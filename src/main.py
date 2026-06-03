@@ -16,7 +16,7 @@ from enum import Enum
 import numpy as np
 import pygame
 import noise
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import convolve, gaussian_filter, map_coordinates
 
 # ---------------------------------------------------------------------------
 # View modes
@@ -61,13 +61,37 @@ SIMULATION_STEPS_PER_SECOND: int = 10
 # Milliseconds between diffusion steps (derived from above).
 MS_PER_STEP: int = 1000 // SIMULATION_STEPS_PER_SECOND
 
-# Standard deviation (in grid cells) of the Gaussian kernel used for diffusion.
+# Standard deviation (in grid cells) of the total diffusion spread per simulation step.
 # Larger values spread heat faster per step.
 BLUR_SIGMA: float = 1.0
 
-# Tolerance passed to math.isclose() when checking energy conservation.
-ENERGY_CONSERVATION_REL_TOL: float = 1e-4
-ENERGY_CONSERVATION_ABS_TOL: float = 1e-6
+# Number of 3x3 kernel applications used to approximate one full diffusion step.
+# Variances add across substeps, so each substep uses sigma = BLUR_SIGMA / sqrt(N).
+# More substeps produce a more isotropic result at the cost of N convolutions per tick.
+DIFFUSION_SUBSTEPS: int = 4
+
+# Controls the balance between advection and diffusion per substep.  At 0 the
+# advection trace is disabled and only diffusion occurs.  At 1 the wind displaces
+# heat by BLUR_SIGMA cells per substep at the reference wind speed, making
+# advection dominant.  Must be in [0, 1].
+WIND_ADVECTION_STRENGTH: float = 0.8
+
+# Standard deviation (in grid cells) of the Gaussian applied to both wind
+# components after deriving them from the temperature gradient.  Approximates
+# the spatial integration that the pressure Poisson equation performs in a real
+# fluid, suppressing cell-scale gradient spikes at sharp temperature fronts.
+WIND_SMOOTH_SIGMA: float = 2.0
+
+# Fraction of the newly computed wind field blended in each tick (0, 1].
+# The remainder is carried over from the previous tick, giving the wind field
+# inertia: direction rotates gradually rather than snapping, and transient
+# spikes from passing fronts are damped before they fully materialise.
+# Approximates the momentum term in the Navier-Stokes equations.
+WIND_TEMPORAL_SMOOTHING: float = 0.2
+
+# Fractional energy correction (relative to mean temperature) above which a
+# warning is printed.  0.05 = warn when the correction exceeds 5% of the mean.
+ENERGY_CORRECTION_WARN_FRACTION: float = 0.05
 
 # Color channel indices within an (R, G, B) tuple
 RED_CHANNEL: int = 0
@@ -220,6 +244,27 @@ def create_grid(size: int) -> np.ndarray:
 # Heat diffusion
 # ---------------------------------------------------------------------------
 
+def _build_diffusion_kernel(sigma: float) -> np.ndarray:
+    offsets = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+    gy, gx = np.meshgrid(offsets, offsets, indexing='ij')
+    kernel = np.exp(-(gx ** 2 + gy ** 2) / (2.0 * sigma ** 2))
+    return (kernel / kernel.sum()).astype(np.float32)
+
+
+_DIFFUSION_STEP_SIGMA: float = BLUR_SIGMA / math.sqrt(DIFFUSION_SUBSTEPS)
+_DIFFUSION_KERNEL: np.ndarray = _build_diffusion_kernel(_DIFFUSION_STEP_SIGMA)
+
+
+def _check_energy_correction(correction: float, temperature: float) -> None:
+    if temperature > 0.0 and abs(correction) / temperature > ENERGY_CORRECTION_WARN_FRACTION:
+        pct = abs(correction) / temperature * 100.0
+        print(
+            f"WARNING: Large energy correction applied — {correction:.2e} "
+            f"({pct:.2f}% of system temperature); wind divergence may be causing "
+            f"significant energy non-conservation in the backward-trace advection"
+        )
+
+
 def compute_temperature(temperatures: np.ndarray) -> float:
     """
     Return the mean pixel value of the grid, treated as the system temperature.
@@ -237,64 +282,83 @@ def compute_temperature(temperatures: np.ndarray) -> float:
     return float(temperatures.mean())
 
 
-def diffuse(temperatures: np.ndarray) -> np.ndarray:
+def diffuse_and_advect(
+    temperatures: np.ndarray,
+    x_wind_vel: np.ndarray,
+    y_wind_vel: np.ndarray,
+    reference_wind_magnitude: float,
+) -> np.ndarray:
     """
-    Advance the simulation by one heat-diffusion step via Gaussian blurring.
+    Advance the simulation by one combined advection-diffusion step.
 
-    Border padding is set to the current system temperature so that edge pixels
-    exchange heat with a virtual environment at the mean value rather than with
-    zeros or reflections, preserving the total energy of the system.
+    Runs DIFFUSION_SUBSTEPS interleaved substeps.  Each substep first traces
+    each cell backward along the local wind direction by a sub-cell distance
+    (bilinear interpolation across up to four neighbours handles fractional and
+    diagonal wind), then applies the isotropic 3x3 Gaussian diffusion kernel.
+    Long-range heat transport emerges from the chain of local steps rather than
+    any single non-local operation.
+
+    The per-substep backward displacement is:
+        WIND_ADVECTION_STRENGTH * BLUR_SIGMA / reference_wind_magnitude
+
+    so that at WIND_ADVECTION_STRENGTH=1 and the reference (startup-maximum)
+    wind speed each substep traces back exactly BLUR_SIGMA cells.
+
+    A uniform additive correction is applied after all substeps to restore the
+    mean temperature exactly, compensating for the small energy asymmetry that
+    the non-symmetric backward-trace kernel introduces at the grid boundaries.
 
     Parameters
     ----------
     temperatures : np.ndarray
         2-D float32 array of shape (rows, cols) with values in [0, 1].
+    x_wind_vel : np.ndarray
+        2-D float32 array of x (eastward) wind velocity components.
+    y_wind_vel : np.ndarray
+        2-D float32 array of y (southward) wind velocity components.
+    reference_wind_magnitude : float
+        Maximum wind speed at simulation startup, used to normalise the
+        advection displacement so WIND_ADVECTION_STRENGTH has consistent units.
 
     Returns
     -------
     np.ndarray
-        A new float32 array of the same shape after one diffusion step.
+        A new float32 array of the same shape after one combined step.
     """
     temperature = compute_temperature(temperatures)
-    blurred = gaussian_filter(
-        temperatures,
-        sigma=BLUR_SIGMA,
-        mode='constant',
-        cval=temperature,
-    ).astype(np.float32)
-    # Constant padding causes asymmetric energy exchange at the borders: hot
-    # edge pixels leak more energy to the phantom region than cold ones, so the
-    # mean drifts unless the edge values happen to cancel exactly.  Adding a
-    # uniform offset restores the mean without distorting the spatial structure.
-    correction = temperature - compute_temperature(blurred)
-    return (blurred + correction).astype(np.float32)
+    rows, cols = temperatures.shape
 
+    row_coords = np.arange(rows, dtype=np.float32)
+    col_coords = np.arange(cols, dtype=np.float32)
+    row_grid, col_grid = np.meshgrid(row_coords, col_coords, indexing='ij')
 
-def check_energy_conservation(temp_before: float, temp_after: float) -> None:
-    """
-    Print a WARNING if the system temperature changed between diffusion steps.
+    if reference_wind_magnitude > 0.0:
+        advection_scale = WIND_ADVECTION_STRENGTH * BLUR_SIGMA / reference_wind_magnitude
+    else:
+        advection_scale = 0.0
 
-    Floating-point tolerances are used so that harmless rounding noise does not
-    trigger false alarms.
+    # Source positions are fixed for the whole tick: wind does not change
+    # between substeps.  Subtracting the wind vector traces backward (upwind).
+    source_rows = row_grid - y_wind_vel * advection_scale
+    source_cols = col_grid - x_wind_vel * advection_scale
 
-    Parameters
-    ----------
-    temp_before : float
-        Mean pixel value before the diffusion step.
-    temp_after : float
-        Mean pixel value after the diffusion step.
-    """
-    if not math.isclose(
-        temp_before,
-        temp_after,
-        rel_tol=ENERGY_CONSERVATION_REL_TOL,
-        abs_tol=ENERGY_CONSERVATION_ABS_TOL,
-    ):
-        print(
-            f"WARNING: Energy not conserved — temperature changed from "
-            f"{temp_before:.8f} to {temp_after:.8f} "
-            f"(delta={temp_after - temp_before:.2e})"
-        )
+    result = temperatures
+    for _ in range(DIFFUSION_SUBSTEPS):
+        result = map_coordinates(
+            result,
+            [source_rows, source_cols],
+            order=1,
+            mode='nearest',
+        ).astype(np.float32)
+        result = convolve(
+            result,
+            _DIFFUSION_KERNEL,
+            mode='nearest',
+        ).astype(np.float32)
+
+    correction = temperature - compute_temperature(result)
+    _check_energy_correction(correction, temperature)
+    return (result + correction).astype(np.float32)
 
 
 def compute_wind_from_temperature(temperatures: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -325,7 +389,9 @@ def compute_wind_from_temperature(temperatures: np.ndarray) -> tuple[np.ndarray,
     """
     # np.gradient returns gradients as [d/d_row, d/d_col], i.e. [y, x].
     grad_y, grad_x = np.gradient(temperatures)
-    return grad_x.astype(np.float32), grad_y.astype(np.float32)
+    x_wind = gaussian_filter(grad_x, sigma=WIND_SMOOTH_SIGMA).astype(np.float32)
+    y_wind = gaussian_filter(grad_y, sigma=WIND_SMOOTH_SIGMA).astype(np.float32)
+    return x_wind, y_wind
 
 
 # ---------------------------------------------------------------------------
@@ -385,29 +451,6 @@ def print_environment_info(
 # Color mapping
 # ---------------------------------------------------------------------------
 
-def value_to_color(value: float) -> tuple[int, int, int]:
-    """
-    Map a scalar in [0, 1] to an (R, G, B) color.
-
-    The mapping is linear: 0 produces black (0, 0, 0) and 1 produces full red
-    (255, 0, 0).  Values between these extremes are intermediate shades of red.
-
-    Parameters
-    ----------
-    value : float
-        Scalar intensity, expected to lie in [0, 1].  Values outside this range
-        are clamped silently by the integer cast (negative → 0, >1 → >255 but
-        visually saturated by pygame).
-
-    Returns
-    -------
-    tuple[int, int, int]
-        An (R, G, B) tuple suitable for pygame drawing calls.
-    """
-    red = int(value * MAX_CHANNEL_VALUE)
-    return (red, 0, 0)
-
-
 def build_color_surface(temperatures: np.ndarray, scale: int) -> pygame.Surface:
     """
     Construct a pygame Surface that visualizes every cell in *temperatures* as a
@@ -426,14 +469,13 @@ def build_color_surface(temperatures: np.ndarray, scale: int) -> pygame.Surface:
         A surface whose pixel dimensions are (cols * scale, rows * scale).
     """
     rows, cols = temperatures.shape
+    red = (np.clip(temperatures, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
+    red_scaled = np.repeat(np.repeat(red, scale, axis=0), scale, axis=1)
+    rgb = np.zeros((rows * scale, cols * scale, 3), dtype=np.uint8)
+    rgb[:, :, RED_CHANNEL] = red_scaled
     surface = pygame.Surface((cols * scale, rows * scale))
-
-    for row in range(rows):
-        for col in range(cols):
-            color = value_to_color(temperatures[row, col])
-            rect = cell_rect(row, col, scale)
-            pygame.draw.rect(surface, color, rect)
-
+    # surfarray expects (width, height, 3); numpy is (height, width, 3)
+    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
     return surface
 
 
@@ -492,7 +534,7 @@ def build_wind_surface(
             if magnitude == 0.0:
                 continue
 
-            brightness = int(magnitude / reference_magnitude * MAX_CHANNEL_VALUE)
+            brightness = int(min(magnitude / reference_magnitude, 1.0) * MAX_CHANNEL_VALUE)
             color = (brightness, brightness, brightness)
 
             # Unit direction vector.
@@ -518,29 +560,6 @@ def build_wind_surface(
                 pygame.draw.line(surface, color, tip, barb, WIND_ARROW_LINE_WIDTH)
 
     return surface
-
-
-def cell_rect(row: int, col: int, scale: int) -> pygame.Rect:
-    """
-    Return the pygame.Rect that corresponds to a single grid cell.
-
-    Parameters
-    ----------
-    row : int
-        Row index of the cell (0-based, top-to-bottom).
-    col : int
-        Column index of the cell (0-based, left-to-right).
-    scale : int
-        Number of screen pixels per grid cell on each axis.
-
-    Returns
-    -------
-    pygame.Rect
-        Rect with position (col * scale, row * scale) and size (scale, scale).
-    """
-    x = col * scale
-    y = row * scale
-    return pygame.Rect(x, y, scale, scale)
 
 
 # ---------------------------------------------------------------------------
@@ -630,9 +649,9 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
     """
     Initialize the grid and pygame, then enter the main display loop.
 
-    The simulation advances at SIMULATION_STEPS_PER_SECOND via Gaussian
-    blurring.  The color surface is rebuilt after every diffusion step and
-    energy conservation is verified each step.  The window is displayed until
+    The simulation advances at SIMULATION_STEPS_PER_SECOND via combined
+    advection-diffusion steps.  Both render surfaces are rebuilt after every
+    simulation step.  The window is displayed until
     the user closes it or presses Escape.
 
     The pixel scale (screen pixels per grid cell) is derived by dividing
@@ -673,11 +692,12 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
         current_ms = pygame.time.get_ticks()
         if current_ms - last_step_ms >= MS_PER_STEP:
             step_start_ms = pygame.time.get_ticks()
-            temp_before = compute_temperature(temperatures)
-            temperatures = diffuse(temperatures)
-            temp_after = compute_temperature(temperatures)
-            check_energy_conservation(temp_before, temp_after)
-            x_wind_vel, y_wind_vel = compute_wind_from_temperature(temperatures)
+            temperatures = diffuse_and_advect(
+                temperatures, x_wind_vel, y_wind_vel, reference_wind_magnitude
+            )
+            new_x_wind, new_y_wind = compute_wind_from_temperature(temperatures)
+            x_wind_vel = WIND_TEMPORAL_SMOOTHING * new_x_wind + (1.0 - WIND_TEMPORAL_SMOOTHING) * x_wind_vel
+            y_wind_vel = WIND_TEMPORAL_SMOOTHING * new_y_wind + (1.0 - WIND_TEMPORAL_SMOOTHING) * y_wind_vel
             color_surface = build_color_surface(temperatures, pixel_scale)
             wind_surface = build_wind_surface(x_wind_vel, y_wind_vel, pixel_scale, reference_wind_magnitude)
             last_step_ms = current_ms
