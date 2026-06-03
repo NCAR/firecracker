@@ -2,3 +2,4 @@ numpy
 scipy
 pygame
 noise
+gymnasium
