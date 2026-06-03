@@ -94,18 +94,56 @@ NOISE_PERSISTENCE: float = 0.5
 # How quickly each successive octave's frequency increases (>1).
 NOISE_LACUNARITY: float = 2.0
 
+# ---------------------------------------------------------------------------
+# Wind field parameters
+# ---------------------------------------------------------------------------
+
+# Independent noise scale for wind — slightly larger than temperature to
+# produce broader, more coherent wind patterns.
+WIND_NOISE_SCALE: float = 80.0
+
+WIND_NOISE_OCTAVES: int = 4
+WIND_NOISE_PERSISTENCE: float = 0.5
+WIND_NOISE_LACUNARITY: float = 2.0
+
+# ---------------------------------------------------------------------------
+# Wind arrow visualization parameters
+# ---------------------------------------------------------------------------
+
+# Draw one arrow for every this many grid cells in each axis.
+WIND_ARROW_STRIDE: int = 16
+
+# Length of each arrow shaft in screen pixels (constant regardless of speed).
+WIND_ARROW_LENGTH: int = 14
+
+# Stroke width in pixels for the shaft and arrowhead lines.
+WIND_ARROW_LINE_WIDTH: int = 1
+
+# Length of each arrowhead barb in screen pixels.
+WIND_ARROW_HEAD_SIZE: int = 4
+
+# Half-angle (radians) between each barb and the shaft at the arrow tip.
+WIND_ARROW_HEAD_ANGLE: float = math.pi / 6  # 30 degrees
+
 
 # ---------------------------------------------------------------------------
 # Grid initialisation
 # ---------------------------------------------------------------------------
 
-def sample_perlin_grid(size: int, base: int) -> np.ndarray:
+def sample_perlin_grid(
+    size: int,
+    base: int,
+    scale: float = NOISE_SCALE,
+    octaves: int = NOISE_OCTAVES,
+    persistence: float = NOISE_PERSISTENCE,
+    lacunarity: float = NOISE_LACUNARITY,
+) -> np.ndarray:
     """
     Sample 2D Perlin noise on an NxN grid and return raw (un-normalized) values.
 
-    Each cell (row, col) is sampled at coordinates (col / NOISE_SCALE,
-    row / NOISE_SCALE) so that adjacent cells are spatially coherent and the
-    NOISE_SCALE constant controls the apparent size of hot/cold regions.
+    Each cell (row, col) is sampled at coordinates (col / scale, row / scale)
+    so that adjacent cells are spatially coherent.  The scale parameter
+    controls the apparent size of features: larger values produce bigger blobs.
 
     Parameters
     ----------
@@ -113,6 +151,14 @@ def sample_perlin_grid(size: int, base: int) -> np.ndarray:
         Side length N of the square grid.
     base : int
         Seed offset passed to pnoise2; changing this produces a different map.
+    scale : float, optional
+        Coordinate divisor controlling feature size.  Defaults to NOISE_SCALE.
+    octaves : int, optional
+        Number of noise layers.  Defaults to NOISE_OCTAVES.
+    persistence : float, optional
+        Amplitude falloff per octave.  Defaults to NOISE_PERSISTENCE.
+    lacunarity : float, optional
+        Frequency multiplier per octave.  Defaults to NOISE_LACUNARITY.
 
     Returns
     -------
@@ -124,11 +170,11 @@ def sample_perlin_grid(size: int, base: int) -> np.ndarray:
     for row in range(size):
         for col in range(size):
             grid[row, col] = noise.pnoise2(
-                col / NOISE_SCALE,
-                row / NOISE_SCALE,
-                octaves=NOISE_OCTAVES,
-                persistence=NOISE_PERSISTENCE,
-                lacunarity=NOISE_LACUNARITY,
+                col / scale,
+                row / scale,
+                octaves=octaves,
+                persistence=persistence,
+                lacunarity=lacunarity,
                 base=base,
             )
     return grid
@@ -159,6 +205,26 @@ def normalize_grid(grid: np.ndarray) -> np.ndarray:
     return ((grid - lo) / (hi - lo)).astype(np.float32)
 
 
+def normalize_to_symmetric(grid: np.ndarray) -> np.ndarray:
+    """
+    Linearly rescale all values in *grid* to the range [-1, 1].
+
+    Used for signed quantities such as wind velocity components, where the sign
+    encodes direction and the magnitude encodes speed.
+
+    Parameters
+    ----------
+    grid : np.ndarray
+        2-D float32 array of arbitrary value range.
+
+    Returns
+    -------
+    np.ndarray
+        A new float32 array of the same shape with values in [-1, 1].
+    """
+    return (normalize_grid(grid) * 2.0 - 1.0).astype(np.float32)
+
+
 def create_grid(size: int) -> np.ndarray:
     """
     Build an NxN float32 grid of Perlin noise values normalized to [0, 1].
@@ -180,6 +246,45 @@ def create_grid(size: int) -> np.ndarray:
     base = np.random.randint(0, 256)
     raw = sample_perlin_grid(size, base)
     return normalize_grid(raw)
+
+
+def create_wind_field(size: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build x and y wind velocity arrays from independent Perlin noise maps.
+
+    Each component is sampled with its own random seed so the x and y fields
+    are uncorrelated.  Values are normalized to [-1, 1]: negative x means wind
+    blowing west, positive x means east; negative y means north, positive y
+    means south.
+
+    Parameters
+    ----------
+    size : int
+        Side length N of the square grid.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        A (x_wind_vel, y_wind_vel) pair, each a float32 array of shape
+        (size, size) with values in [-1, 1].
+    """
+    base_x = np.random.randint(0, 256)
+    base_y = np.random.randint(0, 256)
+    raw_x = sample_perlin_grid(
+        size, base_x,
+        scale=WIND_NOISE_SCALE,
+        octaves=WIND_NOISE_OCTAVES,
+        persistence=WIND_NOISE_PERSISTENCE,
+        lacunarity=WIND_NOISE_LACUNARITY,
+    )
+    raw_y = sample_perlin_grid(
+        size, base_y,
+        scale=WIND_NOISE_SCALE,
+        octaves=WIND_NOISE_OCTAVES,
+        persistence=WIND_NOISE_PERSISTENCE,
+        lacunarity=WIND_NOISE_LACUNARITY,
+    )
+    return normalize_to_symmetric(raw_x), normalize_to_symmetric(raw_y)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +463,81 @@ def build_color_surface(grid: np.ndarray, scale: int) -> pygame.Surface:
     return surface
 
 
+def build_wind_surface(
+    x_wind_vel: np.ndarray,
+    y_wind_vel: np.ndarray,
+    scale: int,
+) -> pygame.Surface:
+    """
+    Construct a pygame Surface that visualizes the wind velocity field as arrows.
+
+    One arrow is drawn every WIND_ARROW_STRIDE cells in each axis to avoid
+    clutter.  Each arrow is centered on its cell and points in the wind
+    direction.  Shaft length is constant (WIND_ARROW_LENGTH pixels); brightness
+    encodes speed, with brighter gray meaning faster wind.
+
+    Parameters
+    ----------
+    x_wind_vel : np.ndarray
+        2-D float32 array of x velocity components, values in [-1, 1].
+    y_wind_vel : np.ndarray
+        2-D float32 array of y velocity components, values in [-1, 1].
+    scale : int
+        Number of screen pixels per grid cell on each axis.
+
+    Returns
+    -------
+    pygame.Surface
+        A black surface with gray arrows, pixel dimensions (cols*scale, rows*scale).
+    """
+    rows, cols = x_wind_vel.shape
+    surface = pygame.Surface((cols * scale, rows * scale))  # black by default
+
+    # Maximum possible magnitude when both components are ±1.
+    max_magnitude = math.sqrt(2.0)
+    half_len = WIND_ARROW_LENGTH / 2.0
+
+    # Start half a stride from each edge so the arrow grid is centered and
+    # the margin is equal on opposite sides.
+    grid_offset = WIND_ARROW_STRIDE // 2
+
+    for row in range(grid_offset, rows, WIND_ARROW_STRIDE):
+        for col in range(grid_offset, cols, WIND_ARROW_STRIDE):
+            vx = float(x_wind_vel[row, col])
+            vy = float(y_wind_vel[row, col])
+            magnitude = math.sqrt(vx ** 2 + vy ** 2)
+
+            if magnitude == 0.0:
+                continue
+
+            brightness = int(magnitude / max_magnitude * MAX_CHANNEL_VALUE)
+            color = (brightness, brightness, brightness)
+
+            # Unit direction vector.
+            ux = vx / magnitude
+            uy = vy / magnitude
+
+            # Cell center in screen pixels.
+            cx = (col + 0.5) * scale
+            cy = (row + 0.5) * scale
+
+            # Shaft: centered on the cell.
+            start = (int(cx - ux * half_len), int(cy - uy * half_len))
+            tip   = (int(cx + ux * half_len), int(cy + uy * half_len))
+            pygame.draw.line(surface, color, start, tip, WIND_ARROW_LINE_WIDTH)
+
+            # Arrowhead: two barbs angled back from the tip.
+            angle = math.atan2(uy, ux)
+            for sign in (+1, -1):
+                barb = (
+                    int(tip[0] - WIND_ARROW_HEAD_SIZE * math.cos(angle + sign * WIND_ARROW_HEAD_ANGLE)),
+                    int(tip[1] - WIND_ARROW_HEAD_SIZE * math.sin(angle + sign * WIND_ARROW_HEAD_ANGLE)),
+                )
+                pygame.draw.line(surface, color, tip, barb, WIND_ARROW_LINE_WIDTH)
+
+    return surface
+
+
 def cell_rect(row: int, col: int, scale: int) -> pygame.Rect:
     """
     Return the pygame.Rect that corresponds to a single grid cell.
@@ -434,7 +614,12 @@ def handle_events(current_mode: ViewMode) -> tuple[bool, ViewMode]:
     return True, current_mode
 
 
-def render_frame(screen: pygame.Surface, mode: ViewMode, color_surface: pygame.Surface) -> None:
+def render_frame(
+    screen: pygame.Surface,
+    mode: ViewMode,
+    color_surface: pygame.Surface,
+    wind_surface: pygame.Surface,
+) -> None:
     """
     Draw one frame to *screen* according to the active *mode*.
 
@@ -446,11 +631,13 @@ def render_frame(screen: pygame.Surface, mode: ViewMode, color_surface: pygame.S
         The currently active view mode.
     color_surface : pygame.Surface
         Pre-built temperature heat-map surface (used by TEMPERATURE mode).
+    wind_surface : pygame.Surface
+        Pre-built wind velocity surface (used by WIND mode).
     """
     if mode == ViewMode.TEMPERATURE:
         screen.blit(color_surface, (0, 0))
     elif mode == ViewMode.WIND:
-        screen.fill((0, 0, 0))
+        screen.blit(wind_surface, (0, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +671,12 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
     pygame.init()
 
     grid = create_grid(grid_size)
+    x_wind_vel, y_wind_vel = create_wind_field(grid_size)
     print_environment_info(grid, "Startup", window_size)
     screen = create_window(grid_size, pixel_scale, WINDOW_TITLE)
     clock = pygame.time.Clock()
     color_surface = build_color_surface(grid, pixel_scale)
+    wind_surface = build_wind_surface(x_wind_vel, y_wind_vel, pixel_scale)
 
     last_step_ms: int = pygame.time.get_ticks()
     current_mode: ViewMode = ViewMode.TEMPERATURE
@@ -505,7 +694,7 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
             color_surface = build_color_surface(grid, pixel_scale)
             last_step_ms = current_ms
 
-        render_frame(screen, current_mode, color_surface)
+        render_frame(screen, current_mode, color_surface, wind_surface)
         pygame.display.flip()
         clock.tick(TARGET_FPS)
 
