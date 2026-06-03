@@ -95,18 +95,6 @@ NOISE_PERSISTENCE: float = 0.5
 NOISE_LACUNARITY: float = 2.0
 
 # ---------------------------------------------------------------------------
-# Wind field parameters
-# ---------------------------------------------------------------------------
-
-# Independent noise scale for wind — slightly larger than temperature to
-# produce broader, more coherent wind patterns.
-WIND_NOISE_SCALE: float = 80.0
-
-WIND_NOISE_OCTAVES: int = 4
-WIND_NOISE_PERSISTENCE: float = 0.5
-WIND_NOISE_LACUNARITY: float = 2.0
-
-# ---------------------------------------------------------------------------
 # Wind arrow visualization parameters
 # ---------------------------------------------------------------------------
 
@@ -205,26 +193,6 @@ def normalize_grid(grid: np.ndarray) -> np.ndarray:
     return ((grid - lo) / (hi - lo)).astype(np.float32)
 
 
-def normalize_to_symmetric(grid: np.ndarray) -> np.ndarray:
-    """
-    Linearly rescale all values in *grid* to the range [-1, 1].
-
-    Used for signed quantities such as wind velocity components, where the sign
-    encodes direction and the magnitude encodes speed.
-
-    Parameters
-    ----------
-    grid : np.ndarray
-        2-D float32 array of arbitrary value range.
-
-    Returns
-    -------
-    np.ndarray
-        A new float32 array of the same shape with values in [-1, 1].
-    """
-    return (normalize_grid(grid) * 2.0 - 1.0).astype(np.float32)
-
-
 def create_grid(size: int) -> np.ndarray:
     """
     Build an NxN float32 grid of Perlin noise values normalized to [0, 1].
@@ -248,56 +216,17 @@ def create_grid(size: int) -> np.ndarray:
     return normalize_grid(raw)
 
 
-def create_wind_field(size: int) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build x and y wind velocity arrays from independent Perlin noise maps.
-
-    Each component is sampled with its own random seed so the x and y fields
-    are uncorrelated.  Values are normalized to [-1, 1]: negative x means wind
-    blowing west, positive x means east; negative y means north, positive y
-    means south.
-
-    Parameters
-    ----------
-    size : int
-        Side length N of the square grid.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        A (x_wind_vel, y_wind_vel) pair, each a float32 array of shape
-        (size, size) with values in [-1, 1].
-    """
-    base_x = np.random.randint(0, 256)
-    base_y = np.random.randint(0, 256)
-    raw_x = sample_perlin_grid(
-        size, base_x,
-        scale=WIND_NOISE_SCALE,
-        octaves=WIND_NOISE_OCTAVES,
-        persistence=WIND_NOISE_PERSISTENCE,
-        lacunarity=WIND_NOISE_LACUNARITY,
-    )
-    raw_y = sample_perlin_grid(
-        size, base_y,
-        scale=WIND_NOISE_SCALE,
-        octaves=WIND_NOISE_OCTAVES,
-        persistence=WIND_NOISE_PERSISTENCE,
-        lacunarity=WIND_NOISE_LACUNARITY,
-    )
-    return normalize_to_symmetric(raw_x), normalize_to_symmetric(raw_y)
-
-
 # ---------------------------------------------------------------------------
 # Heat diffusion
 # ---------------------------------------------------------------------------
 
-def compute_temperature(grid: np.ndarray) -> float:
+def compute_temperature(temperatures: np.ndarray) -> float:
     """
     Return the mean pixel value of the grid, treated as the system temperature.
 
     Parameters
     ----------
-    grid : np.ndarray
+    temperatures : np.ndarray
         2-D float32 array of shape (rows, cols).
 
     Returns
@@ -305,10 +234,10 @@ def compute_temperature(grid: np.ndarray) -> float:
     float
         Arithmetic mean of all pixel values.
     """
-    return float(grid.mean())
+    return float(temperatures.mean())
 
 
-def diffuse(grid: np.ndarray) -> np.ndarray:
+def diffuse(temperatures: np.ndarray) -> np.ndarray:
     """
     Advance the simulation by one heat-diffusion step via Gaussian blurring.
 
@@ -318,7 +247,7 @@ def diffuse(grid: np.ndarray) -> np.ndarray:
 
     Parameters
     ----------
-    grid : np.ndarray
+    temperatures : np.ndarray
         2-D float32 array of shape (rows, cols) with values in [0, 1].
 
     Returns
@@ -326,9 +255,9 @@ def diffuse(grid: np.ndarray) -> np.ndarray:
     np.ndarray
         A new float32 array of the same shape after one diffusion step.
     """
-    temperature = compute_temperature(grid)
+    temperature = compute_temperature(temperatures)
     blurred = gaussian_filter(
-        grid,
+        temperatures,
         sigma=BLUR_SIGMA,
         mode='constant',
         cval=temperature,
@@ -368,6 +297,37 @@ def check_energy_conservation(temp_before: float, temp_after: float) -> None:
         )
 
 
+def compute_wind_from_temperature(temperatures: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Derive wind velocity vectors from the spatial gradient of the temperature field.
+
+    Wind moves from cool (high pressure) toward warm (low pressure) regions,
+    so the wind direction at each cell is the direction of steepest temperature
+    increase — i.e., the gradient vector.  Wind speed is proportional to
+    gradient magnitude: a flat temperature field produces no wind, while a
+    steep gradient produces strong wind.
+
+    np.gradient uses second-order central differences for interior cells and
+    first-order one-sided differences at the borders, which is an adequate
+    approximation for a smoothly varying Perlin-noise temperature field.
+
+    Parameters
+    ----------
+    temperatures : np.ndarray
+        2-D float32 array of shape (rows, cols) with values in [0, 1].
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        A (x_wind_vel, y_wind_vel) pair of float32 arrays, each with shape
+        (rows, cols).  Positive x means blowing east; positive y means south.
+        Magnitudes are in units of temperature-change per cell.
+    """
+    # np.gradient returns gradients as [d/d_row, d/d_col], i.e. [y, x].
+    grad_y, grad_x = np.gradient(temperatures)
+    return grad_x.astype(np.float32), grad_y.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -376,34 +336,48 @@ def check_energy_conservation(temp_before: float, temp_after: float) -> None:
 INFO_SEPARATOR: str = "-" * 36
 
 
-def print_environment_info(grid: np.ndarray, label: str, window_size: int) -> None:
+def print_environment_info(
+    temperatures: np.ndarray,
+    label: str,
+    window_size: int,
+    x_wind_vel: np.ndarray,
+    y_wind_vel: np.ndarray,
+) -> None:
     """
     Print a labeled summary of the current simulation state to stdout.
 
     Displays the grid dimensions, window resolution, simulation rate, and key
-    statistics of the pixel values (temperature, range, and spread).  Called
-    at startup and shutdown so the initial and final states are both visible.
+    statistics of both the temperature field and the wind velocity field.
+    Called at startup and shutdown so the initial and final states are both visible.
 
     Parameters
     ----------
-    grid : np.ndarray
-        Current 2-D float32 grid of shape (rows, cols).
+    temperatures : np.ndarray
+        Current 2-D float32 temperature grid of shape (rows, cols).
     label : str
         Short context label shown in the header (e.g. "Startup", "Shutdown").
     window_size : int
         Side length of the square display window in pixels.
+    x_wind_vel : np.ndarray
+        2-D float32 array of x wind velocity components, shape (rows, cols).
+    y_wind_vel : np.ndarray
+        2-D float32 array of y wind velocity components, shape (rows, cols).
     """
-    rows, cols = grid.shape
+    rows, cols = temperatures.shape
+    wind_speeds = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
     print(INFO_SEPARATOR)
     print(f" {label}")
     print(INFO_SEPARATOR)
     print(f"  Grid size   : {rows} x {cols}  ({rows * cols} cells)")
     print(f"  Window size : {window_size} x {window_size} px")
     print(f"  Sim rate    : {SIMULATION_STEPS_PER_SECOND} steps/sec")
-    print(f"  Temperature : {compute_temperature(grid):.6f}")
-    print(f"  Min value   : {float(grid.min()):.6f}")
-    print(f"  Max value   : {float(grid.max()):.6f}")
-    print(f"  Std dev     : {float(grid.std()):.6f}")
+    print(f"  Temperature : {compute_temperature(temperatures):.6f}")
+    print(f"  Temp min    : {float(temperatures.min()):.6f}")
+    print(f"  Temp max    : {float(temperatures.max()):.6f}")
+    print(f"  Temp std    : {float(temperatures.std()):.6f}")
+    print(f"  Wind mean   : {float(wind_speeds.mean()):.6f}")
+    print(f"  Wind max    : {float(wind_speeds.max()):.6f}")
+    print(f"  Wind std    : {float(wind_speeds.std()):.6f}")
     print(INFO_SEPARATOR)
 
 
@@ -434,14 +408,14 @@ def value_to_color(value: float) -> tuple[int, int, int]:
     return (red, 0, 0)
 
 
-def build_color_surface(grid: np.ndarray, scale: int) -> pygame.Surface:
+def build_color_surface(temperatures: np.ndarray, scale: int) -> pygame.Surface:
     """
-    Construct a pygame Surface that visualizes every cell in *grid* as a
+    Construct a pygame Surface that visualizes every cell in *temperatures* as a
     solid-colored square of side *scale* pixels.
 
     Parameters
     ----------
-    grid : np.ndarray
+    temperatures : np.ndarray
         2-D float32 array of shape (rows, cols) with values in [0, 1].
     scale : int
         Number of screen pixels per grid cell on each axis.
@@ -451,12 +425,12 @@ def build_color_surface(grid: np.ndarray, scale: int) -> pygame.Surface:
     pygame.Surface
         A surface whose pixel dimensions are (cols * scale, rows * scale).
     """
-    rows, cols = grid.shape
+    rows, cols = temperatures.shape
     surface = pygame.Surface((cols * scale, rows * scale))
 
     for row in range(rows):
         for col in range(cols):
-            color = value_to_color(grid[row, col])
+            color = value_to_color(temperatures[row, col])
             rect = cell_rect(row, col, scale)
             pygame.draw.rect(surface, color, rect)
 
@@ -467,6 +441,7 @@ def build_wind_surface(
     x_wind_vel: np.ndarray,
     y_wind_vel: np.ndarray,
     scale: int,
+    reference_magnitude: float,
 ) -> pygame.Surface:
     """
     Construct a pygame Surface that visualizes the wind velocity field as arrows.
@@ -493,8 +468,15 @@ def build_wind_surface(
     rows, cols = x_wind_vel.shape
     surface = pygame.Surface((cols * scale, rows * scale))  # black by default
 
-    # Maximum possible magnitude when both components are ±1.
-    max_magnitude = math.sqrt(2.0)
+    # Brightness is normalised against reference_magnitude (the max gradient at
+    # startup) so arrows begin at full brightness and dim proportionally as the
+    # temperature field flattens.  When reference_magnitude is 0 the field was
+    # already uniform at startup, so there is nothing to show.
+    if reference_magnitude == 0.0:
+        return surface
+
+    magnitudes = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
+
     half_len = WIND_ARROW_LENGTH / 2.0
 
     # Start half a stride from each edge so the arrow grid is centered and
@@ -505,12 +487,12 @@ def build_wind_surface(
         for col in range(grid_offset, cols, WIND_ARROW_STRIDE):
             vx = float(x_wind_vel[row, col])
             vy = float(y_wind_vel[row, col])
-            magnitude = math.sqrt(vx ** 2 + vy ** 2)
+            magnitude = float(magnitudes[row, col])
 
             if magnitude == 0.0:
                 continue
 
-            brightness = int(magnitude / max_magnitude * MAX_CHANNEL_VALUE)
+            brightness = int(magnitude / reference_magnitude * MAX_CHANNEL_VALUE)
             color = (brightness, brightness, brightness)
 
             # Unit direction vector.
@@ -670,13 +652,16 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
 
     pygame.init()
 
-    grid = create_grid(grid_size)
-    x_wind_vel, y_wind_vel = create_wind_field(grid_size)
-    print_environment_info(grid, "Startup", window_size)
+    temperatures = create_grid(grid_size)
+    x_wind_vel, y_wind_vel = compute_wind_from_temperature(temperatures)
+    # Capture the initial gradient strength as a fixed brightness reference so
+    # arrows dim naturally over time rather than always rescaling to full brightness.
+    reference_wind_magnitude = float(np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2).max())
+    print_environment_info(temperatures, "Startup", window_size, x_wind_vel, y_wind_vel)
     screen = create_window(grid_size, pixel_scale, WINDOW_TITLE)
     clock = pygame.time.Clock()
-    color_surface = build_color_surface(grid, pixel_scale)
-    wind_surface = build_wind_surface(x_wind_vel, y_wind_vel, pixel_scale)
+    color_surface = build_color_surface(temperatures, pixel_scale)
+    wind_surface = build_wind_surface(x_wind_vel, y_wind_vel, pixel_scale, reference_wind_magnitude)
 
     last_step_ms: int = pygame.time.get_ticks()
     current_mode: ViewMode = ViewMode.TEMPERATURE
@@ -687,18 +672,20 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
 
         current_ms = pygame.time.get_ticks()
         if current_ms - last_step_ms >= MS_PER_STEP:
-            temp_before = compute_temperature(grid)
-            grid = diffuse(grid)
-            temp_after = compute_temperature(grid)
+            temp_before = compute_temperature(temperatures)
+            temperatures = diffuse(temperatures)
+            temp_after = compute_temperature(temperatures)
             check_energy_conservation(temp_before, temp_after)
-            color_surface = build_color_surface(grid, pixel_scale)
+            x_wind_vel, y_wind_vel = compute_wind_from_temperature(temperatures)
+            color_surface = build_color_surface(temperatures, pixel_scale)
+            wind_surface = build_wind_surface(x_wind_vel, y_wind_vel, pixel_scale, reference_wind_magnitude)
             last_step_ms = current_ms
 
         render_frame(screen, current_mode, color_surface, wind_surface)
         pygame.display.flip()
         clock.tick(TARGET_FPS)
 
-    print_environment_info(grid, "Shutdown", window_size)
+    print_environment_info(temperatures, "Shutdown", window_size, x_wind_vel, y_wind_vel)
     pygame.quit()
 
 
