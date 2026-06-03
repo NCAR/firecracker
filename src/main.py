@@ -5,17 +5,42 @@ Displays an NxN grid of pixels using pygame, where each pixel value is a float
 in [0, 1] sourced from a 2D numpy array. Zero maps to black, one maps to pure
 red, and intermediate values are proportional shades of red.
 
-The grid is initialised with Perlin noise and then evolved in real time using
+The grid is initialized with Perlin noise and then evolved in real time using
 repeated Gaussian blurring to simulate heat diffusion. The mean pixel value
 (system temperature) is conserved across every diffusion step.
 """
 
 import math
 import sys
+from enum import Enum
 import numpy as np
 import pygame
 import noise
 from scipy.ndimage import gaussian_filter
+
+# ---------------------------------------------------------------------------
+# View modes
+# ---------------------------------------------------------------------------
+
+class ViewMode(Enum):
+    """
+    Selectable display modes cycled via number keys at runtime.
+
+    Each member's integer value corresponds to the key used to activate it
+    (e.g. ViewMode.TEMPERATURE is activated by pressing 1).  Add new members
+    here and a matching branch in render_frame to extend the system.
+    """
+    TEMPERATURE = 1
+    WIND = 2
+
+
+# Maps pygame key constants to their corresponding ViewMode.
+# Populated from ViewMode values so new modes are picked up automatically.
+MODE_KEYS: dict[int, ViewMode] = {
+    getattr(pygame, f"K_{mode.value}"): mode
+    for mode in ViewMode
+}
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,12 +69,12 @@ BLUR_SIGMA: float = 1.0
 ENERGY_CONSERVATION_REL_TOL: float = 1e-4
 ENERGY_CONSERVATION_ABS_TOL: float = 1e-6
 
-# Colour channel indices within an (R, G, B) tuple
+# Color channel indices within an (R, G, B) tuple
 RED_CHANNEL: int = 0
 GREEN_CHANNEL: int = 1
 BLUE_CHANNEL: int = 2
 
-# Maximum value of an 8-bit colour channel
+# Maximum value of an 8-bit color channel
 MAX_CHANNEL_VALUE: int = 255
 
 # ---------------------------------------------------------------------------
@@ -76,7 +101,7 @@ NOISE_LACUNARITY: float = 2.0
 
 def sample_perlin_grid(size: int, base: int) -> np.ndarray:
     """
-    Sample 2D Perlin noise on an NxN grid and return raw (un-normalised) values.
+    Sample 2D Perlin noise on an NxN grid and return raw (un-normalized) values.
 
     Each cell (row, col) is sampled at coordinates (col / NOISE_SCALE,
     row / NOISE_SCALE) so that adjacent cells are spatially coherent and the
@@ -109,12 +134,12 @@ def sample_perlin_grid(size: int, base: int) -> np.ndarray:
     return grid
 
 
-def normalise_grid(grid: np.ndarray) -> np.ndarray:
+def normalize_grid(grid: np.ndarray) -> np.ndarray:
     """
     Linearly rescale all values in *grid* to the range [0, 1].
 
-    Uses the grid's own observed minimum and maximum so the full colour range
-    is always utilised regardless of the raw noise amplitude.
+    Uses the grid's own observed minimum and maximum so the full color range
+    is always utilized regardless of the raw noise amplitude.
 
     Parameters
     ----------
@@ -136,7 +161,7 @@ def normalise_grid(grid: np.ndarray) -> np.ndarray:
 
 def create_grid(size: int) -> np.ndarray:
     """
-    Build an NxN float32 grid of Perlin noise values normalised to [0, 1].
+    Build an NxN float32 grid of Perlin noise values normalized to [0, 1].
 
     A random seed is chosen each call so every run produces a different map.
     Values near 0 represent cold (black) regions; values near 1 represent hot
@@ -154,7 +179,7 @@ def create_grid(size: int) -> np.ndarray:
     """
     base = np.random.randint(0, 256)
     raw = sample_perlin_grid(size, base)
-    return normalise_grid(raw)
+    return normalize_grid(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +273,7 @@ INFO_SEPARATOR: str = "-" * 36
 
 def print_environment_info(grid: np.ndarray, label: str, window_size: int) -> None:
     """
-    Print a labelled summary of the current simulation state to stdout.
+    Print a labeled summary of the current simulation state to stdout.
 
     Displays the grid dimensions, window resolution, simulation rate, and key
     statistics of the pixel values (temperature, range, and spread).  Called
@@ -278,12 +303,12 @@ def print_environment_info(grid: np.ndarray, label: str, window_size: int) -> No
 
 
 # ---------------------------------------------------------------------------
-# Colour mapping
+# Color mapping
 # ---------------------------------------------------------------------------
 
-def value_to_colour(value: float) -> tuple[int, int, int]:
+def value_to_color(value: float) -> tuple[int, int, int]:
     """
-    Map a scalar in [0, 1] to an (R, G, B) colour.
+    Map a scalar in [0, 1] to an (R, G, B) color.
 
     The mapping is linear: 0 produces black (0, 0, 0) and 1 produces full red
     (255, 0, 0).  Values between these extremes are intermediate shades of red.
@@ -304,10 +329,10 @@ def value_to_colour(value: float) -> tuple[int, int, int]:
     return (red, 0, 0)
 
 
-def build_colour_surface(grid: np.ndarray, scale: int) -> pygame.Surface:
+def build_color_surface(grid: np.ndarray, scale: int) -> pygame.Surface:
     """
-    Construct a pygame Surface that visualises every cell in *grid* as a
-    solid-coloured square of side *scale* pixels.
+    Construct a pygame Surface that visualizes every cell in *grid* as a
+    solid-colored square of side *scale* pixels.
 
     Parameters
     ----------
@@ -326,9 +351,9 @@ def build_colour_surface(grid: np.ndarray, scale: int) -> pygame.Surface:
 
     for row in range(rows):
         for col in range(cols):
-            colour = value_to_colour(grid[row, col])
+            color = value_to_color(grid[row, col])
             rect = cell_rect(row, col, scale)
-            pygame.draw.rect(surface, colour, rect)
+            pygame.draw.rect(surface, color, rect)
 
     return surface
 
@@ -362,7 +387,7 @@ def cell_rect(row: int, col: int, scale: int) -> pygame.Rect:
 
 def create_window(grid_size: int, scale: int, title: str) -> pygame.Surface:
     """
-    Initialise pygame and open a display window sized to fit the grid.
+    Initialize pygame and open a display window sized to fit the grid.
 
     Parameters
     ----------
@@ -383,22 +408,49 @@ def create_window(grid_size: int, scale: int, title: str) -> pygame.Surface:
     return pygame.display.set_mode(window_size)
 
 
-def handle_events() -> bool:
+def handle_events(current_mode: ViewMode) -> tuple[bool, ViewMode]:
     """
     Process the pygame event queue for the current frame.
 
+    Parameters
+    ----------
+    current_mode : ViewMode
+        The active view mode at the start of this frame.
+
     Returns
     -------
-    bool
-        True if the application should continue running, False if a quit event
-        (window close button or Escape key) was received.
+    tuple[bool, ViewMode]
+        A (running, mode) pair.  running is False if a quit event was received;
+        mode is the updated ViewMode after processing any number-key presses.
     """
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
-            return False
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            return False
-    return True
+            return False, current_mode
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                return False, current_mode
+            if event.key in MODE_KEYS:
+                current_mode = MODE_KEYS[event.key]
+    return True, current_mode
+
+
+def render_frame(screen: pygame.Surface, mode: ViewMode, color_surface: pygame.Surface) -> None:
+    """
+    Draw one frame to *screen* according to the active *mode*.
+
+    Parameters
+    ----------
+    screen : pygame.Surface
+        The main display surface to draw onto.
+    mode : ViewMode
+        The currently active view mode.
+    color_surface : pygame.Surface
+        Pre-built temperature heat-map surface (used by TEMPERATURE mode).
+    """
+    if mode == ViewMode.TEMPERATURE:
+        screen.blit(color_surface, (0, 0))
+    elif mode == ViewMode.WIND:
+        screen.fill((0, 0, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -407,10 +459,10 @@ def handle_events() -> bool:
 
 def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SIZE) -> None:
     """
-    Initialise the grid and pygame, then enter the main display loop.
+    Initialize the grid and pygame, then enter the main display loop.
 
     The simulation advances at SIMULATION_STEPS_PER_SECOND via Gaussian
-    blurring.  The colour surface is rebuilt after every diffusion step and
+    blurring.  The color surface is rebuilt after every diffusion step and
     energy conservation is verified each step.  The window is displayed until
     the user closes it or presses Escape.
 
@@ -435,13 +487,14 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
     print_environment_info(grid, "Startup", window_size)
     screen = create_window(grid_size, pixel_scale, WINDOW_TITLE)
     clock = pygame.time.Clock()
-    colour_surface = build_colour_surface(grid, pixel_scale)
+    color_surface = build_color_surface(grid, pixel_scale)
 
     last_step_ms: int = pygame.time.get_ticks()
+    current_mode: ViewMode = ViewMode.TEMPERATURE
 
     running = True
     while running:
-        running = handle_events()
+        running, current_mode = handle_events(current_mode)
 
         current_ms = pygame.time.get_ticks()
         if current_ms - last_step_ms >= MS_PER_STEP:
@@ -449,10 +502,10 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
             grid = diffuse(grid)
             temp_after = compute_temperature(grid)
             check_energy_conservation(temp_before, temp_after)
-            colour_surface = build_colour_surface(grid, pixel_scale)
+            color_surface = build_color_surface(grid, pixel_scale)
             last_step_ms = current_ms
 
-        screen.blit(colour_surface, (0, 0))
+        render_frame(screen, current_mode, color_surface)
         pygame.display.flip()
         clock.tick(TARGET_FPS)
 
