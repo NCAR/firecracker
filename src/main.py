@@ -672,6 +672,7 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
 
         current_ms = pygame.time.get_ticks()
         if current_ms - last_step_ms >= MS_PER_STEP:
+            step_start_ms = pygame.time.get_ticks()
             temp_before = compute_temperature(temperatures)
             temperatures = diffuse(temperatures)
             temp_after = compute_temperature(temperatures)
@@ -680,6 +681,9 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
             color_surface = build_color_surface(temperatures, pixel_scale)
             wind_surface = build_wind_surface(x_wind_vel, y_wind_vel, pixel_scale, reference_wind_magnitude)
             last_step_ms = current_ms
+            step_elapsed_ms = pygame.time.get_ticks() - step_start_ms
+            if step_elapsed_ms > MS_PER_STEP:
+                print(f"WARNING: Step took {step_elapsed_ms}ms (budget: {MS_PER_STEP}ms)")
 
         render_frame(screen, current_mode, color_surface, wind_surface)
         pygame.display.flip()
