@@ -41,7 +41,13 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
 
     while env._running:
         now = time.monotonic()
-        if now - last_step_time >= _STEP_INTERVAL:
+        if env._step_once:
+            env._step_once = False
+            obs, reward, terminated, truncated, info = env.step(0)
+            last_step_time = now
+            if terminated or truncated:
+                break
+        if not env._paused and now - last_step_time >= _STEP_INTERVAL:
             step_start = time.monotonic()
             obs, reward, terminated, truncated, info = env.step(0)
             last_step_time = now
@@ -50,6 +56,10 @@ def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SI
                 print(f"WARNING: Step took {step_elapsed_ms}ms (budget: {MS_PER_STEP}ms)")
             if terminated or truncated:
                 break
+
+        if env._reset_requested:
+            obs, info = env.reset()
+            last_step_time = time.monotonic()
 
         env.render()
 

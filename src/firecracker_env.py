@@ -226,6 +226,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
         self._running: bool = True
+        self._paused: bool = False
+        self._reset_requested: bool = False
+        self._step_once: bool = False
 
         if render_mode == "human":
             pygame.init()
@@ -259,6 +262,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen = np.ones((self.grid_size, self.grid_size), dtype=np.float32)
         self._step_count = 0
         self._running = True
+        self._paused = False
+        self._reset_requested = False
+        self._step_once = False
         self._surfaces_dirty = True
 
         return self._temperatures.copy(), self._build_info()
@@ -352,6 +358,12 @@ class FirecrackerEnv(gymnasium.Env):
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
+                elif event.key == pygame.K_SPACE:
+                    self._paused = not self._paused
+                elif event.key == pygame.K_PERIOD:
+                    self._step_once = True
+                elif event.key == pygame.K_r:
+                    self._reset_requested = True
                 elif event.key in MODE_KEYS:
                     mode = MODE_KEYS[event.key]
         return running, mode
