@@ -1,0 +1,40 @@
+# Firecracker simulation configuration
+# All parameters have defaults in the source; values here override those defaults.
+
+[simulation]
+steps_per_second     = 10     # physics ticks per second
+blur_sigma           = 1.0    # Gaussian diffusion width per tick
+diffusion_substeps   = 4      # substeps per tick for numerical stability
+atmospheric_cooling_rate = 0.01  # fraction of heat lost to atmosphere each tick
+
+[wind]
+advection_strength  = 0.4   # how far the temperature field is advected per substep
+smooth_sigma        = 2.0   # Gaussian smoothing applied to the derived wind field
+temporal_smoothing  = 0.2   # EMA weight toward newly computed wind (0 = frozen, 1 = instant)
+
+[oxygen]
+diffusion_sigma    = 3.0   # Gaussian diffusion width for oxygen transport
+advection_strength = 3.0   # oxygen advection scale relative to wind
+
+[noise]
+# Perlin noise used for terrain (temperature) and fuel initialisation
+scale       = 64.0
+octaves     = 4
+persistence = 0.5
+lacunarity  = 2.0
+fuel_scale  = 32.0   # separate scale for the fuel noise layer
+
+[fire]
+ignition_threshold    = 0.2   # minimum temperature required to sustain combustion
+fuel_consumption_rate = 0.3   # fraction of remaining fuel consumed per tick while burning
+oxygen_consumption_rate = 0.3 # fraction of remaining oxygen consumed per tick while burning
+burn_heat_scale       = 5.0   # heat added per unit of oxygen consumed
+burnt_threshold       = 0.01  # fuel below this level is considered ash (no longer burns)
+fuel_min              = 0.1   # minimum initial fuel level (avoids bare patches at spawn)
+spawn_radius          = 5     # pixel radius of the circular ignition patch at reset
+
+[environment]
+grid_size          = 256    # simulation grid cells (N x N)
+window_size        = 512    # display window size in pixels (square)
+max_steps          = 1000   # episode length before truncation
+print_episode_info = true   # print variable state at the start and end of each episode

@@ -2,76 +2,146 @@
 main.py
 
 Interactive runner for the Firecracker gymnasium environment.
-Advances the simulation at SIMULATION_STEPS_PER_SECOND and renders at TARGET_FPS.
+Advances the simulation at steps_per_second (from config) and renders at TARGET_FPS.
 """
 
-import sys
+import argparse
 import time
 
-from firecracker_env import FirecrackerEnv, DEFAULT_GRID_SIZE, DEFAULT_WINDOW_SIZE
-from simulation import SIMULATION_STEPS_PER_SECOND, MS_PER_STEP
+from firecracker_env import FirecrackerEnv
+from config import load_config
 
-INFO_SEPARATOR: str = "-" * 36
-_STEP_INTERVAL: float = 1.0 / SIMULATION_STEPS_PER_SECOND
+INFO_SEPARATOR: str = "-" * 40
 
 
-def print_environment_info(info: dict, label: str, grid_size: int, window_size: int) -> None:
+def print_config_info(env: FirecrackerEnv) -> None:
+    sim = env._sim
+    print(INFO_SEPARATOR)
+    print(" Configuration")
+    print(INFO_SEPARATOR)
+    print("  [environment]")
+    print(f"    grid_size              : {env.grid_size} x {env.grid_size}  ({env.grid_size ** 2} cells)")
+    print(f"    window_size            : {env.window_size} x {env.window_size} px")
+    print(f"    max_steps              : {env.max_steps}")
+    print(f"    spawn_radius           : {env._fire_spawn_radius} px")
+    print("  [simulation]")
+    print(f"    steps_per_second       : {sim.simulation_steps_per_second}")
+    print(f"    blur_sigma             : {sim.blur_sigma}")
+    print(f"    diffusion_substeps     : {sim.diffusion_substeps}")
+    print(f"    atmospheric_cooling    : {sim.atmospheric_cooling_rate}")
+    print("  [wind]")
+    print(f"    advection_strength     : {sim.wind_advection_strength}")
+    print(f"    smooth_sigma           : {sim.wind_smooth_sigma}")
+    print(f"    temporal_smoothing     : {sim.wind_temporal_smoothing}")
+    print("  [oxygen]")
+    print(f"    diffusion_sigma        : {sim.oxygen_diffusion_sigma}")
+    print(f"    advection_strength     : {sim.oxygen_advection_strength}")
+    print("  [noise]")
+    print(f"    scale                  : {sim.noise_scale}")
+    print(f"    octaves                : {sim.noise_octaves}")
+    print(f"    persistence            : {sim.noise_persistence}")
+    print(f"    lacunarity             : {sim.noise_lacunarity}")
+    print(f"    fuel_scale             : {sim.fuel_noise_scale}")
+    print("  [fire]")
+    print(f"    ignition_threshold     : {sim.ignition_threshold}")
+    print(f"    fuel_consumption_rate  : {sim.fuel_consumption_rate}")
+    print(f"    oxygen_consumption_rate: {sim.oxygen_consumption_rate}")
+    print(f"    burn_heat_scale        : {sim.fuel_burn_heat_scale}")
+    print(f"    burnt_threshold        : {sim.fuel_burnt_threshold}")
+    print(f"    fuel_min               : {sim.fuel_min}")
+    print(INFO_SEPARATOR)
+
+
+def print_episode_info(info: dict, label: str) -> None:
     print(INFO_SEPARATOR)
     print(f" {label}")
     print(INFO_SEPARATOR)
-    print(f"  Grid size   : {grid_size} x {grid_size}  ({grid_size * grid_size} cells)")
-    print(f"  Window size : {window_size} x {window_size} px")
-    print(f"  Sim rate    : {SIMULATION_STEPS_PER_SECOND} steps/sec")
-    print(f"  Temperature : {info['temperature']:.6f}")
-    print(f"  Temp min    : {info['temp_min']:.6f}")
-    print(f"  Temp max    : {info['temp_max']:.6f}")
-    print(f"  Temp std    : {info['temp_std']:.6f}")
-    print(f"  Wind mean   : {info['wind_mean']:.6f}")
-    print(f"  Wind max    : {info['wind_max']:.6f}")
-    print(f"  Wind std    : {info['wind_std']:.6f}")
+    print(f"  Step          : {info['step']}")
+    print(f"  Temp mean     : {info['temperature']:.6f}")
+    print(f"  Temp min      : {info['temp_min']:.6f}")
+    print(f"  Temp max      : {info['temp_max']:.6f}")
+    print(f"  Temp std      : {info['temp_std']:.6f}")
+    print(f"  Wind mean     : {info['wind_mean']:.6f}")
+    print(f"  Wind max      : {info['wind_max']:.6f}")
+    print(f"  Wind std      : {info['wind_std']:.6f}")
+    print(f"  Fuel mean     : {info['fuel_mean']:.6f}")
+    print(f"  Fuel min      : {info['fuel_min']:.6f}")
+    print(f"  Fuel max      : {info['fuel_max']:.6f}")
+    print(f"  Cells burning : {info['cells_burning']}")
+    print(f"  Cells burnt   : {info['cells_burnt']}")
+    print(f"  Oxygen mean   : {info['oxygen_mean']:.6f}")
+    print(f"  Oxygen min    : {info['oxygen_min']:.6f}")
     print(INFO_SEPARATOR)
 
 
-def run(grid_size: int = DEFAULT_GRID_SIZE, window_size: int = DEFAULT_WINDOW_SIZE) -> None:
-    env = FirecrackerEnv(grid_size=grid_size, window_size=window_size, render_mode="human")
+def run(config: dict) -> None:
+    env = FirecrackerEnv(config=config, render_mode="human")
+
+    step_interval = 1.0 / env._sim.simulation_steps_per_second
+    ms_per_step   = env._sim.ms_per_step
+
+    print_config_info(env)
+
+    log_episodes = bool((config or {}).get("environment", {}).get("print_episode_info", True))
+
+    episode = 0
     obs, info = env.reset()
-    print_environment_info(info, "Startup", grid_size, window_size)
+    episode += 1
+    if log_episodes:
+        print_episode_info(info, f"Episode {episode} — start")
 
     last_step_time = time.monotonic()
+    episode_ended = False
 
     while env._running:
         now = time.monotonic()
+
         if env._step_once:
             env._step_once = False
             obs, reward, terminated, truncated, info = env.step(0)
             last_step_time = now
             if terminated or truncated:
+                if log_episodes:
+                    print_episode_info(info, f"Episode {episode} — end")
+                episode_ended = True
                 break
-        if not env._paused and now - last_step_time >= _STEP_INTERVAL:
+
+        if not env._paused and now - last_step_time >= step_interval:
             step_start = time.monotonic()
             obs, reward, terminated, truncated, info = env.step(0)
             last_step_time = now
             step_elapsed_ms = int((time.monotonic() - step_start) * 1000)
-            if step_elapsed_ms > MS_PER_STEP:
-                print(f"WARNING: Step took {step_elapsed_ms}ms (budget: {MS_PER_STEP}ms)")
+            if step_elapsed_ms > ms_per_step:
+                print(f"WARNING: Step took {step_elapsed_ms}ms (budget: {ms_per_step}ms)")
             if terminated or truncated:
+                if log_episodes:
+                    print_episode_info(info, f"Episode {episode} — end")
+                episode_ended = True
                 break
 
         if env._reset_requested:
+            if log_episodes:
+                print_episode_info(info, f"Episode {episode} — end")
             obs, info = env.reset()
+            episode += 1
+            if log_episodes:
+                print_episode_info(info, f"Episode {episode} — start")
             last_step_time = time.monotonic()
+            episode_ended = False
 
         env.render()
 
-    print_environment_info(info, "Shutdown", grid_size, window_size)
+    if not episode_ended and log_episodes:
+        print_episode_info(info, f"Episode {episode} — end")
+
     env.close()
 
 
 if __name__ == "__main__":
-    try:
-        n = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_GRID_SIZE
-        w = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_WINDOW_SIZE
-    except ValueError:
-        print("Usage: python main.py [N [window_size]]  (both must be positive integers)")
-        sys.exit(1)
-    run(grid_size=n, window_size=w)
+    parser = argparse.ArgumentParser(description="Firecracker interactive runner")
+    parser.add_argument(
+        "--config", metavar="PATH",
+        help="path to a TOML config file (default: cfg/default.toml)",
+    )
+    args = parser.parse_args()
+    run(load_config(args.config))

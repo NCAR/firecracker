@@ -10,226 +10,220 @@ import numpy as np
 import noise
 from scipy.ndimage import convolve, gaussian_filter, map_coordinates
 
-# ---------------------------------------------------------------------------
-# Simulation parameters
-# ---------------------------------------------------------------------------
 
-SIMULATION_STEPS_PER_SECOND: int = 10
-MS_PER_STEP: int = 1000 // SIMULATION_STEPS_PER_SECOND
+class Simulation:
+    def __init__(self, cfg: dict | None = None):
+        sim    = (cfg or {}).get("simulation", {})
+        wind   = (cfg or {}).get("wind", {})
+        oxygen = (cfg or {}).get("oxygen", {})
+        noise  = (cfg or {}).get("noise", {})
+        fire   = (cfg or {}).get("fire", {})
 
-BLUR_SIGMA: float = 1.0
-DIFFUSION_SUBSTEPS: int = 4
+        self.simulation_steps_per_second: int   = int(sim.get("steps_per_second",        10))
+        self.ms_per_step:                 int   = 1000 // self.simulation_steps_per_second
+        self.blur_sigma:                  float = float(sim.get("blur_sigma",              1.0))
+        self.diffusion_substeps:          int   = int(sim.get("diffusion_substeps",        4))
+        self.atmospheric_cooling_rate:    float = float(sim.get("atmospheric_cooling_rate", 0.01))
 
-WIND_ADVECTION_STRENGTH: float = 0.4
-WIND_SMOOTH_SIGMA: float = 2.0
-WIND_TEMPORAL_SMOOTHING: float = 0.2
+        self.wind_advection_strength: float = float(wind.get("advection_strength", 0.4))
+        self.wind_smooth_sigma:       float = float(wind.get("smooth_sigma",       2.0))
+        self.wind_temporal_smoothing: float = float(wind.get("temporal_smoothing", 0.2))
 
-OXYGEN_DIFFUSION_SIGMA: float = 3.0
-OXYGEN_ADVECTION_STRENGTH: float = 3.0
+        self.oxygen_diffusion_sigma:    float = float(oxygen.get("diffusion_sigma",    3.0))
+        self.oxygen_advection_strength: float = float(oxygen.get("advection_strength", 3.0))
 
-ATMOSPHERIC_COOLING_RATE: float = 0.01
+        self.noise_scale:       float = float(noise.get("scale",      64.0))
+        self.noise_octaves:     int   = int(noise.get("octaves",       4))
+        self.noise_persistence: float = float(noise.get("persistence", 0.5))
+        self.noise_lacunarity:  float = float(noise.get("lacunarity",  2.0))
+        self.fuel_noise_scale:  float = float(noise.get("fuel_scale",  32.0))
 
-# ---------------------------------------------------------------------------
-# Perlin noise parameters
-# ---------------------------------------------------------------------------
+        self.ignition_threshold:      float = float(fire.get("ignition_threshold",      0.2))
+        self.fuel_consumption_rate:   float = float(fire.get("fuel_consumption_rate",   0.3))
+        self.oxygen_consumption_rate: float = float(fire.get("oxygen_consumption_rate", 0.3))
+        self.fuel_burn_heat_scale:    float = float(fire.get("burn_heat_scale",         5.0))
+        self.fuel_burnt_threshold:    float = float(fire.get("burnt_threshold",         0.01))
+        self.fuel_min:                float = float(fire.get("fuel_min",                0.1))
 
-NOISE_SCALE: float = 64.0
-NOISE_OCTAVES: int = 4
-NOISE_PERSISTENCE: float = 0.5
-NOISE_LACUNARITY: float = 2.0
+        self._diffusion_kernel        = self._build_diffusion_kernel(
+            self.blur_sigma / math.sqrt(self.diffusion_substeps)
+        )
+        self._oxygen_diffusion_kernel = self._build_diffusion_kernel(
+            self.oxygen_diffusion_sigma / math.sqrt(self.diffusion_substeps)
+        )
 
-FUEL_NOISE_SCALE: float = 32.0
+    # ---------------------------------------------------------------------------
+    # Grid initialisation
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Fire parameters
-# ---------------------------------------------------------------------------
+    def sample_perlin_grid(self, size: int, base: int, scale: float | None = None) -> np.ndarray:
+        if scale is None:
+            scale = self.noise_scale
+        grid = np.empty((size, size), dtype=np.float32)
+        for row in range(size):
+            for col in range(size):
+                grid[row, col] = noise.pnoise2(
+                    col / scale,
+                    row / scale,
+                    octaves=self.noise_octaves,
+                    persistence=self.noise_persistence,
+                    lacunarity=self.noise_lacunarity,
+                    base=base,
+                )
+        return grid
 
-IGNITION_THRESHOLD: float = 0.2
-FUEL_CONSUMPTION_RATE: float = 0.3
-OXYGEN_CONSUMPTION_RATE: float = 0.3
-FUEL_BURN_HEAT_SCALE: float = 5.0
-FUEL_BURNT_THRESHOLD: float = 0.01
-FUEL_MIN: float = 0.1
+    @staticmethod
+    def normalize_grid(grid: np.ndarray) -> np.ndarray:
+        lo = grid.min()
+        hi = grid.max()
+        if hi == lo:
+            return np.zeros_like(grid)
+        return ((grid - lo) / (hi - lo)).astype(np.float32)
 
-# ---------------------------------------------------------------------------
-# Grid initialisation
-# ---------------------------------------------------------------------------
+    def create_grid(self, size: int, scale: float | None = None, base: int | None = None) -> np.ndarray:
+        if scale is None:
+            scale = self.noise_scale
+        if base is None:
+            base = np.random.randint(0, 256)
+        raw = self.sample_perlin_grid(size, base, scale=scale)
+        return self.normalize_grid(raw)
 
-def sample_perlin_grid(
-    size: int,
-    base: int,
-    scale: float = NOISE_SCALE,
-    octaves: int = NOISE_OCTAVES,
-    persistence: float = NOISE_PERSISTENCE,
-    lacunarity: float = NOISE_LACUNARITY,
-) -> np.ndarray:
-    grid = np.empty((size, size), dtype=np.float32)
-    for row in range(size):
-        for col in range(size):
-            grid[row, col] = noise.pnoise2(
-                col / scale,
-                row / scale,
-                octaves=octaves,
-                persistence=persistence,
-                lacunarity=lacunarity,
-                base=base,
-            )
-    return grid
+    # ---------------------------------------------------------------------------
+    # Diffusion / advection
+    # ---------------------------------------------------------------------------
 
+    @staticmethod
+    def _build_diffusion_kernel(sigma: float) -> np.ndarray:
+        offsets = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+        gy, gx = np.meshgrid(offsets, offsets, indexing='ij')
+        kernel = np.exp(-(gx ** 2 + gy ** 2) / (2.0 * sigma ** 2))
+        return (kernel / kernel.sum()).astype(np.float32)
 
-def normalize_grid(grid: np.ndarray) -> np.ndarray:
-    lo = grid.min()
-    hi = grid.max()
-    if hi == lo:
-        return np.zeros_like(grid)
-    return ((grid - lo) / (hi - lo)).astype(np.float32)
+    def _advect_and_diffuse_field(
+        self,
+        field: np.ndarray,
+        source_rows: np.ndarray,
+        source_cols: np.ndarray,
+        boundary_mode: str,
+        boundary_cval: float,
+        kernel: np.ndarray,
+    ) -> np.ndarray:
+        result = field
+        for _ in range(self.diffusion_substeps):
+            result = map_coordinates(
+                result,
+                [source_rows, source_cols],
+                order=1,
+                mode=boundary_mode,
+                cval=boundary_cval,
+            ).astype(np.float32)
+            result = convolve(
+                result,
+                kernel,
+                mode=boundary_mode,
+                cval=boundary_cval,
+            ).astype(np.float32)
+        return result
 
+    @staticmethod
+    def _compute_source_coords(
+        field: np.ndarray,
+        x_wind_vel: np.ndarray,
+        y_wind_vel: np.ndarray,
+        reference_wind_magnitude: float,
+        advection_strength: float,
+        sigma: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        rows, cols = field.shape
+        row_coords = np.arange(rows, dtype=np.float32)
+        col_coords = np.arange(cols, dtype=np.float32)
+        row_grid, col_grid = np.meshgrid(row_coords, col_coords, indexing='ij')
 
-def create_grid(size: int, scale: float = NOISE_SCALE, base: int | None = None) -> np.ndarray:
-    if base is None:
-        base = np.random.randint(0, 256)
-    raw = sample_perlin_grid(size, base, scale=scale)
-    return normalize_grid(raw)
+        if reference_wind_magnitude > 0.0:
+            advection_scale = advection_strength * sigma / reference_wind_magnitude
+        else:
+            advection_scale = 0.0
 
+        return row_grid - y_wind_vel * advection_scale, col_grid - x_wind_vel * advection_scale
 
-# ---------------------------------------------------------------------------
-# Diffusion / advection
-# ---------------------------------------------------------------------------
+    @staticmethod
+    def compute_temperature(temperatures: np.ndarray) -> float:
+        return float(temperatures.mean())
 
-def _build_diffusion_kernel(sigma: float) -> np.ndarray:
-    offsets = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
-    gy, gx = np.meshgrid(offsets, offsets, indexing='ij')
-    kernel = np.exp(-(gx ** 2 + gy ** 2) / (2.0 * sigma ** 2))
-    return (kernel / kernel.sum()).astype(np.float32)
+    def diffuse_and_advect(
+        self,
+        temperatures: np.ndarray,
+        x_wind_vel: np.ndarray,
+        y_wind_vel: np.ndarray,
+        reference_wind_magnitude: float,
+    ) -> np.ndarray:
+        source_rows, source_cols = self._compute_source_coords(
+            temperatures, x_wind_vel, y_wind_vel, reference_wind_magnitude,
+            self.wind_advection_strength, self.blur_sigma,
+        )
+        return self._advect_and_diffuse_field(
+            temperatures, source_rows, source_cols, 'constant', 0.0, self._diffusion_kernel
+        )
 
+    def apply_atmospheric_cooling(self, temperatures: np.ndarray) -> np.ndarray:
+        return (temperatures * (1.0 - self.atmospheric_cooling_rate)).astype(np.float32)
 
-_DIFFUSION_STEP_SIGMA: float = BLUR_SIGMA / math.sqrt(DIFFUSION_SUBSTEPS)
-_DIFFUSION_KERNEL: np.ndarray = _build_diffusion_kernel(_DIFFUSION_STEP_SIGMA)
+    def diffuse_and_advect_oxygen(
+        self,
+        oxygen: np.ndarray,
+        x_wind_vel: np.ndarray,
+        y_wind_vel: np.ndarray,
+        reference_wind_magnitude: float,
+    ) -> np.ndarray:
+        # Boundary cval=1.0 means the outside world acts as an infinite fresh-air source.
+        # No energy correction: oxygen is not conserved — it flows in freely from outside.
+        source_rows, source_cols = self._compute_source_coords(
+            oxygen, x_wind_vel, y_wind_vel, reference_wind_magnitude,
+            self.oxygen_advection_strength, self.oxygen_diffusion_sigma,
+        )
+        result = self._advect_and_diffuse_field(
+            oxygen, source_rows, source_cols, 'constant', 1.0, self._oxygen_diffusion_kernel
+        )
+        return np.clip(result, 0.0, 1.0).astype(np.float32)
 
-_OXYGEN_DIFFUSION_STEP_SIGMA: float = OXYGEN_DIFFUSION_SIGMA / math.sqrt(DIFFUSION_SUBSTEPS)
-_OXYGEN_DIFFUSION_KERNEL: np.ndarray = _build_diffusion_kernel(_OXYGEN_DIFFUSION_STEP_SIGMA)
+    def compute_wind_from_temperature(
+        self, temperatures: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        grad_y, grad_x = np.gradient(temperatures)
+        x_wind = gaussian_filter(grad_x, sigma=self.wind_smooth_sigma).astype(np.float32)
+        y_wind = gaussian_filter(grad_y, sigma=self.wind_smooth_sigma).astype(np.float32)
+        return x_wind, y_wind
 
+    def update_wind(
+        self,
+        temperatures: np.ndarray,
+        x_wind_vel: np.ndarray,
+        y_wind_vel: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        new_x, new_y = self.compute_wind_from_temperature(temperatures)
+        x_wind = (self.wind_temporal_smoothing * new_x + (1.0 - self.wind_temporal_smoothing) * x_wind_vel).astype(np.float32)
+        y_wind = (self.wind_temporal_smoothing * new_y + (1.0 - self.wind_temporal_smoothing) * y_wind_vel).astype(np.float32)
+        return x_wind, y_wind
 
-def _advect_and_diffuse_field(
-    field: np.ndarray,
-    source_rows: np.ndarray,
-    source_cols: np.ndarray,
-    boundary_mode: str,
-    boundary_cval: float,
-    kernel: np.ndarray,
-) -> np.ndarray:
-    result = field
-    for _ in range(DIFFUSION_SUBSTEPS):
-        result = map_coordinates(
-            result,
-            [source_rows, source_cols],
-            order=1,
-            mode=boundary_mode,
-            cval=boundary_cval,
-        ).astype(np.float32)
-        result = convolve(
-            result,
-            kernel,
-            mode=boundary_mode,
-            cval=boundary_cval,
-        ).astype(np.float32)
-    return result
+    # ---------------------------------------------------------------------------
+    # Fire
+    # ---------------------------------------------------------------------------
 
+    def update_fire(
+        self,
+        temperatures: np.ndarray,
+        fuel: np.ndarray,
+        damaged: np.ndarray,
+        oxygen: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        burning = (temperatures >= self.ignition_threshold) & (fuel > self.fuel_burnt_threshold)
 
-def _compute_source_coords(
-    field: np.ndarray,
-    x_wind_vel: np.ndarray,
-    y_wind_vel: np.ndarray,
-    reference_wind_magnitude: float,
-    advection_strength: float,
-    sigma: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    rows, cols = field.shape
-    row_coords = np.arange(rows, dtype=np.float32)
-    col_coords = np.arange(cols, dtype=np.float32)
-    row_grid, col_grid = np.meshgrid(row_coords, col_coords, indexing='ij')
+        fuel_consumed     = np.where(burning, fuel   * self.fuel_consumption_rate,   0.0).astype(np.float32)
+        oxygen_consumed   = np.where(burning, oxygen * self.oxygen_consumption_rate, 0.0).astype(np.float32)
 
-    if reference_wind_magnitude > 0.0:
-        advection_scale = advection_strength * sigma / reference_wind_magnitude
-    else:
-        advection_scale = 0.0
+        fuel         = (fuel - fuel_consumed).astype(np.float32)
+        oxygen       = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
+        temperatures = np.maximum(temperatures + oxygen_consumed * self.fuel_burn_heat_scale, 0.0).astype(np.float32)
+        damaged      = np.where(burning, 1, damaged).astype(np.uint8)
 
-    return row_grid - y_wind_vel * advection_scale, col_grid - x_wind_vel * advection_scale
-
-
-def compute_temperature(temperatures: np.ndarray) -> float:
-    return float(temperatures.mean())
-
-
-def diffuse_and_advect(
-    temperatures: np.ndarray,
-    x_wind_vel: np.ndarray,
-    y_wind_vel: np.ndarray,
-    reference_wind_magnitude: float,
-) -> np.ndarray:
-    source_rows, source_cols = _compute_source_coords(
-        temperatures, x_wind_vel, y_wind_vel, reference_wind_magnitude,
-        WIND_ADVECTION_STRENGTH, BLUR_SIGMA,
-    )
-    return _advect_and_diffuse_field(temperatures, source_rows, source_cols, 'constant', 0.0, _DIFFUSION_KERNEL)
-
-
-def apply_atmospheric_cooling(temperatures: np.ndarray) -> np.ndarray:
-    return (temperatures * (1.0 - ATMOSPHERIC_COOLING_RATE)).astype(np.float32)
-
-
-def diffuse_and_advect_oxygen(
-    oxygen: np.ndarray,
-    x_wind_vel: np.ndarray,
-    y_wind_vel: np.ndarray,
-    reference_wind_magnitude: float,
-) -> np.ndarray:
-    # Boundary cval=1.0 means the outside world acts as an infinite fresh-air source.
-    # No energy correction: oxygen is not conserved — it flows in freely from outside.
-    source_rows, source_cols = _compute_source_coords(
-        oxygen, x_wind_vel, y_wind_vel, reference_wind_magnitude,
-        OXYGEN_ADVECTION_STRENGTH, OXYGEN_DIFFUSION_SIGMA,
-    )
-    result = _advect_and_diffuse_field(oxygen, source_rows, source_cols, 'constant', 1.0, _OXYGEN_DIFFUSION_KERNEL)
-    return np.clip(result, 0.0, 1.0).astype(np.float32)
-
-
-def compute_wind_from_temperature(temperatures: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    grad_y, grad_x = np.gradient(temperatures)
-    x_wind = gaussian_filter(grad_x, sigma=WIND_SMOOTH_SIGMA).astype(np.float32)
-    y_wind = gaussian_filter(grad_y, sigma=WIND_SMOOTH_SIGMA).astype(np.float32)
-    return x_wind, y_wind
-
-
-def update_wind(
-    temperatures: np.ndarray,
-    x_wind_vel: np.ndarray,
-    y_wind_vel: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    new_x, new_y = compute_wind_from_temperature(temperatures)
-    x_wind = (WIND_TEMPORAL_SMOOTHING * new_x + (1.0 - WIND_TEMPORAL_SMOOTHING) * x_wind_vel).astype(np.float32)
-    y_wind = (WIND_TEMPORAL_SMOOTHING * new_y + (1.0 - WIND_TEMPORAL_SMOOTHING) * y_wind_vel).astype(np.float32)
-    return x_wind, y_wind
-
-
-# ---------------------------------------------------------------------------
-# Fire
-# ---------------------------------------------------------------------------
-
-def update_fire(
-    temperatures: np.ndarray,
-    fuel: np.ndarray,
-    damaged: np.ndarray,
-    oxygen: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    burning = (temperatures >= IGNITION_THRESHOLD) & (fuel > FUEL_BURNT_THRESHOLD)
-
-    fuel_consumed = np.where(burning, fuel * FUEL_CONSUMPTION_RATE, 0.0).astype(np.float32)
-    oxygen_consumed = np.where(burning, oxygen * OXYGEN_CONSUMPTION_RATE, 0.0).astype(np.float32)
-
-    fuel = (fuel - fuel_consumed).astype(np.float32)
-    oxygen = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
-    temperatures = np.maximum(temperatures + oxygen_consumed * FUEL_BURN_HEAT_SCALE, 0.0).astype(np.float32)
-    damaged = np.where(burning, 1, damaged).astype(np.uint8)
-
-    return temperatures, fuel, damaged, oxygen
+        return temperatures, fuel, damaged, oxygen
