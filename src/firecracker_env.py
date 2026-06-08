@@ -190,6 +190,7 @@ class FirecrackerEnv(gymnasium.Env):
         self.window_size = int(env_cfg.get("window_size", DEFAULT_WINDOW_SIZE))
         self.max_steps   = int(env_cfg.get("max_steps",   1000))
         self._fire_spawn_radius = int(fire_cfg.get("spawn_radius", FIRE_SPAWN_RADIUS))
+        self._spawn_fire = bool(fire_cfg.get("spawn_fire", False))
         self.render_mode = render_mode
         self._pixel_scale = self.window_size // self.grid_size
 
@@ -241,12 +242,10 @@ class FirecrackerEnv(gymnasium.Env):
         self._temperatures = (temp_raw * 0.1).astype(np.float32)
         fuel_raw = self._sim.create_grid(self.grid_size, scale=self._sim.fuel_noise_scale, base=int(self.np_random.integers(0, 256)))
         self._fuel = (fuel_raw * (1.0 - self._sim.fuel_min) + self._sim.fuel_min).astype(np.float32)
-        r = int(self.np_random.integers(0, self.grid_size))
-        c = int(self.np_random.integers(0, self.grid_size))
-        rows_idx, cols_idx = np.ogrid[:self.grid_size, :self.grid_size]
-        patch = (rows_idx - r) ** 2 + (cols_idx - c) ** 2 <= self._fire_spawn_radius ** 2
-        self._temperatures[patch] = 1.0
-        self._fuel[patch] = 1.0
+        if self._spawn_fire:
+            r = int(self.np_random.integers(0, self.grid_size))
+            c = int(self.np_random.integers(0, self.grid_size))
+            self._spawn_fire_patch(r, c)
         self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_temperature(self._temperatures)
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
@@ -292,7 +291,11 @@ class FirecrackerEnv(gymnasium.Env):
     def render(self) -> np.ndarray | None:
         if self.render_mode == "human":
             self._rebuild_surfaces_if_dirty()
-            self._running, self._current_mode = self._handle_events()
+            self._running, self._current_mode, fire_click = self._handle_events()
+            if fire_click is not None:
+                self._spawn_fire_patch(*fire_click)
+                self._surfaces_dirty = True
+                self._rebuild_surfaces_if_dirty()
             surface = self._surface_for_mode()
             self._screen.blit(surface, (0, 0))
             pygame.display.flip()
@@ -343,12 +346,25 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
         self._surfaces_dirty = False
 
-    def _handle_events(self) -> tuple[bool, ViewMode]:
+    def _spawn_fire_patch(self, row: int, col: int) -> None:
+        rows_idx, cols_idx = np.ogrid[:self.grid_size, :self.grid_size]
+        patch = (rows_idx - row) ** 2 + (cols_idx - col) ** 2 <= self._fire_spawn_radius ** 2
+        self._temperatures[patch] = 1.0
+        self._fuel[patch] = 1.0
+
+    def _handle_events(self) -> tuple[bool, ViewMode, tuple[int, int] | None]:
         running = self._running
         mode = self._current_mode
+        fire_click: tuple[int, int] | None = None
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    px, py = event.pos
+                    row = min(py // self._pixel_scale, self.grid_size - 1)
+                    col = min(px // self._pixel_scale, self.grid_size - 1)
+                    fire_click = (row, col)
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
@@ -360,7 +376,7 @@ class FirecrackerEnv(gymnasium.Env):
                     self._reset_requested = True
                 elif event.key in MODE_KEYS:
                     mode = MODE_KEYS[event.key]
-        return running, mode
+        return running, mode, fire_click
 
     def _build_info(self) -> dict:
         wind_speeds = np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2)

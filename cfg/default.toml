@@ -31,7 +31,8 @@ oxygen_consumption_rate = 0.3 # fraction of remaining oxygen consumed per tick w
 burn_heat_scale       = 5.0   # heat added per unit of oxygen consumed
 burnt_threshold       = 0.01  # fuel below this level is considered ash (no longer burns)
 fuel_min              = 0.1   # minimum initial fuel level (avoids bare patches at spawn)
-spawn_radius          = 5     # pixel radius of the circular ignition patch at reset
+spawn_fire            = false  # if true, a random fire spawns at reset; if false, left-click to ignite
+spawn_radius          = 5     # radius (in grid cells) of the circular ignition patch
 
 [environment]
 grid_size          = 256    # simulation grid cells (N x N)
