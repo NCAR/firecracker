@@ -34,8 +34,9 @@ BLUE_CHANNEL: int = 2
 # Wind arrow visualization parameters
 # ---------------------------------------------------------------------------
 
-_TEMP_FADE_THRESHOLD: float = 1e-2
-_WIND_FADE_THRESHOLD: float = 1e-4
+_TEMP_DISPLAY_THRESHOLD:       float = 1e-2
+_WIND_DISPLAY_THRESHOLD:       float = 1e-4
+_PRESSURE_DISPLAY_THRESHOLD:   float = 1e-2
 
 WIND_ARROW_STRIDE: int = 16
 WIND_ARROW_LENGTH: int = 14
@@ -54,6 +55,7 @@ class ViewMode(Enum):
     WIND = 2
     FIRE = 3
     OXYGEN = 4
+    PRESSURE = 5
 
 
 # Populated from ViewMode values so new modes are picked up automatically.
@@ -72,8 +74,10 @@ def build_color_surface(temperatures: np.ndarray, scale: int) -> pygame.Surface:
     if max_temp == 0.0:
         normalized = np.zeros_like(temperatures)
     else:
-        fade = min(max_temp / _TEMP_FADE_THRESHOLD, 1.0)
-        normalized = np.clip(temperatures / max_temp, 0.0, 1.0) * fade
+        t        = min(max_temp / _TEMP_DISPLAY_THRESHOLD, 1.0)
+        relative = np.clip(temperatures / max_temp, 0.0, 1.0)
+        absolute = np.clip(temperatures / _TEMP_DISPLAY_THRESHOLD, 0.0, 1.0)
+        normalized = t * relative + (1.0 - t) * absolute
     red = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
     red_scaled = np.repeat(np.repeat(red, scale, axis=0), scale, axis=1)
     rgb = np.zeros((rows * scale, cols * scale, 3), dtype=np.uint8)
@@ -96,7 +100,7 @@ def build_wind_surface(
     if reference_magnitude == 0.0:
         return surface
 
-    fade = min(reference_magnitude / _WIND_FADE_THRESHOLD, 1.0)
+    t = min(reference_magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
     magnitudes = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
     half_len = WIND_ARROW_LENGTH / 2.0
     grid_offset = WIND_ARROW_STRIDE // 2
@@ -109,7 +113,9 @@ def build_wind_surface(
             if magnitude == 0.0:
                 continue
 
-            brightness = int(min(magnitude / reference_magnitude, 1.0) * MAX_CHANNEL_VALUE * fade)
+            relative = min(magnitude / reference_magnitude, 1.0)
+            absolute = min(magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
+            brightness = int((t * relative + (1.0 - t) * absolute) * MAX_CHANNEL_VALUE)
             color = (brightness, brightness, brightness)
             ux, uy = vx / magnitude, vy / magnitude
             cx = (col + 0.5) * scale
@@ -136,6 +142,25 @@ def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
     brightness = ((1.0 - np.clip(oxygen, 0.0, 1.0)) * MAX_CHANNEL_VALUE).astype(np.uint8)
     brightness_scaled = np.repeat(np.repeat(brightness, scale, axis=0), scale, axis=1)
     rgb = np.stack([brightness_scaled] * 3, axis=-1)
+    surface = pygame.Surface((cols * scale, rows * scale))
+    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
+    return surface
+
+
+def build_pressure_surface(pressure: np.ndarray, scale: int) -> pygame.Surface:
+    rows, cols = pressure.shape
+    p_min = float(pressure.min())
+    p_max = float(pressure.max())
+    p_range = p_max - p_min
+    absolute = np.clip(pressure, 0.0, 1.0)
+    minmax = (pressure - p_min) / p_range if p_range > 0.0 else absolute
+    t = min(p_range / _PRESSURE_DISPLAY_THRESHOLD, 1.0)
+    normalized = t * minmax + (1.0 - t) * absolute
+    fade = min(p_max / _PRESSURE_DISPLAY_THRESHOLD, 1.0)
+    blue = (normalized * fade * MAX_CHANNEL_VALUE).astype(np.uint8)
+    blue_scaled = np.repeat(np.repeat(blue, scale, axis=0), scale, axis=1)
+    rgb = np.zeros((rows * scale, cols * scale, 3), dtype=np.uint8)
+    rgb[:, :, BLUE_CHANNEL] = blue_scaled
     surface = pygame.Surface((cols * scale, rows * scale))
     pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
     return surface
@@ -210,6 +235,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._reference_wind_magnitude: float = 0.0
         self._fuel: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
+        self._pressure: np.ndarray | None = None
         self._step_count: int = 0
 
         # Rendering state
@@ -219,8 +245,10 @@ class FirecrackerEnv(gymnasium.Env):
         self._wind_surface: pygame.Surface | None = None
         self._fire_surface: pygame.Surface | None = None
         self._oxygen_surface: pygame.Surface | None = None
+        self._pressure_surface: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
+        self._show_wind_overlay: bool = False
         self._running: bool = True
         self._paused: bool = False
         self._reset_requested: bool = False
@@ -248,7 +276,10 @@ class FirecrackerEnv(gymnasium.Env):
             r = int(self.np_random.integers(0, self.grid_size))
             c = int(self.np_random.integers(0, self.grid_size))
             self._spawn_fire_patch(r, c)
-        self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_temperature(self._temperatures)
+        self._pressure = np.exp(
+            -self._sim.pressure_temp_scale * self._temperatures
+        ).astype(np.float32)
+        self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_pressure(self._pressure)
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
         )
@@ -275,8 +306,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._temperatures, self._fuel, self._oxygen = self._sim.update_fire(
             self._temperatures, self._fuel, self._oxygen
         )
+        self._pressure = self._sim.update_pressure(self._pressure, self._temperatures)
         self._x_wind_vel, self._y_wind_vel = self._sim.update_wind(
-            self._temperatures, self._x_wind_vel, self._y_wind_vel
+            self._pressure, self._x_wind_vel, self._y_wind_vel
         )
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
@@ -299,6 +331,8 @@ class FirecrackerEnv(gymnasium.Env):
                 self._rebuild_surfaces_if_dirty()
             surface = self._surface_for_mode()
             self._screen.blit(surface, (0, 0))
+            if self._show_wind_overlay and self._current_mode in (ViewMode.TEMPERATURE, ViewMode.PRESSURE):
+                self._screen.blit(self._wind_surface, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
             pygame.display.flip()
             self._clock.tick(TARGET_FPS)
             return None
@@ -330,7 +364,9 @@ class FirecrackerEnv(gymnasium.Env):
             return self._wind_surface
         if self._current_mode == ViewMode.FIRE:
             return self._fire_surface
-        return self._oxygen_surface
+        if self._current_mode == ViewMode.OXYGEN:
+            return self._oxygen_surface
+        return self._pressure_surface
 
     def _rebuild_surfaces_if_dirty(self) -> None:
         if not self._surfaces_dirty:
@@ -345,6 +381,7 @@ class FirecrackerEnv(gymnasium.Env):
             self._sim.ignition_threshold, self._sim.fuel_burnt_threshold,
         )
         self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
+        self._pressure_surface = build_pressure_surface(self._pressure, self._pixel_scale)
         self._surfaces_dirty = False
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
@@ -373,6 +410,8 @@ class FirecrackerEnv(gymnasium.Env):
                     self._paused = not self._paused
                 elif event.key == pygame.K_PERIOD:
                     self._step_once = True
+                elif event.key == pygame.K_w:
+                    self._show_wind_overlay = not self._show_wind_overlay
                 elif event.key == pygame.K_r:
                     self._reset_requested = True
                 elif event.key in MODE_KEYS:

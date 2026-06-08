@@ -24,6 +24,11 @@ persistence = 0.5
 lacunarity  = 2.0
 fuel_scale  = 32.0   # separate scale for the fuel noise layer
 
+[pressure]
+temp_scale          = 0.2   # alpha in exp(-alpha * T); steepness of pressure response to temperature
+relaxation_rate     = 0.1   # rate at which pressure relaxes toward exp(-alpha * T) each tick
+equalization_rate   = 0.1   # Laplacian coefficient for wind-driven pressure change (must stay < 0.25)
+
 [fire]
 ignition_threshold    = 5     # minimum temperature required to sustain combustion
 fuel_consumption_rate = 0.3   # fraction of remaining fuel consumed per tick while burning

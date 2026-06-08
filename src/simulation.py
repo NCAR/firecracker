@@ -8,7 +8,7 @@ No pygame dependency; safe to import in headless training environments.
 import math
 import numpy as np
 import noise
-from scipy.ndimage import convolve, gaussian_filter, map_coordinates
+from scipy.ndimage import convolve, gaussian_filter, laplace, map_coordinates
 
 
 class Simulation:
@@ -37,6 +37,12 @@ class Simulation:
         self.noise_persistence: float = float(noise.get("persistence", 0.5))
         self.noise_lacunarity:  float = float(noise.get("lacunarity",  2.0))
         self.fuel_noise_scale:  float = float(noise.get("fuel_scale",  32.0))
+
+        pressure = (cfg or {}).get("pressure", {})
+
+        self.pressure_temp_scale:        float = float(pressure.get("temp_scale",        0.2))
+        self.pressure_relaxation_rate:   float = float(pressure.get("relaxation_rate",   0.1))
+        self.pressure_equalization_rate: float = float(pressure.get("equalization_rate", 0.1))
 
         self.ignition_threshold:      float = float(fire.get("ignition_threshold",      5.0))
         self.fuel_consumption_rate:   float = float(fire.get("fuel_consumption_rate",   0.3))
@@ -185,21 +191,36 @@ class Simulation:
         )
         return np.clip(result, 0.0, 1.0).astype(np.float32)
 
-    def compute_wind_from_temperature(
-        self, temperatures: np.ndarray
+    def update_pressure(
+        self,
+        pressure: np.ndarray,
+        temperatures: np.ndarray,
+    ) -> np.ndarray:
+        lap   = laplace(pressure, mode='reflect').astype(np.float32)
+        p_eq  = np.exp(-self.pressure_temp_scale * temperatures).astype(np.float32)
+        new_p = (
+            pressure
+            + self.pressure_equalization_rate * lap
+            + self.pressure_relaxation_rate * (p_eq - pressure)
+        )
+        return np.clip(new_p, 0.0, 1.0).astype(np.float32)
+
+    def compute_wind_from_pressure(
+        self, pressure: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        grad_y, grad_x = np.gradient(temperatures)
-        x_wind = gaussian_filter(grad_x, sigma=self.wind_smooth_sigma).astype(np.float32)
-        y_wind = gaussian_filter(grad_y, sigma=self.wind_smooth_sigma).astype(np.float32)
+        grad_y, grad_x = np.gradient(pressure)
+        # Wind flows from high to low pressure, so negate the gradient.
+        x_wind = gaussian_filter(-grad_x, sigma=self.wind_smooth_sigma).astype(np.float32)
+        y_wind = gaussian_filter(-grad_y, sigma=self.wind_smooth_sigma).astype(np.float32)
         return x_wind, y_wind
 
     def update_wind(
         self,
-        temperatures: np.ndarray,
+        pressure: np.ndarray,
         x_wind_vel: np.ndarray,
         y_wind_vel: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        new_x, new_y = self.compute_wind_from_temperature(temperatures)
+        new_x, new_y = self.compute_wind_from_pressure(pressure)
         x_wind = (self.wind_temporal_smoothing * new_x + (1.0 - self.wind_temporal_smoothing) * x_wind_vel).astype(np.float32)
         y_wind = (self.wind_temporal_smoothing * new_y + (1.0 - self.wind_temporal_smoothing) * y_wind_vel).astype(np.float32)
         return x_wind, y_wind
