@@ -25,12 +25,11 @@ lacunarity  = 2.0
 fuel_scale  = 32.0   # separate scale for the fuel noise layer
 
 [fire]
-ignition_threshold    = 0.2   # minimum temperature required to sustain combustion
+ignition_threshold    = 5     # minimum temperature required to sustain combustion
 fuel_consumption_rate = 0.3   # fraction of remaining fuel consumed per tick while burning
 oxygen_consumption_rate = 0.3 # fraction of remaining oxygen consumed per tick while burning
 burn_heat_scale       = 5.0   # heat added per unit of oxygen consumed
 burnt_threshold       = 0.01  # fuel below this level is considered ash (no longer burns)
-fuel_min              = 0.1   # minimum initial fuel level (avoids bare patches at spawn)
 spawn_fire            = false  # if true, a random fire spawns at reset; if false, left-click to ignite
 spawn_radius          = 5     # radius (in grid cells) of the circular ignition patch
 

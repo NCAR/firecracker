@@ -38,12 +38,11 @@ class Simulation:
         self.noise_lacunarity:  float = float(noise.get("lacunarity",  2.0))
         self.fuel_noise_scale:  float = float(noise.get("fuel_scale",  32.0))
 
-        self.ignition_threshold:      float = float(fire.get("ignition_threshold",      0.2))
+        self.ignition_threshold:      float = float(fire.get("ignition_threshold",      5.0))
         self.fuel_consumption_rate:   float = float(fire.get("fuel_consumption_rate",   0.3))
         self.oxygen_consumption_rate: float = float(fire.get("oxygen_consumption_rate", 0.3))
         self.fuel_burn_heat_scale:    float = float(fire.get("burn_heat_scale",         5.0))
         self.fuel_burnt_threshold:    float = float(fire.get("burnt_threshold",         0.01))
-        self.fuel_min:                float = float(fire.get("fuel_min",                0.1))
 
         self._diffusion_kernel        = self._build_diffusion_kernel(
             self.blur_sigma / math.sqrt(self.diffusion_substeps)
@@ -162,7 +161,7 @@ class Simulation:
             self.wind_advection_strength, self.blur_sigma,
         )
         return self._advect_and_diffuse_field(
-            temperatures, source_rows, source_cols, 'constant', 0.0, self._diffusion_kernel
+            temperatures, source_rows, source_cols, 'reflect', 0.0, self._diffusion_kernel
         )
 
     def apply_atmospheric_cooling(self, temperatures: np.ndarray) -> np.ndarray:
@@ -213,17 +212,15 @@ class Simulation:
         self,
         temperatures: np.ndarray,
         fuel: np.ndarray,
-        damaged: np.ndarray,
         oxygen: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         burning = (temperatures >= self.ignition_threshold) & (fuel > self.fuel_burnt_threshold)
 
-        fuel_consumed     = np.where(burning, fuel   * self.fuel_consumption_rate,   0.0).astype(np.float32)
-        oxygen_consumed   = np.where(burning, oxygen * self.oxygen_consumption_rate, 0.0).astype(np.float32)
+        fuel_consumed   = np.where(burning, fuel   * self.fuel_consumption_rate,   0.0).astype(np.float32)
+        oxygen_consumed = np.where(burning, oxygen * self.oxygen_consumption_rate, 0.0).astype(np.float32)
 
         fuel         = (fuel - fuel_consumed).astype(np.float32)
         oxygen       = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
         temperatures = np.maximum(temperatures + oxygen_consumed * self.fuel_burn_heat_scale, 0.0).astype(np.float32)
-        damaged      = np.where(burning, 1, damaged).astype(np.uint8)
 
-        return temperatures, fuel, damaged, oxygen
+        return temperatures, fuel, oxygen

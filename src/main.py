@@ -49,7 +49,6 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print(f"    oxygen_consumption_rate: {sim.oxygen_consumption_rate}")
     print(f"    burn_heat_scale        : {sim.fuel_burn_heat_scale}")
     print(f"    burnt_threshold        : {sim.fuel_burnt_threshold}")
-    print(f"    fuel_min               : {sim.fuel_min}")
     print(INFO_SEPARATOR)
 
 
@@ -69,7 +68,6 @@ def print_episode_info(info: dict, label: str) -> None:
     print(f"  Fuel min      : {info['fuel_min']:.6f}")
     print(f"  Fuel max      : {info['fuel_max']:.6f}")
     print(f"  Cells burning : {info['cells_burning']}")
-    print(f"  Cells burnt   : {info['cells_burnt']}")
     print(f"  Oxygen mean   : {info['oxygen_mean']:.6f}")
     print(f"  Oxygen min    : {info['oxygen_min']:.6f}")
     print(INFO_SEPARATOR)

@@ -34,6 +34,9 @@ BLUE_CHANNEL: int = 2
 # Wind arrow visualization parameters
 # ---------------------------------------------------------------------------
 
+_TEMP_FADE_THRESHOLD: float = 1e-2
+_WIND_FADE_THRESHOLD: float = 1e-4
+
 WIND_ARROW_STRIDE: int = 16
 WIND_ARROW_LENGTH: int = 14
 WIND_ARROW_LINE_WIDTH: int = 1
@@ -65,7 +68,13 @@ MODE_KEYS: dict[int, ViewMode] = {
 
 def build_color_surface(temperatures: np.ndarray, scale: int) -> pygame.Surface:
     rows, cols = temperatures.shape
-    red = (np.clip(temperatures, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
+    max_temp = float(temperatures.max())
+    if max_temp == 0.0:
+        normalized = np.zeros_like(temperatures)
+    else:
+        fade = min(max_temp / _TEMP_FADE_THRESHOLD, 1.0)
+        normalized = np.clip(temperatures / max_temp, 0.0, 1.0) * fade
+    red = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
     red_scaled = np.repeat(np.repeat(red, scale, axis=0), scale, axis=1)
     rgb = np.zeros((rows * scale, cols * scale, 3), dtype=np.uint8)
     rgb[:, :, RED_CHANNEL] = red_scaled
@@ -87,6 +96,7 @@ def build_wind_surface(
     if reference_magnitude == 0.0:
         return surface
 
+    fade = min(reference_magnitude / _WIND_FADE_THRESHOLD, 1.0)
     magnitudes = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
     half_len = WIND_ARROW_LENGTH / 2.0
     grid_offset = WIND_ARROW_STRIDE // 2
@@ -99,7 +109,7 @@ def build_wind_surface(
             if magnitude == 0.0:
                 continue
 
-            brightness = int(min(magnitude / reference_magnitude, 1.0) * MAX_CHANNEL_VALUE)
+            brightness = int(min(magnitude / reference_magnitude, 1.0) * MAX_CHANNEL_VALUE * fade)
             color = (brightness, brightness, brightness)
             ux, uy = vx / magnitude, vy / magnitude
             cx = (col + 0.5) * scale
@@ -131,16 +141,12 @@ def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
     return surface
 
 
-_COLOR_BURNT    = (  0,   0,   0)
-_COLOR_BURNING  = (255, 140,   0)
-_COLOR_DAMAGED  = (  0,  60,   0)
-_COLOR_HEALTHY  = (  0, 100,   0)
+_COLOR_BURNING = (255, 140, 0)
 
 
 def build_fire_surface(
     temperatures: np.ndarray,
     fuel: np.ndarray,
-    damaged: np.ndarray,
     scale: int,
     ignition_threshold: float,
     fuel_burnt_threshold: float,
@@ -148,15 +154,12 @@ def build_fire_surface(
     rows, cols = temperatures.shape
     rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
 
-    burnt    = fuel <= fuel_burnt_threshold
-    burning  = ~burnt & (temperatures >= ignition_threshold)
-    damaged_ = ~burnt & ~burning & (damaged == 1)
-    healthy  = ~burnt & ~burning & (damaged == 0)
+    burning = (temperatures >= ignition_threshold) & (fuel > fuel_burnt_threshold)
 
-    rgb[healthy]  = _COLOR_HEALTHY
-    rgb[damaged_] = _COLOR_DAMAGED
-    rgb[burning]  = _COLOR_BURNING
-    # burnt stays (0, 0, 0)
+    # Green brightness tracks fuel level; burning cells overwrite with orange.
+    fuel_brightness = (np.clip(fuel, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
+    rgb[:, :, GREEN_CHANNEL] = fuel_brightness
+    rgb[burning] = _COLOR_BURNING
 
     rgb_scaled = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     surface = pygame.Surface((cols * scale, rows * scale))
@@ -206,7 +209,6 @@ class FirecrackerEnv(gymnasium.Env):
         self._y_wind_vel: np.ndarray | None = None
         self._reference_wind_magnitude: float = 0.0
         self._fuel: np.ndarray | None = None
-        self._damaged: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
         self._step_count: int = 0
 
@@ -239,9 +241,9 @@ class FirecrackerEnv(gymnasium.Env):
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
         temp_raw = self._sim.create_grid(self.grid_size, base=int(self.np_random.integers(0, 256)))
-        self._temperatures = (temp_raw * 0.1).astype(np.float32)
+        self._temperatures = temp_raw.astype(np.float32)
         fuel_raw = self._sim.create_grid(self.grid_size, scale=self._sim.fuel_noise_scale, base=int(self.np_random.integers(0, 256)))
-        self._fuel = (fuel_raw * (1.0 - self._sim.fuel_min) + self._sim.fuel_min).astype(np.float32)
+        self._fuel = fuel_raw.astype(np.float32)
         if self._spawn_fire:
             r = int(self.np_random.integers(0, self.grid_size))
             c = int(self.np_random.integers(0, self.grid_size))
@@ -250,7 +252,6 @@ class FirecrackerEnv(gymnasium.Env):
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
         )
-        self._damaged = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
         self._oxygen = np.ones((self.grid_size, self.grid_size), dtype=np.float32)
         self._step_count = 0
         self._running = True
@@ -271,8 +272,8 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen = self._sim.diffuse_and_advect_oxygen(
             self._oxygen, self._x_wind_vel, self._y_wind_vel, self._reference_wind_magnitude
         )
-        self._temperatures, self._fuel, self._damaged, self._oxygen = self._sim.update_fire(
-            self._temperatures, self._fuel, self._damaged, self._oxygen
+        self._temperatures, self._fuel, self._oxygen = self._sim.update_fire(
+            self._temperatures, self._fuel, self._oxygen
         )
         self._x_wind_vel, self._y_wind_vel = self._sim.update_wind(
             self._temperatures, self._x_wind_vel, self._y_wind_vel
@@ -340,7 +341,7 @@ class FirecrackerEnv(gymnasium.Env):
             self._pixel_scale, self._reference_wind_magnitude,
         )
         self._fire_surface = build_fire_surface(
-            self._temperatures, self._fuel, self._damaged, self._pixel_scale,
+            self._temperatures, self._fuel, self._pixel_scale,
             self._sim.ignition_threshold, self._sim.fuel_burnt_threshold,
         )
         self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
@@ -349,7 +350,7 @@ class FirecrackerEnv(gymnasium.Env):
     def _spawn_fire_patch(self, row: int, col: int) -> None:
         rows_idx, cols_idx = np.ogrid[:self.grid_size, :self.grid_size]
         patch = (rows_idx - row) ** 2 + (cols_idx - col) ** 2 <= self._fire_spawn_radius ** 2
-        self._temperatures[patch] = 1.0
+        self._temperatures[patch] = self._sim.ignition_threshold * 2.0
         self._fuel[patch] = 1.0
 
     def _handle_events(self) -> tuple[bool, ViewMode, tuple[int, int] | None]:
@@ -393,7 +394,6 @@ class FirecrackerEnv(gymnasium.Env):
             "fuel_min": float(self._fuel.min()),
             "fuel_max": float(self._fuel.max()),
             "cells_burning": int(burning.sum()),
-            "cells_burnt": int((self._fuel <= self._sim.fuel_burnt_threshold).sum()),
             "oxygen_mean": float(self._oxygen.mean()),
             "oxygen_min": float(self._oxygen.min()),
             "step": self._step_count,
