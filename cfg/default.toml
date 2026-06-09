@@ -8,7 +8,7 @@ diffusion_substeps   = 4      # substeps per tick for numerical stability
 atmospheric_cooling_rate = 0.01  # fraction of heat lost to atmosphere each tick
 
 [wind]
-advection_strength  = 0.4   # how far the temperature field is advected per substep
+advection_strength  = 0.1   # how far the temperature field is advected per substep
 smooth_sigma        = 2.0   # Gaussian smoothing applied to the derived wind field
 temporal_smoothing  = 0.2   # EMA weight toward newly computed wind (0 = frozen, 1 = instant)
 
@@ -30,16 +30,18 @@ relaxation_rate     = 0.1   # rate at which pressure relaxes toward exp(-alpha *
 equalization_rate   = 0.1   # Laplacian coefficient for wind-driven pressure change (must stay < 0.25)
 
 [fire]
-ignition_threshold    = 5     # minimum temperature required to sustain combustion
-fuel_consumption_rate = 0.3   # fraction of remaining fuel consumed per tick while burning
-oxygen_consumption_rate = 0.3 # fraction of remaining oxygen consumed per tick while burning
-burn_heat_scale       = 5.0   # heat added per unit of oxygen consumed
-burnt_threshold       = 0.01  # fuel below this level is considered ash (no longer burns)
-spawn_fire            = false  # if true, a random fire spawns at reset; if false, left-click to ignite
-spawn_radius          = 5     # radius (in grid cells) of the circular ignition patch
+ignition_threshold    = 2     # minimum temperature required to sustain combustion
+fuel_consumption_rate       = 0.001  # fraction of remaining fuel consumed per tick per unit of fuel temperature
+oxygen_consumption_rate     = 0.01   # fraction of remaining oxygen consumed per tick per unit of fuel temperature
+burn_heat_scale             = 500.0  # heat added per unit of min(fuel_consumed, oxygen_consumed)
+burnt_threshold             = 0.01  # fuel below this level is considered ash (no longer burns)
+fuel_air_heat_transfer_rate = 0.01   # fraction of fuel-air temperature difference exchanged per tick
+burn_heat_fuel_fraction     = 0.2   # fraction of burn heat deposited into fuel (rest goes to air)
+spawn_fire                  = false  # if true, a random fire spawns at reset; if false, left-click to ignite
+spawn_radius                = 5     # radius (in grid cells) of the circular ignition patch
 
 [environment]
 grid_size          = 256    # simulation grid cells (N x N)
 window_size        = 512    # display window size in pixels (square)
-max_steps          = 1000   # episode length before truncation
+max_steps          = 10_000   # episode length before truncation
 print_episode_info = true   # print variable state at the start and end of each episode

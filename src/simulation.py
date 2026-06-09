@@ -44,11 +44,13 @@ class Simulation:
         self.pressure_relaxation_rate:   float = float(pressure.get("relaxation_rate",   0.1))
         self.pressure_equalization_rate: float = float(pressure.get("equalization_rate", 0.1))
 
-        self.ignition_threshold:      float = float(fire.get("ignition_threshold",      5.0))
-        self.fuel_consumption_rate:   float = float(fire.get("fuel_consumption_rate",   0.3))
-        self.oxygen_consumption_rate: float = float(fire.get("oxygen_consumption_rate", 0.3))
-        self.fuel_burn_heat_scale:    float = float(fire.get("burn_heat_scale",         5.0))
-        self.fuel_burnt_threshold:    float = float(fire.get("burnt_threshold",         0.01))
+        self.ignition_threshold:          float = float(fire.get("ignition_threshold",          5.0))
+        self.fuel_consumption_rate:       float = float(fire.get("fuel_consumption_rate",       0.3))
+        self.oxygen_consumption_rate:     float = float(fire.get("oxygen_consumption_rate",     0.3))
+        self.fuel_burn_heat_scale:        float = float(fire.get("burn_heat_scale",             5.0))
+        self.fuel_burnt_threshold:        float = float(fire.get("burnt_threshold",             0.01))
+        self.fuel_air_heat_transfer_rate: float = float(fire.get("fuel_air_heat_transfer_rate", 0.1))
+        self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",     0.5))
 
         self._diffusion_kernel        = self._build_diffusion_kernel(
             self.blur_sigma / math.sqrt(self.diffusion_substeps)
@@ -152,26 +154,26 @@ class Simulation:
         return row_grid - y_wind_vel * advection_scale, col_grid - x_wind_vel * advection_scale
 
     @staticmethod
-    def compute_temperature(temperatures: np.ndarray) -> float:
-        return float(temperatures.mean())
+    def compute_air_temperature(air_temperatures: np.ndarray) -> float:
+        return float(air_temperatures.mean())
 
     def diffuse_and_advect(
         self,
-        temperatures: np.ndarray,
+        air_temperatures: np.ndarray,
         x_wind_vel: np.ndarray,
         y_wind_vel: np.ndarray,
         reference_wind_magnitude: float,
     ) -> np.ndarray:
         source_rows, source_cols = self._compute_source_coords(
-            temperatures, x_wind_vel, y_wind_vel, reference_wind_magnitude,
+            air_temperatures, x_wind_vel, y_wind_vel, reference_wind_magnitude,
             self.wind_advection_strength, self.blur_sigma,
         )
         return self._advect_and_diffuse_field(
-            temperatures, source_rows, source_cols, 'reflect', 0.0, self._diffusion_kernel
+            air_temperatures, source_rows, source_cols, 'reflect', 0.0, self._diffusion_kernel
         )
 
-    def apply_atmospheric_cooling(self, temperatures: np.ndarray) -> np.ndarray:
-        return (temperatures * (1.0 - self.atmospheric_cooling_rate)).astype(np.float32)
+    def apply_atmospheric_cooling(self, air_temperatures: np.ndarray) -> np.ndarray:
+        return (air_temperatures * (1.0 - self.atmospheric_cooling_rate)).astype(np.float32)
 
     def diffuse_and_advect_oxygen(
         self,
@@ -194,10 +196,10 @@ class Simulation:
     def update_pressure(
         self,
         pressure: np.ndarray,
-        temperatures: np.ndarray,
+        air_temperatures: np.ndarray,
     ) -> np.ndarray:
         lap   = laplace(pressure, mode='reflect').astype(np.float32)
-        p_eq  = np.exp(-self.pressure_temp_scale * temperatures).astype(np.float32)
+        p_eq  = np.exp(-self.pressure_temp_scale * air_temperatures).astype(np.float32)
         new_p = (
             pressure
             + self.pressure_equalization_rate * lap
@@ -229,19 +231,30 @@ class Simulation:
     # Fire
     # ---------------------------------------------------------------------------
 
+    def exchange_fuel_air_heat(
+        self,
+        air_temperatures: np.ndarray,
+        fuel_temperatures: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        transfer = (self.fuel_air_heat_transfer_rate * (air_temperatures - fuel_temperatures)).astype(np.float32)
+        return (air_temperatures - transfer).astype(np.float32), (fuel_temperatures + transfer).astype(np.float32)
+
     def update_fire(
         self,
-        temperatures: np.ndarray,
+        air_temperatures: np.ndarray,
+        fuel_temperatures: np.ndarray,
         fuel: np.ndarray,
         oxygen: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        burning = (temperatures >= self.ignition_threshold) & (fuel > self.fuel_burnt_threshold)
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        burning = (fuel_temperatures >= self.ignition_threshold) & (fuel > self.fuel_burnt_threshold)
 
-        fuel_consumed   = np.where(burning, fuel   * self.fuel_consumption_rate,   0.0).astype(np.float32)
-        oxygen_consumed = np.where(burning, oxygen * self.oxygen_consumption_rate, 0.0).astype(np.float32)
+        fuel_consumed   = np.where(burning, fuel   * np.minimum(fuel_temperatures * self.fuel_consumption_rate,   1.0), 0.0).astype(np.float32)
+        oxygen_consumed = np.where(burning, oxygen * np.minimum(fuel_temperatures * self.oxygen_consumption_rate, 1.0), 0.0).astype(np.float32)
 
-        fuel         = (fuel - fuel_consumed).astype(np.float32)
-        oxygen       = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
-        temperatures = np.maximum(temperatures + oxygen_consumed * self.fuel_burn_heat_scale, 0.0).astype(np.float32)
+        fuel    = (fuel - fuel_consumed).astype(np.float32)
+        oxygen  = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
+        burn_heat = np.minimum(fuel_consumed, oxygen_consumed) * self.fuel_burn_heat_scale
+        air_temperatures  = np.maximum(air_temperatures  + burn_heat * (1.0 - self.burn_heat_fuel_fraction), 0.0).astype(np.float32)
+        fuel_temperatures = np.maximum(fuel_temperatures + burn_heat * self.burn_heat_fuel_fraction,         0.0).astype(np.float32)
 
-        return temperatures, fuel, oxygen
+        return air_temperatures, fuel_temperatures, fuel, oxygen
