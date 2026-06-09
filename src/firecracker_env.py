@@ -39,7 +39,7 @@ _WIND_DISPLAY_THRESHOLD:       float = 1e-4
 _PRESSURE_DISPLAY_THRESHOLD:   float = 1e-2
 
 WIND_ARROW_STRIDE: int = 16
-WIND_ARROW_LENGTH: int = 14
+WIND_ARROW_LENGTH: int = 24
 WIND_ARROW_LINE_WIDTH: int = 1
 WIND_ARROW_HEAD_SIZE: int = 4
 WIND_ARROW_HEAD_ANGLE: float = math.pi / 6  # 30 degrees
@@ -79,10 +79,14 @@ def build_color_surface(air_temperatures: np.ndarray, scale: int) -> pygame.Surf
         relative = np.clip(air_temperatures / max_temp, 0.0, 1.0)
         absolute = np.clip(air_temperatures / _AIR_TEMP_DISPLAY_THRESHOLD, 0.0, 1.0)
         normalized = t * relative + (1.0 - t) * absolute
-    red = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
-    red_scaled = np.repeat(np.repeat(red, scale, axis=0), scale, axis=1)
-    rgb = np.zeros((rows * scale, cols * scale, 3), dtype=np.uint8)
-    rgb[:, :, RED_CHANNEL] = red_scaled
+    r = (normalized * 255).astype(np.uint8)
+    g = ((1.0 - normalized) * 15).astype(np.uint8)
+    b = ((1.0 - normalized) * 31).astype(np.uint8)
+    rgb = np.stack([
+        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
+    ], axis=-1)
     surface = pygame.Surface((cols * scale, rows * scale))
     # surfarray expects (width, height, 3); numpy is (height, width, 3)
     pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
@@ -92,35 +96,46 @@ def build_color_surface(air_temperatures: np.ndarray, scale: int) -> pygame.Surf
 def build_wind_surface(
     x_wind_vel: np.ndarray,
     y_wind_vel: np.ndarray,
+    air_temperatures: np.ndarray,
     scale: int,
     reference_magnitude: float,
 ) -> pygame.Surface:
     rows, cols = x_wind_vel.shape
     surface = pygame.Surface((cols * scale, rows * scale))
+    surface.set_colorkey((0, 0, 0))
 
     if reference_magnitude == 0.0:
         return surface
 
     t = min(reference_magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
     magnitudes = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
-    half_len = WIND_ARROW_LENGTH / 2.0
+    max_half_len = WIND_ARROW_LENGTH / 2.0
     grid_offset = WIND_ARROW_STRIDE // 2
+
+    visible_temps = air_temperatures[magnitudes >= 0.1 * reference_magnitude]
+    temp_min = float(visible_temps.min()) if visible_temps.size > 0 else float(air_temperatures.min())
+    temp_max = float(visible_temps.max()) if visible_temps.size > 0 else float(air_temperatures.max())
+    temp_range = temp_max - temp_min
 
     for row in range(grid_offset, rows, WIND_ARROW_STRIDE):
         for col in range(grid_offset, cols, WIND_ARROW_STRIDE):
             vx = float(x_wind_vel[row, col])
             vy = float(y_wind_vel[row, col])
             magnitude = float(magnitudes[row, col])
-            if magnitude == 0.0:
+            if magnitude < 0.1 * reference_magnitude:
                 continue
 
             relative = min(magnitude / reference_magnitude, 1.0)
             absolute = min(magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
-            brightness = int((t * relative + (1.0 - t) * absolute) * MAX_CHANNEL_VALUE)
-            color = (brightness, brightness, brightness)
+            half_len = (t * relative + (1.0 - t) * absolute) * max_half_len
+            if half_len < 1.0:
+                continue
             ux, uy = vx / magnitude, vy / magnitude
             cx = (col + 0.5) * scale
             cy = (row + 0.5) * scale
+
+            heat = (float(air_temperatures[row, col]) - temp_min) / temp_range if temp_range > 0.0 else 0.0
+            color = (int(heat * MAX_CHANNEL_VALUE), int((1.0 - heat) * 127), int((1.0 - heat) * MAX_CHANNEL_VALUE))
 
             start = (int(cx - ux * half_len), int(cy - uy * half_len))
             tip = (int(cx + ux * half_len), int(cy + uy * half_len))
@@ -185,7 +200,7 @@ def build_fire_surface(
     rgb[:, :, GREEN_CHANNEL] = fuel_brightness
 
     if show_fire_overlay:
-        # Burning cells: red at ignition threshold, yellow at 10x ignition threshold.
+        # Burning cells: red at ignition threshold, yellow at 25x ignition threshold.
         t = np.clip((fuel_temperatures - ignition_threshold) / (24.0 * ignition_threshold), 0.0, 1.0)
         rgb[burning, RED_CHANNEL]   = MAX_CHANNEL_VALUE
         rgb[burning, GREEN_CHANNEL] = (t[burning] * MAX_CHANNEL_VALUE).astype(np.uint8)
@@ -277,7 +292,7 @@ class FirecrackerEnv(gymnasium.Env):
         super().reset(seed=seed)
         temp_raw = self._sim.create_grid(self.grid_size, base=int(self.np_random.integers(0, 256)))
         self._air_temperatures  = temp_raw.astype(np.float32)
-        self._fuel_temperatures = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        self._fuel_temperatures = self._air_temperatures.copy()
         fuel_raw = self._sim.create_grid(self.grid_size, scale=self._sim.fuel_noise_scale, base=int(self.np_random.integers(0, 256)))
         self._fuel = fuel_raw.astype(np.float32)
         if self._spawn_fire:
@@ -341,9 +356,10 @@ class FirecrackerEnv(gymnasium.Env):
                 self._surfaces_dirty = True
                 self._rebuild_surfaces_if_dirty()
             surface = self._surface_for_mode()
+            self._screen.fill((0, 0, 0))
             self._screen.blit(surface, (0, 0))
             if self._show_wind_overlay and self._current_mode in (ViewMode.TEMPERATURE, ViewMode.PRESSURE):
-                self._screen.blit(self._wind_surface, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+                self._screen.blit(self._wind_surface, (0, 0))
             pygame.display.flip()
             self._clock.tick(TARGET_FPS)
             return None
@@ -386,7 +402,7 @@ class FirecrackerEnv(gymnasium.Env):
             return
         self._color_surface = build_color_surface(self._air_temperatures, self._pixel_scale)
         self._wind_surface = build_wind_surface(
-            self._x_wind_vel, self._y_wind_vel,
+            self._x_wind_vel, self._y_wind_vel, self._air_temperatures,
             self._pixel_scale, self._reference_wind_magnitude,
         )
         self._fire_surface = build_fire_surface(
