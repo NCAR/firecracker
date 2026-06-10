@@ -45,21 +45,21 @@ spawn_radius                = 5      # radius (in grid cells) of the circular ig
 heat_capacity          = 0.5    # thermal mass per unit of fuel
 ignition_threshold     = 1.5    # fuel temperature required to ignite
 consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fuel temperature
-burn_heat_scale        = 300.0  # heat released per unit of fuel consumed
+burn_heat_scale        = 100.0  # heat released per unit of fuel consumed
 fuel_air_transfer_rate = 0.05   # rate of heat exchange with air
 noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
 
 [fuel_types.wood]
-heat_capacity          = 2.0
+heat_capacity          = 2.5
 ignition_threshold     = 1.5
 consumption_rate       = 0.001
-burn_heat_scale        = 800.0
+burn_heat_scale        = 300.0
 fuel_air_transfer_rate = 0.01
 noise_scale            = 32.0
 
 [radiant_heat]
 kernel_radius     = 10       # max range of radiation in grid cells
-emission_scale    = 0.0001   # multiplier on fuel temperature emission
+emission_scale    = 0.002    # multiplier on fuel temperature emission
 emission_exponent = 2.0      # nonlinearity of emission vs fuel temperature (blackbody ~4)
 
 [environment]
