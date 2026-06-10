@@ -38,6 +38,13 @@ _AIR_TEMP_DISPLAY_THRESHOLD:       float = 1e-2
 _WIND_DISPLAY_THRESHOLD:       float = 1e-4
 _PRESSURE_DISPLAY_THRESHOLD:   float = 1e-2
 
+# EMA weight for the upper bound of the fuel-temperature and radiant-heat color
+# scales. Smaller = steadier (slower to track the peak); larger = more responsive.
+_DISPLAY_SCALE_EMA_ALPHA: float = 0.1
+# Fraction of the frame max the EMA tracks toward, so cells at/above this fraction
+# of the smoothed peak saturate to the top color.
+_DISPLAY_SCALE_MAX_FRACTION: float = 0.5
+
 WIND_ARROW_STRIDE: int = 16
 WIND_ARROW_LENGTH: int = 24
 WIND_ARROW_LINE_WIDTH: int = 1
@@ -70,16 +77,26 @@ MODE_KEYS: dict[int, ViewMode] = {
 # Surface builders
 # ---------------------------------------------------------------------------
 
-def build_color_surface(air_temperatures: np.ndarray, scale: int) -> pygame.Surface:
+def build_color_surface(
+    air_temperatures: np.ndarray, scale: int, upper_bound: float | None = None
+) -> pygame.Surface:
     rows, cols = air_temperatures.shape
-    max_temp = float(air_temperatures.max())
-    if max_temp == 0.0:
-        normalized = np.zeros_like(air_temperatures)
+    if upper_bound is not None:
+        # Fixed (EMA-smoothed) upper bound: normalize against it and clamp values
+        # above it to the top color, so the scale doesn't flicker with the frame max.
+        normalized = (
+            np.clip(air_temperatures / upper_bound, 0.0, 1.0)
+            if upper_bound > 0.0 else np.zeros_like(air_temperatures)
+        )
     else:
-        t        = min(max_temp / _AIR_TEMP_DISPLAY_THRESHOLD, 1.0)
-        relative = np.clip(air_temperatures / max_temp, 0.0, 1.0)
-        absolute = np.clip(air_temperatures / _AIR_TEMP_DISPLAY_THRESHOLD, 0.0, 1.0)
-        normalized = t * relative + (1.0 - t) * absolute
+        max_temp = float(air_temperatures.max())
+        if max_temp == 0.0:
+            normalized = np.zeros_like(air_temperatures)
+        else:
+            t        = min(max_temp / _AIR_TEMP_DISPLAY_THRESHOLD, 1.0)
+            relative = np.clip(air_temperatures / max_temp, 0.0, 1.0)
+            absolute = np.clip(air_temperatures / _AIR_TEMP_DISPLAY_THRESHOLD, 0.0, 1.0)
+            normalized = t * relative + (1.0 - t) * absolute
     r = (normalized * 255).astype(np.uint8)
     g = ((1.0 - normalized) * 15).astype(np.uint8)
     b = ((1.0 - normalized) * 31).astype(np.uint8)
@@ -183,10 +200,13 @@ def build_pressure_surface(pressure: np.ndarray, scale: int) -> pygame.Surface:
     return surface
 
 
-def build_radiant_heat_surface(radiant_flux: np.ndarray, scale: int) -> pygame.Surface:
+def build_radiant_heat_surface(
+    radiant_flux: np.ndarray, scale: int, upper_bound: float | None = None
+) -> pygame.Surface:
     rows, cols = radiant_flux.shape
-    max_flux = float(radiant_flux.max())
-    normalized = (np.clip(radiant_flux / max_flux, 0.0, 1.0) if max_flux > 0.0 else np.zeros_like(radiant_flux))
+    # EMA-smoothed upper bound when provided; otherwise fall back to the frame max.
+    bound = upper_bound if upper_bound is not None else float(radiant_flux.max())
+    normalized = (np.clip(radiant_flux / bound, 0.0, 1.0) if bound > 0.0 else np.zeros_like(radiant_flux))
     r = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
     g = (normalized * 80).astype(np.uint8)
     b = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
@@ -285,6 +305,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen: np.ndarray | None = None
         self._pressure: np.ndarray | None = None
         self._last_radiant_flux: np.ndarray | None = None
+        # EMA-smoothed upper bounds for the mode 6 / mode 7 color scales.
+        self._fuel_temp_display_scale: float = 0.0
+        self._radiant_flux_display_scale: float = 0.0
         self._step_count: int = 0
 
         # Rendering state
@@ -358,6 +381,9 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._oxygen = np.ones((self.grid_size, self.grid_size), dtype=np.float32)
         self._last_radiant_flux = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        # Seed the display scales from the initial state so the first frames are scaled sanely.
+        self._fuel_temp_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._fuel_temperatures.max())
+        self._radiant_flux_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._last_radiant_flux.max())
         self._step_count = 0
         self._running = True
         self._paused = False
@@ -392,6 +418,16 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
+        )
+        # Track EMA-smoothed peaks (toward a fraction of the max) so the mode 6 / mode 7
+        # color scales don't flicker.
+        a = _DISPLAY_SCALE_EMA_ALPHA
+        f = _DISPLAY_SCALE_MAX_FRACTION
+        self._fuel_temp_display_scale = (
+            a * f * float(self._fuel_temperatures.max()) + (1.0 - a) * self._fuel_temp_display_scale
+        )
+        self._radiant_flux_display_scale = (
+            a * f * float(self._last_radiant_flux.max()) + (1.0 - a) * self._radiant_flux_display_scale
         )
         self._step_count += 1
         self._surfaces_dirty = True
@@ -468,8 +504,14 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(self._pressure, self._pixel_scale)
-        self._fuel_temperature_surface = build_color_surface(self._fuel_temperatures.max(axis=0), self._pixel_scale)
-        self._radiant_flux_surface = build_radiant_heat_surface(self._last_radiant_flux, self._pixel_scale)
+        self._fuel_temperature_surface = build_color_surface(
+            self._fuel_temperatures.max(axis=0), self._pixel_scale,
+            upper_bound=self._fuel_temp_display_scale,
+        )
+        self._radiant_flux_surface = build_radiant_heat_surface(
+            self._last_radiant_flux, self._pixel_scale,
+            upper_bound=self._radiant_flux_display_scale,
+        )
         self._surfaces_dirty = False
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
