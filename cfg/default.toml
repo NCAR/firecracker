@@ -51,7 +51,7 @@ noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
 
 [fuel_types.wood]
 heat_capacity          = 2.0
-ignition_threshold     = 3.0
+ignition_threshold     = 1.5
 consumption_rate       = 0.001
 burn_heat_scale        = 800.0
 fuel_air_transfer_rate = 0.01

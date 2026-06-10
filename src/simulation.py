@@ -290,9 +290,10 @@ class Simulation:
             dT_fuel_raw,
             dT_fuel_eq,
         )
-        dT_fuel = np.where(mask, dT_fuel, 0.0).astype(np.float32)
+        dT_fuel = dT_fuel.astype(np.float32)
 
         # Air loses the sum of heat transferred to all fuel types (energy conserving).
+        # Depleted cells (mask=False) contribute ~0 because C_fuel = h*fuel ≈ 0.
         dT_air = -np.sum(C_fuel * dT_fuel, axis=0).astype(np.float32)
 
         return (air_temperatures + dT_air).astype(np.float32), (fuel_temperatures + dT_fuel).astype(np.float32)
