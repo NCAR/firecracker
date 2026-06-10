@@ -2,13 +2,13 @@
 # All parameters have defaults in the source; values here override those defaults.
 
 [simulation]
-steps_per_second     = 25     # physics ticks per second
+steps_per_second     = 10     # physics ticks per second
 blur_sigma           = 1.0    # Gaussian diffusion width per tick
 diffusion_substeps   = 4      # substeps per tick for numerical stability
 atmospheric_cooling_rate = 0.01  # fraction of heat lost to atmosphere each tick
 
 [wind]
-advection_strength  = 0.1   # how far the temperature field is advected per substep
+advection_strength  = 0.2   # how far the temperature field is advected per substep
 smooth_sigma        = 2.0   # Gaussian smoothing applied to the derived wind field
 temporal_smoothing  = 0.2   # EMA weight toward newly computed wind (0 = frozen, 1 = instant)
 
@@ -39,6 +39,11 @@ fuel_air_heat_transfer_rate = 0.01   # fraction of fuel-air temperature differen
 burn_heat_fuel_fraction     = 0.2   # fraction of burn heat deposited into fuel (rest goes to air)
 spawn_fire                  = false  # if true, a random fire spawns at reset; if false, left-click to ignite
 spawn_radius                = 5     # radius (in grid cells) of the circular ignition patch
+
+[radiant_heat]
+kernel_radius     = 10     # max range of radiation in grid cells
+emission_scale    = 0.0001   # multiplier on fuel temperature emission
+emission_exponent = 2.0    # nonlinearity of emission vs fuel temperature (blackbody ~4)
 
 [environment]
 grid_size          = 256    # simulation grid cells (N x N)

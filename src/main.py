@@ -55,6 +55,10 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print(f"    burnt_threshold             : {sim.fuel_burnt_threshold}")
     print(f"    fuel_air_heat_transfer_rate : {sim.fuel_air_heat_transfer_rate}")
     print(f"    burn_heat_fuel_fraction     : {sim.burn_heat_fuel_fraction}")
+    print("  [radiant_heat]")
+    print(f"    kernel_radius          : {sim.radiant_kernel_radius}")
+    print(f"    emission_scale         : {sim.radiant_emission_scale}")
+    print(f"    emission_exponent      : {sim.radiant_emission_exponent}")
     print(INFO_SEPARATOR)
 
 

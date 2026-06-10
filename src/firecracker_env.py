@@ -332,6 +332,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen = self._sim.update_fire(
             self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen
         )
+        self._fuel_temperatures = self._sim.apply_radiant_heat(
+            self._fuel_temperatures, self._fuel
+        )
         self._pressure = self._sim.update_pressure(self._pressure, self._air_temperatures)
         self._x_wind_vel, self._y_wind_vel = self._sim.update_wind(
             self._pressure, self._x_wind_vel, self._y_wind_vel

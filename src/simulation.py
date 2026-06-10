@@ -8,7 +8,8 @@ No pygame dependency; safe to import in headless training environments.
 import math
 import numpy as np
 import noise
-from scipy.ndimage import convolve, gaussian_filter, laplace, map_coordinates
+from scipy.ndimage import gaussian_filter, laplace, map_coordinates
+from scipy.signal import fftconvolve, oaconvolve
 
 
 class Simulation:
@@ -52,12 +53,18 @@ class Simulation:
         self.fuel_air_heat_transfer_rate: float = float(fire.get("fuel_air_heat_transfer_rate", 0.1))
         self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",     0.5))
 
+        radiant = (cfg or {}).get("radiant_heat", {})
+        self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",     20))
+        self.radiant_emission_scale:    float = float(radiant.get("emission_scale",   0.05))
+        self.radiant_emission_exponent: float = float(radiant.get("emission_exponent", 2.0))
+
         self._diffusion_kernel        = self._build_diffusion_kernel(
             self.blur_sigma / math.sqrt(self.diffusion_substeps)
         )
         self._oxygen_diffusion_kernel = self._build_diffusion_kernel(
             self.oxygen_diffusion_sigma / math.sqrt(self.diffusion_substeps)
         )
+        self._radiant_kernel = self._build_radiant_kernel(self.radiant_kernel_radius)
 
     # ---------------------------------------------------------------------------
     # Grid initialisation
@@ -106,6 +113,17 @@ class Simulation:
         kernel = np.exp(-(gx ** 2 + gy ** 2) / (2.0 * sigma ** 2))
         return (kernel / kernel.sum()).astype(np.float32)
 
+    @staticmethod
+    def _build_radiant_kernel(radius: int) -> np.ndarray:
+        size = 2 * radius + 1
+        rows, cols = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
+        r_sq = ((rows - radius) ** 2 + (cols - radius) ** 2).astype(np.float32)
+        # 1/r² inverse-square law; center cell contributes nothing (self-heating handled by combustion).
+        # Avoid dividing by zero at the center by substituting 1.0 before masking it out.
+        safe_r_sq = np.where(r_sq > 0, r_sq, 1.0)
+        kernel = np.where(r_sq > 0, 1.0 / safe_r_sq, 0.0).astype(np.float32)
+        return (kernel / kernel.sum()).astype(np.float32)
+
     def _advect_and_diffuse_field(
         self,
         field: np.ndarray,
@@ -116,6 +134,8 @@ class Simulation:
         kernel: np.ndarray,
     ) -> np.ndarray:
         result = field
+        pad_r = kernel.shape[0] // 2
+        pad_c = kernel.shape[1] // 2
         for _ in range(self.diffusion_substeps):
             result = map_coordinates(
                 result,
@@ -124,12 +144,11 @@ class Simulation:
                 mode=boundary_mode,
                 cval=boundary_cval,
             ).astype(np.float32)
-            result = convolve(
-                result,
-                kernel,
-                mode=boundary_mode,
-                cval=boundary_cval,
-            ).astype(np.float32)
+            if boundary_mode == 'reflect':
+                padded = np.pad(result, ((pad_r, pad_r), (pad_c, pad_c)), mode='reflect')
+            else:
+                padded = np.pad(result, ((pad_r, pad_r), (pad_c, pad_c)), mode='constant', constant_values=boundary_cval)
+            result = oaconvolve(padded, kernel, mode='valid').astype(np.float32)
         return result
 
     @staticmethod
@@ -258,3 +277,19 @@ class Simulation:
         fuel_temperatures = np.maximum(fuel_temperatures + burn_heat * self.burn_heat_fuel_fraction,         0.0).astype(np.float32)
 
         return air_temperatures, fuel_temperatures, fuel, oxygen
+
+    def apply_radiant_heat(
+        self,
+        fuel_temperatures: np.ndarray,
+        fuel: np.ndarray,
+    ) -> np.ndarray:
+        burning = (fuel_temperatures >= self.ignition_threshold) & (fuel > self.fuel_burnt_threshold)
+        emission = np.where(
+            burning,
+            self.radiant_emission_scale * fuel_temperatures ** self.radiant_emission_exponent,
+            0.0,
+        ).astype(np.float32)
+        radiant_flux = np.clip(
+            fftconvolve(emission, self._radiant_kernel, mode='same'), 0.0, None
+        ).astype(np.float32)
+        return (fuel_temperatures + radiant_flux).astype(np.float32)
