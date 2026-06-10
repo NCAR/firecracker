@@ -29,7 +29,7 @@ relaxation_rate     = 0.1   # rate at which pressure relaxes toward exp(-alpha *
 equalization_rate   = 0.1   # Laplacian coefficient for wind-driven pressure change (must stay < 0.25)
 
 [fire]
-oxygen_consumption_rate     = 0.01   # fraction of remaining oxygen consumed per tick per unit of fuel temperature
+oxygen_consumption_rate     = 3.0    # oxygen consumed per unit of fuel burned (stoichiometric)
 burnt_threshold             = 0.01   # fuel below this level is considered ash (no longer burns)
 oxygen_extinction_threshold = 0.05   # oxygen below this level extinguishes fire
 burn_heat_fuel_fraction     = 0.2    # fraction of burn heat deposited into fuel (rest goes to air)

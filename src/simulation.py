@@ -290,10 +290,13 @@ class Simulation:
             dT_fuel_raw,
             dT_fuel_eq,
         )
-        dT_fuel = dT_fuel.astype(np.float32)
+        # Burnt-out cells (mask=False) are ~massless: snap them straight to air
+        # temperature (dT_fuel = dT). They carry no thermal mass, so the dT_air term
+        # below leaves the air essentially unchanged — massless ash holds no heat.
+        dT_fuel = np.where(mask, dT_fuel, dT).astype(np.float32)
 
         # Air loses the sum of heat transferred to all fuel types (energy conserving).
-        # Depleted cells (mask=False) contribute ~0 because C_fuel = h*fuel ≈ 0.
+        # Depleted cells contribute ~0 because C_fuel = h*fuel ≈ 0.
         dT_air = -np.sum(C_fuel * dT_fuel, axis=0).astype(np.float32)
 
         return (air_temperatures + dT_air).astype(np.float32), (fuel_temperatures + dT_fuel).astype(np.float32)
@@ -322,12 +325,11 @@ class Simulation:
             0.0,
         ).astype(np.float32)  # (N, H, W)
 
-        # Oxygen consumed by all burning types combined, capped at available oxygen.
+        # Oxygen consumed is stoichiometric: proportional to fuel actually burned this
+        # tick (summed over types), capped at available oxygen. Tying it to fuel_consumed
+        # rather than ambient oxygen avoids a hot cell suffocating itself in one tick.
         oxygen_consumed = np.minimum(
-            np.sum(
-                np.where(burning, oxygen[np.newaxis] * np.minimum(fuel_temperatures * self.oxygen_consumption_rate, 1.0), 0.0),
-                axis=0,
-            ),
+            np.sum(fuel_consumed * self.oxygen_consumption_rate, axis=0),
             oxygen,
         ).astype(np.float32)  # (H, W)
 
