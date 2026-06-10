@@ -359,7 +359,7 @@ class Simulation:
         fuel_temperatures: np.ndarray,  # (N, H, W)
         fuel: np.ndarray,               # (N, H, W)
         oxygen: np.ndarray,             # (H, W)
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         ign = self.ignition_thresholds[:, np.newaxis, np.newaxis]
 
         burning = (
@@ -396,4 +396,4 @@ class Simulation:
             0.0,
         ).astype(np.float32)
 
-        return (fuel_temperatures + dT_fuel).astype(np.float32)
+        return (fuel_temperatures + dT_fuel).astype(np.float32), radiant_flux

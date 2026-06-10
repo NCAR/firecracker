@@ -57,6 +57,7 @@ class ViewMode(Enum):
     OXYGEN = 4
     PRESSURE = 5
     FUEL_TEMPERATURE = 6
+    RADIANT_HEAT = 7
 
 
 # Populated from ViewMode values so new modes are picked up automatically.
@@ -182,6 +183,23 @@ def build_pressure_surface(pressure: np.ndarray, scale: int) -> pygame.Surface:
     return surface
 
 
+def build_radiant_heat_surface(radiant_flux: np.ndarray, scale: int) -> pygame.Surface:
+    rows, cols = radiant_flux.shape
+    max_flux = float(radiant_flux.max())
+    normalized = (np.clip(radiant_flux / max_flux, 0.0, 1.0) if max_flux > 0.0 else np.zeros_like(radiant_flux))
+    r = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
+    g = (normalized * 80).astype(np.uint8)
+    b = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
+    rgb = np.stack([
+        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
+    ], axis=-1)
+    surface = pygame.Surface((cols * scale, rows * scale))
+    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
+    return surface
+
+
 def build_fire_surface(
     fuel_temperatures: np.ndarray,       # (N, H, W)
     fuel: np.ndarray,                    # (N, H, W)
@@ -266,6 +284,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._fuel: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
         self._pressure: np.ndarray | None = None
+        self._last_radiant_flux: np.ndarray | None = None
         self._step_count: int = 0
 
         # Rendering state
@@ -277,6 +296,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen_surface: pygame.Surface | None = None
         self._pressure_surface: pygame.Surface | None = None
         self._fuel_temperature_surface: pygame.Surface | None = None
+        self._radiant_flux_surface: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
         self._show_wind_overlay: bool = False
@@ -337,6 +357,7 @@ class FirecrackerEnv(gymnasium.Env):
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
         )
         self._oxygen = np.ones((self.grid_size, self.grid_size), dtype=np.float32)
+        self._last_radiant_flux = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         self._step_count = 0
         self._running = True
         self._paused = False
@@ -362,7 +383,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen = self._sim.update_fire(
             self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen
         )
-        self._fuel_temperatures = self._sim.apply_radiant_heat(
+        self._fuel_temperatures, self._last_radiant_flux = self._sim.apply_radiant_heat(
             self._fuel_temperatures, self._fuel, self._oxygen
         )
         self._pressure = self._sim.update_pressure(self._pressure, self._air_temperatures)
@@ -428,7 +449,9 @@ class FirecrackerEnv(gymnasium.Env):
             return self._oxygen_surface
         if self._current_mode == ViewMode.PRESSURE:
             return self._pressure_surface
-        return self._fuel_temperature_surface
+        if self._current_mode == ViewMode.FUEL_TEMPERATURE:
+            return self._fuel_temperature_surface
+        return self._radiant_flux_surface
 
     def _rebuild_surfaces_if_dirty(self) -> None:
         if not self._surfaces_dirty:
@@ -446,6 +469,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(self._pressure, self._pixel_scale)
         self._fuel_temperature_surface = build_color_surface(self._fuel_temperatures.max(axis=0), self._pixel_scale)
+        self._radiant_flux_surface = build_radiant_heat_surface(self._last_radiant_flux, self._pixel_scale)
         self._surfaces_dirty = False
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
