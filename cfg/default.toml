@@ -10,19 +10,18 @@ atmospheric_cooling_rate = 0.01  # fraction of heat lost to atmosphere each tick
 [wind]
 advection_strength  = 0.2   # how far the temperature field is advected per substep
 smooth_sigma        = 2.0   # Gaussian smoothing applied to the derived wind field
-temporal_smoothing  = 0.2   # EMA weight toward newly computed wind (0 = frozen, 1 = instant)
+temporal_smoothing  = 0.1   # EMA weight toward newly computed wind (0 = frozen, 1 = instant)
 
 [oxygen]
 diffusion_sigma    = 3.0   # Gaussian diffusion width for oxygen transport
 advection_strength = 3.0   # oxygen advection scale relative to wind
 
 [noise]
-# Perlin noise used for terrain (temperature) and fuel initialisation
+# Perlin noise used for air temperature initialisation
 scale       = 64.0
 octaves     = 4
 persistence = 0.5
 lacunarity  = 2.0
-fuel_scale  = 32.0   # separate scale for the fuel noise layer
 
 [pressure]
 temp_scale          = 0.2   # alpha in exp(-alpha * T); steepness of pressure response to temperature
@@ -30,23 +29,41 @@ relaxation_rate     = 0.1   # rate at which pressure relaxes toward exp(-alpha *
 equalization_rate   = 0.1   # Laplacian coefficient for wind-driven pressure change (must stay < 0.25)
 
 [fire]
-ignition_threshold    = 2     # minimum temperature required to sustain combustion
-fuel_consumption_rate       = 0.001  # fraction of remaining fuel consumed per tick per unit of fuel temperature
 oxygen_consumption_rate     = 0.01   # fraction of remaining oxygen consumed per tick per unit of fuel temperature
-burn_heat_scale             = 500.0  # heat added per unit of min(fuel_consumed, oxygen_consumed)
-burnt_threshold             = 0.01  # fuel below this level is considered ash (no longer burns)
-fuel_air_heat_transfer_rate = 0.01   # fraction of fuel-air temperature difference exchanged per tick
-burn_heat_fuel_fraction     = 0.2   # fraction of burn heat deposited into fuel (rest goes to air)
+burnt_threshold             = 0.01   # fuel below this level is considered ash (no longer burns)
+oxygen_extinction_threshold = 0.05   # oxygen below this level extinguishes fire
+burn_heat_fuel_fraction     = 0.2    # fraction of burn heat deposited into fuel (rest goes to air)
 spawn_fire                  = false  # if true, a random fire spawns at reset; if false, left-click to ignite
-spawn_radius                = 5     # radius (in grid cells) of the circular ignition patch
+spawn_radius                = 5      # radius (in grid cells) of the circular ignition patch
+
+# ---------------------------------------------------------------------------
+# Fuel types — add more subtables here to expand to additional fuel types.
+# Each subtable becomes one layer in the (N, H, W) fuel and fuel_temperatures arrays.
+# ---------------------------------------------------------------------------
+
+[fuel_types.grass]
+heat_capacity          = 0.5    # thermal mass per unit of fuel
+ignition_threshold     = 1.5    # fuel temperature required to ignite
+consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fuel temperature
+burn_heat_scale        = 300.0  # heat released per unit of fuel consumed
+fuel_air_transfer_rate = 0.05   # rate of heat exchange with air
+noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
+
+[fuel_types.wood]
+heat_capacity          = 2.0
+ignition_threshold     = 3.0
+consumption_rate       = 0.001
+burn_heat_scale        = 800.0
+fuel_air_transfer_rate = 0.01
+noise_scale            = 32.0
 
 [radiant_heat]
-kernel_radius     = 10     # max range of radiation in grid cells
+kernel_radius     = 10       # max range of radiation in grid cells
 emission_scale    = 0.0001   # multiplier on fuel temperature emission
-emission_exponent = 2.0    # nonlinearity of emission vs fuel temperature (blackbody ~4)
+emission_exponent = 2.0      # nonlinearity of emission vs fuel temperature (blackbody ~4)
 
 [environment]
-grid_size          = 256    # simulation grid cells (N x N)
-window_size        = 512    # display window size in pixels (square)
+grid_size          = 256      # simulation grid cells (N x N)
+window_size        = 512      # display window size in pixels (square)
 max_steps          = 10_000   # episode length before truncation
-print_episode_info = true   # print variable state at the start and end of each episode
+print_episode_info = true     # print variable state at the start and end of each episode

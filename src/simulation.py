@@ -37,7 +37,6 @@ class Simulation:
         self.noise_octaves:     int   = int(noise.get("octaves",       4))
         self.noise_persistence: float = float(noise.get("persistence", 0.5))
         self.noise_lacunarity:  float = float(noise.get("lacunarity",  2.0))
-        self.fuel_noise_scale:  float = float(noise.get("fuel_scale",  32.0))
 
         pressure = (cfg or {}).get("pressure", {})
 
@@ -45,16 +44,31 @@ class Simulation:
         self.pressure_relaxation_rate:   float = float(pressure.get("relaxation_rate",   0.1))
         self.pressure_equalization_rate: float = float(pressure.get("equalization_rate", 0.1))
 
-        self.ignition_threshold:          float = float(fire.get("ignition_threshold",          5.0))
-        self.fuel_consumption_rate:       float = float(fire.get("fuel_consumption_rate",       0.3))
-        self.oxygen_consumption_rate:     float = float(fire.get("oxygen_consumption_rate",     0.3))
-        self.fuel_burn_heat_scale:        float = float(fire.get("burn_heat_scale",             5.0))
+        self.oxygen_consumption_rate:     float = float(fire.get("oxygen_consumption_rate",     0.01))
         self.fuel_burnt_threshold:        float = float(fire.get("burnt_threshold",             0.01))
-        self.fuel_air_heat_transfer_rate: float = float(fire.get("fuel_air_heat_transfer_rate", 0.1))
-        self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",     0.5))
+        self.oxygen_extinction_threshold: float = float(fire.get("oxygen_extinction_threshold", 0.05))
+        self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",     0.2))
+
+        # ---------------------------------------------------------------------------
+        # Fuel types — parsed in config order; add subtables to expand.
+        # ---------------------------------------------------------------------------
+
+        fuel_types_cfg = (cfg or {}).get("fuel_types", {})
+        self.fuel_type_names: list[str] = list(fuel_types_cfg.keys())
+        self.num_fuel_types:  int       = len(self.fuel_type_names)
+
+        def _ft(name: str, key: str, default: float) -> float:
+            return float(fuel_types_cfg.get(name, {}).get(key, default))
+
+        self.heat_capacities     = np.array([_ft(n, "heat_capacity",          1.0)   for n in self.fuel_type_names], dtype=np.float32)
+        self.ignition_thresholds = np.array([_ft(n, "ignition_threshold",     2.0)   for n in self.fuel_type_names], dtype=np.float32)
+        self.consumption_rates   = np.array([_ft(n, "consumption_rate",       0.001) for n in self.fuel_type_names], dtype=np.float32)
+        self.burn_heat_scales    = np.array([_ft(n, "burn_heat_scale",        500.0) for n in self.fuel_type_names], dtype=np.float32)
+        self.fuel_transfer_rates = np.array([_ft(n, "fuel_air_transfer_rate", 0.01)  for n in self.fuel_type_names], dtype=np.float32)
+        self.fuel_noise_scales   = np.array([_ft(n, "noise_scale",            32.0)  for n in self.fuel_type_names], dtype=np.float32)
 
         radiant = (cfg or {}).get("radiant_heat", {})
-        self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",     20))
+        self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",      20))
         self.radiant_emission_scale:    float = float(radiant.get("emission_scale",   0.05))
         self.radiant_emission_exponent: float = float(radiant.get("emission_exponent", 2.0))
 
@@ -252,44 +266,133 @@ class Simulation:
 
     def exchange_fuel_air_heat(
         self,
-        air_temperatures: np.ndarray,
-        fuel_temperatures: np.ndarray,
+        air_temperatures: np.ndarray,   # (H, W)
+        fuel_temperatures: np.ndarray,  # (N, H, W)
+        fuel: np.ndarray,               # (N, H, W)
     ) -> tuple[np.ndarray, np.ndarray]:
-        transfer = (self.fuel_air_heat_transfer_rate * (air_temperatures - fuel_temperatures)).astype(np.float32)
-        return (air_temperatures - transfer).astype(np.float32), (fuel_temperatures + transfer).astype(np.float32)
+        h = self.heat_capacities[:, np.newaxis, np.newaxis]    # (N, 1, 1)
+        k = self.fuel_transfer_rates[:, np.newaxis, np.newaxis]  # (N, 1, 1)
+
+        mask    = fuel > self.fuel_burnt_threshold              # (N, H, W)
+        dT      = air_temperatures[np.newaxis] - fuel_temperatures  # (N, H, W)
+        C_fuel  = h * fuel                                      # (N, H, W)
+
+        # Avoid dividing by zero for non-participating cells.
+        safe_C = np.where(mask, C_fuel, 1.0)
+
+        # Unconstrained Newton step and equilibrium step (maximum without overshoot).
+        dT_fuel_raw = k * dT / safe_C
+        dT_fuel_eq  = dT / (1.0 + safe_C)
+
+        # Take the smaller magnitude — whichever doesn't cross equilibrium.
+        dT_fuel = np.where(
+            np.abs(dT_fuel_raw) <= np.abs(dT_fuel_eq),
+            dT_fuel_raw,
+            dT_fuel_eq,
+        )
+        dT_fuel = np.where(mask, dT_fuel, 0.0).astype(np.float32)
+
+        # Air loses the sum of heat transferred to all fuel types (energy conserving).
+        dT_air = -np.sum(C_fuel * dT_fuel, axis=0).astype(np.float32)
+
+        return (air_temperatures + dT_air).astype(np.float32), (fuel_temperatures + dT_fuel).astype(np.float32)
 
     def update_fire(
         self,
-        air_temperatures: np.ndarray,
-        fuel_temperatures: np.ndarray,
-        fuel: np.ndarray,
-        oxygen: np.ndarray,
+        air_temperatures: np.ndarray,   # (H, W)
+        fuel_temperatures: np.ndarray,  # (N, H, W)
+        fuel: np.ndarray,               # (N, H, W)
+        oxygen: np.ndarray,             # (H, W)
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        burning = (fuel_temperatures >= self.ignition_threshold) & (fuel > self.fuel_burnt_threshold)
+        ign = self.ignition_thresholds[:, np.newaxis, np.newaxis]  # (N, 1, 1)
+        cr  = self.consumption_rates[:, np.newaxis, np.newaxis]    # (N, 1, 1)
+        bhs = self.burn_heat_scales[:, np.newaxis, np.newaxis]     # (N, 1, 1)
+        h   = self.heat_capacities[:, np.newaxis, np.newaxis]      # (N, 1, 1)
 
-        fuel_consumed   = np.where(burning, fuel   * np.minimum(fuel_temperatures * self.fuel_consumption_rate,   1.0), 0.0).astype(np.float32)
-        oxygen_consumed = np.where(burning, oxygen * np.minimum(fuel_temperatures * self.oxygen_consumption_rate, 1.0), 0.0).astype(np.float32)
+        burning = (
+            (fuel_temperatures >= ign) &
+            (fuel > self.fuel_burnt_threshold) &
+            (oxygen[np.newaxis] > self.oxygen_extinction_threshold)
+        )  # (N, H, W)
 
-        fuel    = (fuel - fuel_consumed).astype(np.float32)
-        oxygen  = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
-        burn_heat = np.minimum(fuel_consumed, oxygen_consumed) * self.fuel_burn_heat_scale
-        air_temperatures  = np.maximum(air_temperatures  + burn_heat * (1.0 - self.burn_heat_fuel_fraction), 0.0).astype(np.float32)
-        fuel_temperatures = np.maximum(fuel_temperatures + burn_heat * self.burn_heat_fuel_fraction,         0.0).astype(np.float32)
+        fuel_consumed = np.where(
+            burning,
+            fuel * np.minimum(fuel_temperatures * cr, 1.0),
+            0.0,
+        ).astype(np.float32)  # (N, H, W)
+
+        # Oxygen consumed by all burning types combined, capped at available oxygen.
+        oxygen_consumed = np.minimum(
+            np.sum(
+                np.where(burning, oxygen[np.newaxis] * np.minimum(fuel_temperatures * self.oxygen_consumption_rate, 1.0), 0.0),
+                axis=0,
+            ),
+            oxygen,
+        ).astype(np.float32)  # (H, W)
+
+        fuel   = (fuel - fuel_consumed).astype(np.float32)
+        oxygen = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
+
+        # Heat released per type, split between air and fuel.
+        burn_heat_per_type = (fuel_consumed * bhs).astype(np.float32)  # (N, H, W)
+        total_burn_heat    = burn_heat_per_type.sum(axis=0)             # (H, W)
+
+        air_temperatures = np.maximum(
+            air_temperatures + total_burn_heat * (1.0 - self.burn_heat_fuel_fraction), 0.0
+        ).astype(np.float32)
+
+        # Each type's fuel temperature rises by its share of burn heat divided by thermal mass.
+        C_fuel    = h * fuel
+        safe_C    = np.where(fuel > self.fuel_burnt_threshold, C_fuel, 1.0)
+        dT_fuel   = np.where(
+            fuel > self.fuel_burnt_threshold,
+            burn_heat_per_type * self.burn_heat_fuel_fraction / safe_C,
+            0.0,
+        )
+        fuel_temperatures = np.maximum(fuel_temperatures + dT_fuel, 0.0).astype(np.float32)
 
         return air_temperatures, fuel_temperatures, fuel, oxygen
 
     def apply_radiant_heat(
         self,
-        fuel_temperatures: np.ndarray,
-        fuel: np.ndarray,
+        fuel_temperatures: np.ndarray,  # (N, H, W)
+        fuel: np.ndarray,               # (N, H, W)
+        oxygen: np.ndarray,             # (H, W)
     ) -> np.ndarray:
-        burning = (fuel_temperatures >= self.ignition_threshold) & (fuel > self.fuel_burnt_threshold)
+        ign = self.ignition_thresholds[:, np.newaxis, np.newaxis]
+
+        burning = (
+            (fuel_temperatures >= ign) &
+            (fuel > self.fuel_burnt_threshold) &
+            (oxygen[np.newaxis] > self.oxygen_extinction_threshold)
+        )  # (N, H, W)
+
+        # Total emission summed across all burning types.
         emission = np.where(
             burning,
             self.radiant_emission_scale * fuel_temperatures ** self.radiant_emission_exponent,
             0.0,
         ).astype(np.float32)
+        total_emission = emission.sum(axis=0)  # (H, W)
+
         radiant_flux = np.clip(
-            fftconvolve(emission, self._radiant_kernel, mode='same'), 0.0, None
+            fftconvolve(total_emission, self._radiant_kernel, mode='same'), 0.0, None
+        ).astype(np.float32)  # (H, W)
+
+        # Distribute flux to each type proportional to its fuel mass fraction,
+        # then divide by thermal mass to get temperature change.
+        total_fuel = fuel.sum(axis=0)                             # (H, W)
+        safe_total = np.where(total_fuel > 0, total_fuel, 1.0)
+        fuel_frac  = fuel / safe_total[np.newaxis]                # (N, H, W)
+
+        h      = self.heat_capacities[:, np.newaxis, np.newaxis]
+        C_fuel = h * fuel
+        safe_C = np.where(fuel > self.fuel_burnt_threshold, C_fuel, 1.0)
+
+        dT_fuel = np.where(
+            fuel > self.fuel_burnt_threshold,
+            radiant_flux[np.newaxis] * fuel_frac / safe_C,
+            0.0,
         ).astype(np.float32)
-        return (fuel_temperatures + radiant_flux).astype(np.float32)
+
+        return (fuel_temperatures + dT_fuel).astype(np.float32)

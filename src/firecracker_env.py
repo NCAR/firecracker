@@ -183,27 +183,37 @@ def build_pressure_surface(pressure: np.ndarray, scale: int) -> pygame.Surface:
 
 
 def build_fire_surface(
-    fuel_temperatures: np.ndarray,
-    fuel: np.ndarray,
+    fuel_temperatures: np.ndarray,       # (N, H, W)
+    fuel: np.ndarray,                    # (N, H, W)
+    oxygen: np.ndarray,                  # (H, W)
     scale: int,
-    ignition_threshold: float,
+    ignition_thresholds: np.ndarray,     # (N,)
     fuel_burnt_threshold: float,
+    oxygen_extinction_threshold: float,
     show_fire_overlay: bool = True,
 ) -> pygame.Surface:
-    rows, cols = fuel_temperatures.shape
+    rows, cols = fuel_temperatures.shape[1], fuel_temperatures.shape[2]
     rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
 
-    burning = (fuel_temperatures >= ignition_threshold) & (fuel > fuel_burnt_threshold)
+    ign = ignition_thresholds[:, np.newaxis, np.newaxis]
+    burning_per_type = (
+        (fuel_temperatures >= ign) &
+        (fuel > fuel_burnt_threshold) &
+        (oxygen[np.newaxis] > oxygen_extinction_threshold)
+    )
+    any_burning = burning_per_type.any(axis=0)  # (H, W)
 
-    # Green brightness tracks fuel level for all cells.
-    fuel_brightness = (np.clip(fuel, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
-    rgb[:, :, GREEN_CHANNEL] = fuel_brightness
+    # Green brightness tracks total fuel across all types.
+    total_fuel = np.clip(fuel.sum(axis=0), 0.0, 1.0)
+    rgb[:, :, GREEN_CHANNEL] = (total_fuel * MAX_CHANNEL_VALUE).astype(np.uint8)
 
     if show_fire_overlay:
-        # Burning cells: red at ignition threshold, yellow at 25x ignition threshold.
-        t = np.clip((fuel_temperatures - ignition_threshold) / (24.0 * ignition_threshold), 0.0, 1.0)
-        rgb[burning, RED_CHANNEL]   = MAX_CHANNEL_VALUE
-        rgb[burning, GREEN_CHANNEL] = (t[burning] * MAX_CHANNEL_VALUE).astype(np.uint8)
+        # Color gradient based on the hottest fuel type; scale from min ignition threshold.
+        max_fuel_temp = fuel_temperatures.max(axis=0)
+        min_ign = float(ignition_thresholds.min())
+        t = np.clip((max_fuel_temp - min_ign) / (24.0 * min_ign), 0.0, 1.0)
+        rgb[any_burning, RED_CHANNEL]   = MAX_CHANNEL_VALUE
+        rgb[any_burning, GREEN_CHANNEL] = (t[any_burning] * MAX_CHANNEL_VALUE).astype(np.uint8)
 
     rgb_scaled = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     surface = pygame.Surface((cols * scale, rows * scale))
@@ -291,10 +301,30 @@ class FirecrackerEnv(gymnasium.Env):
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
         temp_raw = self._sim.create_grid(self.grid_size, base=int(self.np_random.integers(0, 256)))
-        self._air_temperatures  = temp_raw.astype(np.float32)
-        self._fuel_temperatures = self._air_temperatures.copy()
-        fuel_raw = self._sim.create_grid(self.grid_size, scale=self._sim.fuel_noise_scale, base=int(self.np_random.integers(0, 256)))
-        self._fuel = fuel_raw.astype(np.float32)
+        self._air_temperatures = temp_raw.astype(np.float32)
+
+        N = self._sim.num_fuel_types
+        self._fuel = np.zeros((N, self.grid_size, self.grid_size), dtype=np.float32)
+
+        # Grass (type 0): continuous Perlin noise scaled to [0, 0.5].
+        grass_noise = self._sim.create_grid(
+            self.grid_size,
+            scale=float(self._sim.fuel_noise_scales[0]),
+            base=int(self.np_random.integers(0, 256)),
+        )
+        self._fuel[0] = (grass_noise * 0.5).astype(np.float32)
+
+        # Wood (type 1): binary spawn from Perlin probability map.
+        if N > 1:
+            wood_prob = self._sim.create_grid(
+                self.grid_size,
+                scale=float(self._sim.fuel_noise_scales[1]),
+                base=int(self.np_random.integers(0, 256)),
+            )
+            self._fuel[1] = (self.np_random.random((self.grid_size, self.grid_size)) < wood_prob * 0.25).astype(np.float32)
+
+        # Each fuel type starts at ambient air temperature.
+        self._fuel_temperatures = np.tile(self._air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)
         if self._spawn_fire:
             r = int(self.np_random.integers(0, self.grid_size))
             c = int(self.np_random.integers(0, self.grid_size))
@@ -324,7 +354,7 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._air_temperatures = self._sim.apply_atmospheric_cooling(self._air_temperatures)
         self._air_temperatures, self._fuel_temperatures = self._sim.exchange_fuel_air_heat(
-            self._air_temperatures, self._fuel_temperatures
+            self._air_temperatures, self._fuel_temperatures, self._fuel
         )
         self._oxygen = self._sim.diffuse_and_advect_oxygen(
             self._oxygen, self._x_wind_vel, self._y_wind_vel, self._reference_wind_magnitude
@@ -333,7 +363,7 @@ class FirecrackerEnv(gymnasium.Env):
             self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen
         )
         self._fuel_temperatures = self._sim.apply_radiant_heat(
-            self._fuel_temperatures, self._fuel
+            self._fuel_temperatures, self._fuel, self._oxygen
         )
         self._pressure = self._sim.update_pressure(self._pressure, self._air_temperatures)
         self._x_wind_vel, self._y_wind_vel = self._sim.update_wind(
@@ -409,21 +439,22 @@ class FirecrackerEnv(gymnasium.Env):
             self._pixel_scale, self._reference_wind_magnitude,
         )
         self._fire_surface = build_fire_surface(
-            self._fuel_temperatures, self._fuel, self._pixel_scale,
-            self._sim.ignition_threshold, self._sim.fuel_burnt_threshold,
-            self._show_fire_overlay,
+            self._fuel_temperatures, self._fuel, self._oxygen, self._pixel_scale,
+            self._sim.ignition_thresholds, self._sim.fuel_burnt_threshold,
+            self._sim.oxygen_extinction_threshold, self._show_fire_overlay,
         )
         self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(self._pressure, self._pixel_scale)
-        self._fuel_temperature_surface = build_color_surface(self._fuel_temperatures, self._pixel_scale)
+        self._fuel_temperature_surface = build_color_surface(self._fuel_temperatures.max(axis=0), self._pixel_scale)
         self._surfaces_dirty = False
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
         rows_idx, cols_idx = np.ogrid[:self.grid_size, :self.grid_size]
         patch = (rows_idx - row) ** 2 + (cols_idx - col) ** 2 <= self._fire_spawn_radius ** 2
-        self._air_temperatures[patch]  = self._sim.ignition_threshold * 2.0
-        self._fuel_temperatures[patch] = self._sim.ignition_threshold * 2.0
-        self._fuel[patch] = 1.0
+        self._air_temperatures[patch] = float(self._sim.ignition_thresholds.max()) * 2.0
+        for n in range(self._sim.num_fuel_types):
+            self._fuel_temperatures[n][patch] = float(self._sim.ignition_thresholds[n]) * 2.0
+            self._fuel[n][patch] = 1.0
 
     def _handle_events(self) -> tuple[bool, ViewMode, tuple[int, int] | None]:
         running = self._running
@@ -458,24 +489,29 @@ class FirecrackerEnv(gymnasium.Env):
 
     def _build_info(self) -> dict:
         wind_speeds = np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2)
-        burning = (self._fuel_temperatures >= self._sim.ignition_threshold) & (self._fuel > self._sim.fuel_burnt_threshold)
-        return {
+        ign = self._sim.ignition_thresholds[:, np.newaxis, np.newaxis]
+        burning_per_type = (
+            (self._fuel_temperatures >= ign) &
+            (self._fuel > self._sim.fuel_burnt_threshold) &
+            (self._oxygen[np.newaxis] > self._sim.oxygen_extinction_threshold)
+        )
+        info = {
             "air_temperature": self._sim.compute_air_temperature(self._air_temperatures),
-            "air_temp_min": float(self._air_temperatures.min()),
-            "air_temp_max": float(self._air_temperatures.max()),
-            "air_temp_std": float(self._air_temperatures.std()),
-            "fuel_temp_mean": float(self._fuel_temperatures.mean()),
-            "fuel_temp_min": float(self._fuel_temperatures.min()),
-            "fuel_temp_max": float(self._fuel_temperatures.max()),
-            "fuel_temp_std": float(self._fuel_temperatures.std()),
-            "wind_mean": float(wind_speeds.mean()),
-            "wind_max": float(wind_speeds.max()),
-            "wind_std": float(wind_speeds.std()),
-            "fuel_mean": float(self._fuel.mean()),
-            "fuel_min": float(self._fuel.min()),
-            "fuel_max": float(self._fuel.max()),
-            "cells_burning": int(burning.sum()),
-            "oxygen_mean": float(self._oxygen.mean()),
-            "oxygen_min": float(self._oxygen.min()),
-            "step": self._step_count,
+            "air_temp_min":    float(self._air_temperatures.min()),
+            "air_temp_max":    float(self._air_temperatures.max()),
+            "air_temp_std":    float(self._air_temperatures.std()),
+            "wind_mean":       float(wind_speeds.mean()),
+            "wind_max":        float(wind_speeds.max()),
+            "wind_std":        float(wind_speeds.std()),
+            "oxygen_mean":     float(self._oxygen.mean()),
+            "oxygen_min":      float(self._oxygen.min()),
+            "cells_burning":   int(burning_per_type.any(axis=0).sum()),
+            "step":            self._step_count,
         }
+        for i, name in enumerate(self._sim.fuel_type_names):
+            info[f"fuel_{name}_mean"]      = float(self._fuel[i].mean())
+            info[f"fuel_{name}_max"]       = float(self._fuel[i].max())
+            info[f"fuel_temp_{name}_mean"] = float(self._fuel_temperatures[i].mean())
+            info[f"fuel_temp_{name}_max"]  = float(self._fuel_temperatures[i].max())
+            info[f"cells_burning_{name}"]  = int(burning_per_type[i].sum())
+        return info
