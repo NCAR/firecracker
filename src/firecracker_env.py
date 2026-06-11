@@ -65,6 +65,7 @@ class ViewMode(Enum):
     PRESSURE = 5
     FUEL_TEMPERATURE = 6
     RADIANT_HEAT = 7
+    TERRAIN = 8
 
 
 # Populated from ViewMode values so new modes are picked up automatically.
@@ -220,6 +221,23 @@ def build_radiant_heat_surface(
     return surface
 
 
+def build_terrain_surface(terrain: np.ndarray, scale: int) -> pygame.Surface:
+    rows, cols = terrain.shape
+    h = np.clip(terrain, 0.0, 1.0)
+    # Elevation relief: dark green valleys -> white peaks.
+    r = (h * MAX_CHANNEL_VALUE).astype(np.uint8)
+    g = (60.0 + h * (MAX_CHANNEL_VALUE - 60.0)).astype(np.uint8)
+    b = (h * MAX_CHANNEL_VALUE).astype(np.uint8)
+    rgb = np.stack([
+        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
+    ], axis=-1)
+    surface = pygame.Surface((cols * scale, rows * scale))
+    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
+    return surface
+
+
 def build_fire_surface(
     fuel_temperatures: np.ndarray,       # (N, H, W)
     fuel: np.ndarray,                    # (N, H, W)
@@ -304,6 +322,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._fuel: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
         self._pressure: np.ndarray | None = None
+        self._terrain: np.ndarray | None = None
         self._last_radiant_flux: np.ndarray | None = None
         # EMA-smoothed upper bounds for the mode 6 / mode 7 color scales.
         self._fuel_temp_display_scale: float = 0.0
@@ -320,6 +339,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._pressure_surface: pygame.Surface | None = None
         self._fuel_temperature_surface: pygame.Surface | None = None
         self._radiant_flux_surface: pygame.Surface | None = None
+        self._terrain_surface: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
         self._show_wind_overlay: bool = False
@@ -346,25 +366,33 @@ class FirecrackerEnv(gymnasium.Env):
         temp_raw = self._sim.create_grid(self.grid_size, base=int(self.np_random.integers(0, 256)))
         self._air_temperatures = temp_raw.astype(np.float32)
 
+        # Elevation height map; higher ground supports less vegetation.
+        self._terrain = self._sim.create_terrain(
+            self.grid_size, base=int(self.np_random.integers(0, 256))
+        )
+
         N = self._sim.num_fuel_types
         self._fuel = np.zeros((N, self.grid_size, self.grid_size), dtype=np.float32)
 
-        # Grass (type 0): continuous Perlin noise scaled to [0, 0.5].
+        # Grass (type 0): continuous Perlin noise scaled to [0, 0.5], thinned by elevation.
         grass_noise = self._sim.create_grid(
             self.grid_size,
             scale=float(self._sim.fuel_noise_scales[0]),
             base=int(self.np_random.integers(0, 256)),
         )
-        self._fuel[0] = (grass_noise * 0.5).astype(np.float32)
+        grass_alt = self._sim.altitude_vegetation_multiplier(self._terrain, 0)
+        self._fuel[0] = (grass_noise * float(self._sim.spawn_densities[0]) * grass_alt).astype(np.float32)
 
-        # Wood (type 1): binary spawn from Perlin probability map.
+        # Wood (type 1): binary spawn from Perlin probability map, thinned by elevation.
         if N > 1:
             wood_prob = self._sim.create_grid(
                 self.grid_size,
                 scale=float(self._sim.fuel_noise_scales[1]),
                 base=int(self.np_random.integers(0, 256)),
             )
-            self._fuel[1] = (self.np_random.random((self.grid_size, self.grid_size)) < wood_prob * 0.25).astype(np.float32)
+            wood_alt = self._sim.altitude_vegetation_multiplier(self._terrain, 1)
+            spawn_prob = wood_prob * float(self._sim.spawn_densities[1]) * wood_alt
+            self._fuel[1] = (self.np_random.random((self.grid_size, self.grid_size)) < spawn_prob).astype(np.float32)
 
         # Each fuel type starts at ambient air temperature.
         self._fuel_temperatures = np.tile(self._air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)
@@ -487,6 +515,8 @@ class FirecrackerEnv(gymnasium.Env):
             return self._pressure_surface
         if self._current_mode == ViewMode.FUEL_TEMPERATURE:
             return self._fuel_temperature_surface
+        if self._current_mode == ViewMode.TERRAIN:
+            return self._terrain_surface
         return self._radiant_flux_surface
 
     def _rebuild_surfaces_if_dirty(self) -> None:
@@ -512,6 +542,8 @@ class FirecrackerEnv(gymnasium.Env):
             self._last_radiant_flux, self._pixel_scale,
             upper_bound=self._radiant_flux_display_scale,
         )
+        # Static after reset, but rebuilt with the batch for consistency (cost is negligible).
+        self._terrain_surface = build_terrain_surface(self._terrain, self._pixel_scale)
         self._surfaces_dirty = False
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
@@ -572,6 +604,9 @@ class FirecrackerEnv(gymnasium.Env):
             "oxygen_mean":     float(self._oxygen.mean()),
             "oxygen_min":      float(self._oxygen.min()),
             "cells_burning":   int(burning_per_type.any(axis=0).sum()),
+            "terrain_mean":    float(self._terrain.mean()),
+            "terrain_min":     float(self._terrain.min()),
+            "terrain_max":     float(self._terrain.max()),
             "step":            self._step_count,
         }
         for i, name in enumerate(self._sim.fuel_type_names):

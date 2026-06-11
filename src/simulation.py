@@ -38,6 +38,13 @@ class Simulation:
         self.noise_persistence: float = float(noise.get("persistence", 0.5))
         self.noise_lacunarity:  float = float(noise.get("lacunarity",  2.0))
 
+        terrain = (cfg or {}).get("terrain", {})
+
+        self.terrain_scale:       float = float(terrain.get("scale",      96.0))
+        self.terrain_octaves:     int   = int(terrain.get("octaves",       6))
+        self.terrain_persistence: float = float(terrain.get("persistence", 0.5))
+        self.terrain_lacunarity:  float = float(terrain.get("lacunarity",  2.0))
+
         pressure = (cfg or {}).get("pressure", {})
 
         self.pressure_temp_scale:        float = float(pressure.get("temp_scale",        0.2))
@@ -66,6 +73,8 @@ class Simulation:
         self.burn_heat_scales    = np.array([_ft(n, "burn_heat_scale",        500.0) for n in self.fuel_type_names], dtype=np.float32)
         self.fuel_transfer_rates = np.array([_ft(n, "fuel_air_transfer_rate", 0.01)  for n in self.fuel_type_names], dtype=np.float32)
         self.fuel_noise_scales   = np.array([_ft(n, "noise_scale",            32.0)  for n in self.fuel_type_names], dtype=np.float32)
+        self.altitude_falloffs   = np.array([_ft(n, "altitude_falloff",        1.0)  for n in self.fuel_type_names], dtype=np.float32)
+        self.spawn_densities     = np.array([_ft(n, "spawn_density",           0.5)  for n in self.fuel_type_names], dtype=np.float32)
 
         radiant = (cfg or {}).get("radiant_heat", {})
         self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",      20))
@@ -84,18 +93,32 @@ class Simulation:
     # Grid initialisation
     # ---------------------------------------------------------------------------
 
-    def sample_perlin_grid(self, size: int, base: int, scale: float | None = None) -> np.ndarray:
+    def sample_perlin_grid(
+        self,
+        size: int,
+        base: int,
+        scale: float | None = None,
+        octaves: int | None = None,
+        persistence: float | None = None,
+        lacunarity: float | None = None,
+    ) -> np.ndarray:
         if scale is None:
             scale = self.noise_scale
+        if octaves is None:
+            octaves = self.noise_octaves
+        if persistence is None:
+            persistence = self.noise_persistence
+        if lacunarity is None:
+            lacunarity = self.noise_lacunarity
         grid = np.empty((size, size), dtype=np.float32)
         for row in range(size):
             for col in range(size):
                 grid[row, col] = noise.pnoise2(
                     col / scale,
                     row / scale,
-                    octaves=self.noise_octaves,
-                    persistence=self.noise_persistence,
-                    lacunarity=self.noise_lacunarity,
+                    octaves=octaves,
+                    persistence=persistence,
+                    lacunarity=lacunarity,
                     base=base,
                 )
         return grid
@@ -108,13 +131,44 @@ class Simulation:
             return np.zeros_like(grid)
         return ((grid - lo) / (hi - lo)).astype(np.float32)
 
-    def create_grid(self, size: int, scale: float | None = None, base: int | None = None) -> np.ndarray:
+    def create_grid(
+        self,
+        size: int,
+        scale: float | None = None,
+        base: int | None = None,
+        octaves: int | None = None,
+        persistence: float | None = None,
+        lacunarity: float | None = None,
+    ) -> np.ndarray:
         if scale is None:
             scale = self.noise_scale
         if base is None:
             base = np.random.randint(0, 256)
-        raw = self.sample_perlin_grid(size, base, scale=scale)
+        raw = self.sample_perlin_grid(
+            size, base, scale=scale,
+            octaves=octaves, persistence=persistence, lacunarity=lacunarity,
+        )
         return self.normalize_grid(raw)
+
+    def create_terrain(self, size: int, base: int | None = None) -> np.ndarray:
+        """Normalised [0, 1] elevation height map from octave Perlin noise.
+
+        The normalised map is squared to bias toward flat low-elevation
+        terrain with sharper, less frequent high-elevation peaks.
+        """
+        height = self.create_grid(
+            size,
+            scale=self.terrain_scale,
+            base=base,
+            octaves=self.terrain_octaves,
+            persistence=self.terrain_persistence,
+            lacunarity=self.terrain_lacunarity,
+        )
+        return (height ** 2).astype(np.float32)
+
+    def altitude_vegetation_multiplier(self, terrain: np.ndarray, fuel_index: int) -> np.ndarray:
+        """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
+        return ((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index])).astype(np.float32)
 
     # ---------------------------------------------------------------------------
     # Diffusion / advection

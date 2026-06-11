@@ -23,6 +23,14 @@ octaves     = 4
 persistence = 0.5
 lacunarity  = 2.0
 
+[terrain]
+# Octave Perlin noise for the elevation height map, normalised to [0, 1].
+# More octaves layer in finer-resolution detail on top of the broad relief.
+scale       = 96.0
+octaves     = 6
+persistence = 0.5
+lacunarity  = 2.0
+
 [pressure]
 temp_scale          = 0.2   # alpha in exp(-alpha * T); steepness of pressure response to temperature
 relaxation_rate     = 0.1   # rate at which pressure relaxes toward exp(-alpha * T) each tick
@@ -48,6 +56,8 @@ consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fu
 burn_heat_scale        = 100.0  # heat released per unit of fuel consumed
 fuel_air_transfer_rate = 0.05   # rate of heat exchange with air
 noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
+altitude_falloff       = 1.0    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
+spawn_density          = 0.5    # scales the [0,1] noise into continuous grass density
 
 [fuel_types.wood]
 heat_capacity          = 2.5
@@ -56,6 +66,8 @@ consumption_rate       = 0.001
 burn_heat_scale        = 300.0
 fuel_air_transfer_rate = 0.01
 noise_scale            = 32.0
+altitude_falloff       = 4.0    # steep: trees thin out quickly with elevation
+spawn_density          = 0.25   # scales the [0,1] noise into per-cell tree spawn probability
 
 [radiant_heat]
 kernel_radius     = 10       # max range of radiation in grid cells
