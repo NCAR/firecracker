@@ -56,22 +56,24 @@ consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fu
 burn_heat_scale        = 100.0  # heat released per unit of fuel consumed
 fuel_air_transfer_rate = 0.05   # rate of heat exchange with air
 noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
-altitude_falloff       = 1.0    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
-spawn_density          = 0.5    # scales the [0,1] noise into continuous grass density
+altitude_falloff       = 0.5    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
+spawn_density          = 1.0    # scales the [0,1] noise into continuous grass density
 
-[fuel_types.wood]
+[fuel_types.tree]
 heat_capacity          = 2.5
 ignition_threshold     = 1.5
 consumption_rate       = 0.001
 burn_heat_scale        = 300.0
 fuel_air_transfer_rate = 0.01
 noise_scale            = 32.0
-altitude_falloff       = 4.0    # steep: trees thin out quickly with elevation
-spawn_density          = 0.25   # scales the [0,1] noise into per-cell tree spawn probability
+altitude_falloff       = 3.0    # steep: trees thin out quickly with elevation
+spawn_density          = 2.0    # mean trees per cell per unit elevation-thinned noise (exponential mean scale)
+fuel_per_tree          = 1.0    # fuel mass contributed by each tree in a cell
+max_trees_per_cell     = 4      # hard cap on the per-cell tree count
 
 [radiant_heat]
 kernel_radius     = 10       # max range of radiation in grid cells
-emission_scale    = 0.002    # multiplier on fuel temperature emission
+emission_scale    = 0.001    # multiplier on fuel temperature emission
 emission_exponent = 2.0      # nonlinearity of emission vs fuel temperature (blackbody ~4)
 
 [environment]

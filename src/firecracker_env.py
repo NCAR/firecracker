@@ -259,9 +259,13 @@ def build_fire_surface(
     )
     any_burning = burning_per_type.any(axis=0)  # (H, W)
 
-    # Green brightness tracks total fuel across all types.
-    total_fuel = np.clip(fuel.sum(axis=0), 0.0, 1.0)
-    rgb[:, :, GREEN_CHANNEL] = (total_fuel * MAX_CHANNEL_VALUE).astype(np.uint8)
+    # Green brightness tracks total fuel, normalised so the cell with the most fuel
+    # on the map is full brightness. This keeps the image scale-invariant: uniformly
+    # scaling all fuel leaves the ratios (and thus the rendered intensities) unchanged.
+    total_fuel = fuel.sum(axis=0)
+    max_fuel = float(total_fuel.max())
+    normalized_fuel = total_fuel / max_fuel if max_fuel > 0.0 else total_fuel
+    rgb[:, :, GREEN_CHANNEL] = (normalized_fuel * MAX_CHANNEL_VALUE).astype(np.uint8)
 
     if show_fire_overlay:
         # Color gradient based on the hottest fuel type; scale from min ignition threshold.
@@ -383,16 +387,19 @@ class FirecrackerEnv(gymnasium.Env):
         grass_alt = self._sim.altitude_vegetation_multiplier(self._terrain, 0)
         self._fuel[0] = (grass_noise * float(self._sim.spawn_densities[0]) * grass_alt).astype(np.float32)
 
-        # Wood (type 1): binary spawn from Perlin probability map, thinned by elevation.
+        # Trees (type 1): per-cell counts drawn from an exponential whose mean is the
+        # elevation-thinned noise density, capped at max_trees_per_cell, then scaled
+        # to fuel mass. Higher density -> more trees on average.
         if N > 1:
-            wood_prob = self._sim.create_grid(
+            tree_noise = self._sim.create_grid(
                 self.grid_size,
                 scale=float(self._sim.fuel_noise_scales[1]),
                 base=int(self.np_random.integers(0, 256)),
             )
-            wood_alt = self._sim.altitude_vegetation_multiplier(self._terrain, 1)
-            spawn_prob = wood_prob * float(self._sim.spawn_densities[1]) * wood_alt
-            self._fuel[1] = (self.np_random.random((self.grid_size, self.grid_size)) < spawn_prob).astype(np.float32)
+            tree_alt = self._sim.altitude_vegetation_multiplier(self._terrain, 1)
+            density = tree_noise * float(self._sim.spawn_densities[1]) * tree_alt
+            tree_counts = self._sim.sample_tree_counts(density, self.np_random)
+            self._fuel[1] = (tree_counts * self._sim.fuel_per_tree).astype(np.float32)
 
         # Each fuel type starts at ambient air temperature.
         self._fuel_temperatures = np.tile(self._air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)

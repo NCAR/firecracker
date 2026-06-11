@@ -76,6 +76,12 @@ class Simulation:
         self.altitude_falloffs   = np.array([_ft(n, "altitude_falloff",        1.0)  for n in self.fuel_type_names], dtype=np.float32)
         self.spawn_densities     = np.array([_ft(n, "spawn_density",           0.5)  for n in self.fuel_type_names], dtype=np.float32)
 
+        # Tree-specific discretisation: per-cell tree counts are drawn from an
+        # exponential whose mean is the local density, then capped.
+        tree_cfg = fuel_types_cfg.get("tree", {})
+        self.fuel_per_tree:      float = float(tree_cfg.get("fuel_per_tree",      0.33))
+        self.max_trees_per_cell: int   = int(tree_cfg.get("max_trees_per_cell",   3))
+
         radiant = (cfg or {}).get("radiant_heat", {})
         self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",      20))
         self.radiant_emission_scale:    float = float(radiant.get("emission_scale",   0.05))
@@ -169,6 +175,15 @@ class Simulation:
     def altitude_vegetation_multiplier(self, terrain: np.ndarray, fuel_index: int) -> np.ndarray:
         """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
         return ((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index])).astype(np.float32)
+
+    def sample_tree_counts(self, density: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Stochastic per-cell tree counts.
+
+        Each cell's count is floor(Exp(mean=density)) capped at max_trees_per_cell,
+        so cells with higher density average more trees (mean 0 -> always 0).
+        """
+        samples = rng.exponential(np.maximum(density, 0.0))
+        return np.minimum(np.floor(samples), self.max_trees_per_cell).astype(np.float32)
 
     # ---------------------------------------------------------------------------
     # Diffusion / advection
