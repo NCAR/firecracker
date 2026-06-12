@@ -327,6 +327,10 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen: np.ndarray | None = None
         self._pressure: np.ndarray | None = None
         self._terrain: np.ndarray | None = None
+        # Relaxation targets (initial profiles) and per-cell temperature rate.
+        self._temp_eq: np.ndarray | None = None
+        self._oxygen_eq: np.ndarray | None = None
+        self._temp_relax_rate: np.ndarray | None = None
         self._last_radiant_flux: np.ndarray | None = None
         # EMA-smoothed upper bounds for the mode 6 / mode 7 color scales.
         self._fuel_temp_display_scale: float = 0.0
@@ -418,6 +422,11 @@ class FirecrackerEnv(gymnasium.Env):
         )
         # Oxygen also thins exponentially with elevation (1.0 at sea level).
         self._oxygen = self._sim.elevation_falloff(self._terrain, self._sim.oxygen_lapse_rate)
+        # Relaxation targets are the initial profiles; the rate field is elevation-based
+        # (all static within an episode, so cache them once here).
+        self._temp_eq = self._air_temperatures.copy()
+        self._oxygen_eq = self._oxygen.copy()
+        self._temp_relax_rate = self._sim.temperature_relax_rate(self._terrain)
         self._last_radiant_flux = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         # Seed the display scales from the initial state so the first frames are scaled sanely.
         self._fuel_temp_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._fuel_temperatures.max())
@@ -437,12 +446,19 @@ class FirecrackerEnv(gymnasium.Env):
         self._air_temperatures = self._sim.diffuse_and_advect(
             self._air_temperatures, self._x_wind_vel, self._y_wind_vel, self._reference_wind_magnitude
         )
-        self._air_temperatures = self._sim.apply_atmospheric_cooling(self._air_temperatures)
+        self._air_temperatures = self._sim.relax_to_equilibrium(
+            self._air_temperatures, self._temp_eq, self._temp_relax_rate
+        )
         self._air_temperatures, self._fuel_temperatures = self._sim.exchange_fuel_air_heat(
             self._air_temperatures, self._fuel_temperatures, self._fuel
         )
         self._oxygen = self._sim.diffuse_and_advect_oxygen(
             self._oxygen, self._x_wind_vel, self._y_wind_vel, self._reference_wind_magnitude
+        )
+        # Fresh-air replenishment toward the elevation oxygen profile (combustion below
+        # still draws this down, so a vigorous fire can outpace it locally).
+        self._oxygen = self._sim.relax_to_equilibrium(
+            self._oxygen, self._oxygen_eq, self._sim.oxygen_rate
         )
         self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen = self._sim.update_fire(
             self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen

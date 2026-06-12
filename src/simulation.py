@@ -27,7 +27,6 @@ class Simulation:
         self.ms_per_step:                 int   = 1000 // self.simulation_steps_per_second
         self.blur_sigma:                  float = float(sim.get("blur_sigma",              1.0))
         self.diffusion_substeps:          int   = int(sim.get("diffusion_substeps",        4))
-        self.atmospheric_cooling_rate:    float = float(sim.get("atmospheric_cooling_rate", 0.01))
 
         self.wind_advection_strength: float = float(wind.get("advection_strength", 0.4))
         self.wind_smooth_sigma:       float = float(wind.get("smooth_sigma",       2.0))
@@ -49,6 +48,14 @@ class Simulation:
         self.terrain_lacunarity:  float = float(terrain.get("lacunarity",  2.0))
         self.temperature_lapse_rate: float = float(terrain.get("temperature_lapse_rate", 3.0))
         self.oxygen_lapse_rate:      float = float(terrain.get("oxygen_lapse_rate",      1.5))
+
+        relaxation = (cfg or {}).get("relaxation", {})
+
+        # Newtonian relaxation toward the elevation equilibrium profiles (radiative
+        # forcing for temperature, fresh-air replenishment for oxygen).
+        self.temperature_rate_low:  float = float(relaxation.get("temperature_rate_low",  0.02))
+        self.temperature_rate_high: float = float(relaxation.get("temperature_rate_high", 0.30))
+        self.oxygen_rate:           float = float(relaxation.get("oxygen_rate",           0.05))
 
         pressure = (cfg or {}).get("pressure", {})
 
@@ -315,8 +322,22 @@ class Simulation:
             air_temperatures, x_vel, y_vel, self.blur_sigma
         )
 
-    def apply_atmospheric_cooling(self, air_temperatures: np.ndarray) -> np.ndarray:
-        return (air_temperatures * (1.0 - self.atmospheric_cooling_rate)).astype(np.float32)
+    def temperature_relax_rate(self, terrain: np.ndarray) -> np.ndarray:
+        """Per-cell radiative relaxation rate: slow in valleys, fast at altitude."""
+        return (
+            self.temperature_rate_low
+            + (self.temperature_rate_high - self.temperature_rate_low) * terrain
+        ).astype(np.float32)
+
+    @staticmethod
+    def relax_to_equilibrium(
+        field: np.ndarray, target: np.ndarray, rate: np.ndarray | float
+    ) -> np.ndarray:
+        """Newtonian relaxation toward target, exact-exponential form (stable for any rate).
+
+        rate may be a scalar or a per-cell array.
+        """
+        return (target + (field - target) * np.exp(-rate)).astype(np.float32)
 
     def diffuse_and_advect_oxygen(
         self,
