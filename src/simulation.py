@@ -8,8 +8,11 @@ No pygame dependency; safe to import in headless training environments.
 import math
 import numpy as np
 import noise
-from scipy.ndimage import gaussian_filter, laplace, map_coordinates
-from scipy.signal import fftconvolve, oaconvolve
+from scipy.ndimage import gaussian_filter, laplace
+from scipy.signal import fftconvolve
+
+# Stability cap for the explicit Laplacian diffusion coefficient (2D: must be < 0.25).
+_MAX_DIFFUSION_COEFF: float = 0.2
 
 
 class Simulation:
@@ -44,6 +47,8 @@ class Simulation:
         self.terrain_octaves:     int   = int(terrain.get("octaves",       6))
         self.terrain_persistence: float = float(terrain.get("persistence", 0.5))
         self.terrain_lacunarity:  float = float(terrain.get("lacunarity",  2.0))
+        self.temperature_lapse_rate: float = float(terrain.get("temperature_lapse_rate", 3.0))
+        self.oxygen_lapse_rate:      float = float(terrain.get("oxygen_lapse_rate",      1.5))
 
         pressure = (cfg or {}).get("pressure", {})
 
@@ -87,12 +92,6 @@ class Simulation:
         self.radiant_emission_scale:    float = float(radiant.get("emission_scale",   0.05))
         self.radiant_emission_exponent: float = float(radiant.get("emission_exponent", 2.0))
 
-        self._diffusion_kernel        = self._build_diffusion_kernel(
-            self.blur_sigma / math.sqrt(self.diffusion_substeps)
-        )
-        self._oxygen_diffusion_kernel = self._build_diffusion_kernel(
-            self.oxygen_diffusion_sigma / math.sqrt(self.diffusion_substeps)
-        )
         self._radiant_kernel = self._build_radiant_kernel(self.radiant_kernel_radius)
 
     # ---------------------------------------------------------------------------
@@ -176,6 +175,11 @@ class Simulation:
         """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
         return ((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index])).astype(np.float32)
 
+    @staticmethod
+    def elevation_falloff(terrain: np.ndarray, rate: float) -> np.ndarray:
+        """Field that decays exponentially with elevation: exp(-rate * h), 1.0 at sea level."""
+        return np.exp(-rate * terrain).astype(np.float32)
+
     def sample_tree_counts(self, density: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         """Stochastic per-cell tree counts.
 
@@ -188,13 +192,6 @@ class Simulation:
     # ---------------------------------------------------------------------------
     # Diffusion / advection
     # ---------------------------------------------------------------------------
-
-    @staticmethod
-    def _build_diffusion_kernel(sigma: float) -> np.ndarray:
-        offsets = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
-        gy, gx = np.meshgrid(offsets, offsets, indexing='ij')
-        kernel = np.exp(-(gx ** 2 + gy ** 2) / (2.0 * sigma ** 2))
-        return (kernel / kernel.sum()).astype(np.float32)
 
     @staticmethod
     def _build_radiant_kernel(radius: int) -> np.ndarray:
@@ -210,50 +207,94 @@ class Simulation:
     def _advect_and_diffuse_field(
         self,
         field: np.ndarray,
-        source_rows: np.ndarray,
-        source_cols: np.ndarray,
-        boundary_mode: str,
-        boundary_cval: float,
-        kernel: np.ndarray,
+        x_vel: np.ndarray,
+        y_vel: np.ndarray,
+        sigma: float,
+        saturate: bool = False,
     ) -> np.ndarray:
+        # Operator splitting: conservative flux advection, then conservative diffusion.
+        result = self._advect_field(field, x_vel, y_vel, saturate)
+        return self._diffuse(result, sigma)
+
+    def _diffuse(self, field: np.ndarray, sigma: float) -> np.ndarray:
+        # Explicit Laplacian diffusion with no-flux (reflect) boundaries. The
+        # discrete Laplacian sums to zero under reflect, so this conserves the total
+        # exactly (same scheme as the pressure equalisation). Each substep is a
+        # convex combination (coefficient <= 0.25), so values stay within bounds.
+        if sigma <= 0.0:
+            return field
+        variance = sigma * sigma
+        n = max(1, int(math.ceil(variance / (2.0 * _MAX_DIFFUSION_COEFF))))
+        coeff = variance / (2.0 * n)   # exact: total variance = 2 * coeff * n = sigma^2
         result = field
-        pad_r = kernel.shape[0] // 2
-        pad_c = kernel.shape[1] // 2
-        for _ in range(self.diffusion_substeps):
-            result = map_coordinates(
-                result,
-                [source_rows, source_cols],
-                order=1,
-                mode=boundary_mode,
-                cval=boundary_cval,
-            ).astype(np.float32)
-            if boundary_mode == 'reflect':
-                padded = np.pad(result, ((pad_r, pad_r), (pad_c, pad_c)), mode='reflect')
-            else:
-                padded = np.pad(result, ((pad_r, pad_r), (pad_c, pad_c)), mode='constant', constant_values=boundary_cval)
-            result = oaconvolve(padded, kernel, mode='valid').astype(np.float32)
+        for _ in range(n):
+            result = (result + coeff * laplace(result, mode='reflect')).astype(np.float32)
         return result
 
     @staticmethod
-    def _compute_source_coords(
-        field: np.ndarray,
+    def _advection_velocity(
         x_wind_vel: np.ndarray,
         y_wind_vel: np.ndarray,
         reference_wind_magnitude: float,
         advection_strength: float,
         sigma: float,
+        diffusion_substeps: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        rows, cols = field.shape
-        row_coords = np.arange(rows, dtype=np.float32)
-        col_coords = np.arange(cols, dtype=np.float32)
-        row_grid, col_grid = np.meshgrid(row_coords, col_coords, indexing='ij')
-
+        # Per-tick displacement field in grid cells. The diffusion_substeps factor
+        # preserves the previous total transport (the old loop applied the full
+        # displacement once per diffusion substep).
         if reference_wind_magnitude > 0.0:
-            advection_scale = advection_strength * sigma / reference_wind_magnitude
+            scale = advection_strength * sigma / reference_wind_magnitude * diffusion_substeps
         else:
-            advection_scale = 0.0
+            scale = 0.0
+        return (x_wind_vel * scale).astype(np.float32), (y_wind_vel * scale).astype(np.float32)
 
-        return row_grid - y_wind_vel * advection_scale, col_grid - x_wind_vel * advection_scale
+    @staticmethod
+    def _advect_upwind(
+        field: np.ndarray, x_vel: np.ndarray, y_vel: np.ndarray, saturate: bool = False
+    ) -> np.ndarray:
+        # One CFL-safe (<= 1 cell) first-order upwind step with no-flux walls.
+        # Each shared face flux is added to one neighbour and subtracted from the
+        # other, so the interior total is conserved exactly (telescoping sum).
+        uf = 0.5 * (x_vel[:, :-1] + x_vel[:, 1:])   # x-velocity on interior vertical faces
+        fx = np.maximum(uf, 0.0) * field[:, :-1] + np.minimum(uf, 0.0) * field[:, 1:]
+        vf = 0.5 * (y_vel[:-1, :] + y_vel[1:, :])   # y-velocity on interior horizontal faces
+        fy = np.maximum(vf, 0.0) * field[:-1, :] + np.minimum(vf, 0.0) * field[1:, :]
+
+        if saturate:
+            # Saturation: a cell at capacity (1.0) cannot accept more; the rejected
+            # flux stays in the upstream cell. Scale each face flux by the acceptance
+            # ratio of its destination cell. This conserves (flux still added once /
+            # subtracted once) while keeping every cell <= 1.0.
+            inflow = np.zeros_like(field)
+            inflow[:, 1:]  += np.maximum(fx, 0.0)    # fx > 0 flows into the right cell
+            inflow[:, :-1] += np.maximum(-fx, 0.0)   # fx < 0 flows into the left cell
+            inflow[1:, :]  += np.maximum(fy, 0.0)
+            inflow[:-1, :] += np.maximum(-fy, 0.0)
+            capacity = np.maximum(1.0 - field, 0.0)
+            accept = np.where(inflow > 0.0, np.minimum(1.0, capacity / np.maximum(inflow, 1e-12)), 1.0)
+            fx = fx * np.where(fx > 0.0, accept[:, 1:], accept[:, :-1])
+            fy = fy * np.where(fy > 0.0, accept[1:, :], accept[:-1, :])
+
+        out = field.copy()
+        out[:, :-1] -= fx
+        out[:, 1:]  += fx
+        out[:-1, :] -= fy
+        out[1:, :]  += fy
+        return out.astype(np.float32)
+
+    def _advect_field(
+        self, field: np.ndarray, x_vel: np.ndarray, y_vel: np.ndarray, saturate: bool = False
+    ) -> np.ndarray:
+        # CFL-adaptive substepping: split the displacement so each upwind substep
+        # moves at most one cell, then apply it that many times.
+        max_disp = float(np.abs(x_vel).max() + np.abs(y_vel).max())
+        n = max(1, int(math.ceil(max_disp)))
+        sx, sy = x_vel / n, y_vel / n
+        result = field
+        for _ in range(n):
+            result = self._advect_upwind(result, sx, sy, saturate)
+        return result
 
     @staticmethod
     def compute_air_temperature(air_temperatures: np.ndarray) -> float:
@@ -266,12 +307,12 @@ class Simulation:
         y_wind_vel: np.ndarray,
         reference_wind_magnitude: float,
     ) -> np.ndarray:
-        source_rows, source_cols = self._compute_source_coords(
-            air_temperatures, x_wind_vel, y_wind_vel, reference_wind_magnitude,
-            self.wind_advection_strength, self.blur_sigma,
+        x_vel, y_vel = self._advection_velocity(
+            x_wind_vel, y_wind_vel, reference_wind_magnitude,
+            self.wind_advection_strength, self.blur_sigma, self.diffusion_substeps,
         )
         return self._advect_and_diffuse_field(
-            air_temperatures, source_rows, source_cols, 'reflect', 0.0, self._diffusion_kernel
+            air_temperatures, x_vel, y_vel, self.blur_sigma
         )
 
     def apply_atmospheric_cooling(self, air_temperatures: np.ndarray) -> np.ndarray:
@@ -284,16 +325,16 @@ class Simulation:
         y_wind_vel: np.ndarray,
         reference_wind_magnitude: float,
     ) -> np.ndarray:
-        # Boundary cval=1.0 means the outside world acts as an infinite fresh-air source.
-        # No energy correction: oxygen is not conserved — it flows in freely from outside.
-        source_rows, source_cols = self._compute_source_coords(
-            oxygen, x_wind_vel, y_wind_vel, reference_wind_magnitude,
-            self.oxygen_advection_strength, self.oxygen_diffusion_sigma,
+        # Closed domain (no-flux walls): oxygen is neither lost nor replenished at
+        # the edges. Conservative flux advection with saturation keeps the total
+        # constant while capping each cell at 1.0 (saturated cells reject inflow).
+        x_vel, y_vel = self._advection_velocity(
+            x_wind_vel, y_wind_vel, reference_wind_magnitude,
+            self.oxygen_advection_strength, self.oxygen_diffusion_sigma, self.diffusion_substeps,
         )
-        result = self._advect_and_diffuse_field(
-            oxygen, source_rows, source_cols, 'constant', 1.0, self._oxygen_diffusion_kernel
+        return self._advect_and_diffuse_field(
+            oxygen, x_vel, y_vel, self.oxygen_diffusion_sigma, saturate=True
         )
-        return np.clip(result, 0.0, 1.0).astype(np.float32)
 
     def update_pressure(
         self,
@@ -403,7 +444,10 @@ class Simulation:
         ).astype(np.float32)  # (H, W)
 
         fuel   = (fuel - fuel_consumed).astype(np.float32)
-        oxygen = np.clip(oxygen - oxygen_consumed, 0.0, 1.0).astype(np.float32)
+        # Combustion is a real oxygen sink. oxygen_consumed <= oxygen and incoming
+        # oxygen is already <= 1 (saturated advection), so no clip is needed here —
+        # clipping would silently destroy/create oxygen and break conservation.
+        oxygen = (oxygen - oxygen_consumed).astype(np.float32)
 
         # Heat released per type, split between air and fuel.
         burn_heat_per_type = (fuel_consumed * bhs).astype(np.float32)  # (N, H, W)

@@ -49,6 +49,8 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print(f"    octaves                : {sim.terrain_octaves}")
     print(f"    persistence            : {sim.terrain_persistence}")
     print(f"    lacunarity             : {sim.terrain_lacunarity}")
+    print(f"    temperature_lapse_rate : {sim.temperature_lapse_rate}")
+    print(f"    oxygen_lapse_rate      : {sim.oxygen_lapse_rate}")
     print("  [fire]")
     print(f"    spawn_fire                  : {env._spawn_fire}")
     print(f"    spawn_radius                : {env._fire_spawn_radius}")

@@ -17,7 +17,7 @@ diffusion_sigma    = 3.0   # Gaussian diffusion width for oxygen transport
 advection_strength = 3.0   # oxygen advection scale relative to wind
 
 [noise]
-# Perlin noise used for air temperature initialisation
+# Default Perlin noise parameters (used for the fuel maps; terrain has its own).
 scale       = 64.0
 octaves     = 4
 persistence = 0.5
@@ -30,6 +30,10 @@ scale       = 96.0
 octaves     = 6
 persistence = 0.5
 lacunarity  = 2.0
+# Initial air temperature and oxygen fall off exponentially with elevation as
+# exp(-rate * h): 1.0 at sea level (h=0), decaying toward the peaks (h=1).
+temperature_lapse_rate = 3.0   # steeper -> colder peaks
+oxygen_lapse_rate      = 1.5   # steeper -> thinner air at altitude
 
 [pressure]
 temp_scale          = 0.2   # alpha in exp(-alpha * T); steepness of pressure response to temperature

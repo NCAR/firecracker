@@ -367,12 +367,14 @@ class FirecrackerEnv(gymnasium.Env):
         options: dict | None = None,
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-        temp_raw = self._sim.create_grid(self.grid_size, base=int(self.np_random.integers(0, 256)))
-        self._air_temperatures = temp_raw.astype(np.float32)
-
-        # Elevation height map; higher ground supports less vegetation.
+        # Elevation height map drives initial temperature, oxygen, and vegetation.
         self._terrain = self._sim.create_terrain(
             self.grid_size, base=int(self.np_random.integers(0, 256))
+        )
+
+        # Air temperature falls off exponentially with elevation (1.0 at sea level).
+        self._air_temperatures = self._sim.elevation_falloff(
+            self._terrain, self._sim.temperature_lapse_rate
         )
 
         N = self._sim.num_fuel_types
@@ -414,7 +416,8 @@ class FirecrackerEnv(gymnasium.Env):
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
         )
-        self._oxygen = np.ones((self.grid_size, self.grid_size), dtype=np.float32)
+        # Oxygen also thins exponentially with elevation (1.0 at sea level).
+        self._oxygen = self._sim.elevation_falloff(self._terrain, self._sim.oxygen_lapse_rate)
         self._last_radiant_flux = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         # Seed the display scales from the initial state so the first frames are scaled sanely.
         self._fuel_temp_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._fuel_temperatures.max())
