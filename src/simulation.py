@@ -126,24 +126,6 @@ class Simulation:
         return result
 
     @staticmethod
-    def _advection_velocity(
-        x_wind_vel: np.ndarray,
-        y_wind_vel: np.ndarray,
-        reference_wind_magnitude: float,
-        advection_strength: float,
-        sigma: float,
-        diffusion_substeps: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        # Per-tick displacement field in grid cells. The diffusion_substeps factor
-        # preserves the previous total transport (the old loop applied the full
-        # displacement once per diffusion substep).
-        if reference_wind_magnitude > 0.0:
-            scale = advection_strength * sigma / reference_wind_magnitude * diffusion_substeps
-        else:
-            scale = 0.0
-        return (x_wind_vel * scale).astype(np.float32), (y_wind_vel * scale).astype(np.float32)
-
-    @staticmethod
     def _advect_upwind(
         field: np.ndarray, x_vel: np.ndarray, y_vel: np.ndarray, saturate: bool = False
     ) -> np.ndarray:
@@ -194,6 +176,33 @@ class Simulation:
     def compute_air_temperature(air_temperatures: np.ndarray) -> float:
         return float(air_temperatures.mean())
 
+    @staticmethod
+    def _phi_diffuse_step(
+        mass: np.ndarray, energy: np.ndarray, phi: np.ndarray, dt: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        # One conservative substep of relaxational diffusion: each face carries a
+        # down-gradient flux F = -q_face * (Phi[R] - Phi[L]) of mass and energy, with the
+        # face quantity q_face taken as the *arithmetic mean* of the two cells. Centered
+        # (not upwind), because this is diffusion, not advection — the "velocity" is the
+        # potential gradient itself. Each face flux is added to one neighbour and
+        # subtracted from the other (telescoping), so both totals are conserved under
+        # no-flux walls.
+        dphix = phi[:, 1:] - phi[:, :-1]    # Phi[R] - Phi[L] across vertical faces
+        dphiy = phi[1:, :] - phi[:-1, :]
+        mfx = 0.5 * (mass[:, :-1] + mass[:, 1:]) * dphix * dt    # flux L -> R (sign folded in)
+        efx = 0.5 * (energy[:, :-1] + energy[:, 1:]) * dphix * dt
+        mfy = 0.5 * (mass[:-1, :] + mass[1:, :]) * dphiy * dt
+        efy = 0.5 * (energy[:-1, :] + energy[1:, :]) * dphiy * dt
+
+        m, e = mass.copy(), energy.copy()
+        # Down-gradient: a cell loses to lower-Phi neighbours. dphix>0 means the right cell
+        # is higher, so flux runs R -> L: the left cell gains (+), the right loses (-).
+        m[:, :-1] += mfx; m[:, 1:] -= mfx
+        e[:, :-1] += efx; e[:, 1:] -= efx
+        m[:-1, :] += mfy; m[1:, :] -= mfy
+        e[:-1, :] += efy; e[1:, :] -= efy
+        return m.astype(np.float32), e.astype(np.float32)
+
     def transport_mass_energy(
         self,
         mass: np.ndarray,
@@ -201,23 +210,39 @@ class Simulation:
         terrain: np.ndarray,
         air_temperatures: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Convective transport: flux both mass and energy down the transport potential.
+        """Convective transport: relax mass and energy down the transport-potential gradient.
 
-        Phi = c_p * m + c_b * H, where H = gamma*terrain + m*(1 + alpha*T) is the column
-        height. The flow velocity u = -grad(Phi) carries both mass and energy in the
-        same conservative upwind flux, so energy moves with the air (convection) without
-        any compression term. Because u is the gradient of a scalar potential, the
-        dynamics are purely relaxational — no gravity-wave feedback. Both the mass and
-        the energy totals are conserved exactly (no-flux walls).
+        Phi = c_p*m + c_b*H, H = gamma*terrain + m*(1 + alpha*T). Since m*(1+alpha*T) =
+        m + alpha*E, Phi is linear in the conserved fields: Phi = (c_p+c_b)*m + c_b*alpha*E
+        + c_b*gamma*terrain. Mass and energy are carried by the same down-gradient flux
+        F = -q * grad(Phi). This is relaxational *diffusion* (the flow vanishes where Phi is
+        uniform), so it is discretised with a conservative centered finite-volume flux —
+        face quantities are arithmetic means, which couples neighbours directly without the
+        odd/even checkerboard a cell-centred central-difference velocity produces.
+
+        Stability is the explicit-diffusion limit (diffusion number <~ 0.25 in 2D), which is
+        far stricter than an advective CFL: with the local diffusivity D = q * dPhi/dq =
+        (c_p+c_b)*m + c_b*alpha*E, the substep count is sized so dt*D stays well under the
+        limit at every cell. Both totals are conserved exactly (no-flux walls); under that
+        step the centered diffusion is monotone, so mass stays non-negative.
         """
-        height = self.column_height(mass, terrain, air_temperatures)
-        phi = self.pressure_transport_rate * mass + self.buoyancy_transport_rate * height
-        grad_y, grad_x = np.gradient(phi)
-        # Down-gradient velocity (cells per tick), lightly smoothed to de-noise.
-        x_vel = gaussian_filter(-grad_x, sigma=self.wind_smooth_sigma).astype(np.float32)
-        y_vel = gaussian_filter(-grad_y, sigma=self.wind_smooth_sigma).astype(np.float32)
-        mass = self._advect_field(mass, x_vel, y_vel)
-        energy = self._advect_field(energy, x_vel, y_vel)
+        c_p, c_b = self.pressure_transport_rate, self.buoyancy_transport_rate
+        gamma, alpha = self.terrain_height_scale, self.thermal_expansion
+        terrain_term = (c_b * gamma * terrain).astype(np.float32)
+
+        def phi_of(m: np.ndarray, e: np.ndarray) -> np.ndarray:
+            return ((c_p + c_b) * m + c_b * alpha * e + terrain_term).astype(np.float32)
+
+        # Local diffusivity D = q * dPhi/dq = (c_p+c_b)*m + c_b*alpha*E. Explicit 2D
+        # diffusion is stable for dt*D below ~0.25 per axis; use a safety factor of 8 so a
+        # cell's worst-case coupling across all four faces stays well within bounds.
+        diffusivity = float(((c_p + c_b) * mass + c_b * alpha * energy).max(initial=0.0))
+        n = max(1, int(math.ceil(8.0 * diffusivity)))
+        dt = 1.0 / n
+
+        for _ in range(n):
+            mass, energy = self._phi_diffuse_step(mass, energy, phi_of(mass, energy), dt)
+
         # A little conservative thermal mixing on the energy (intensive T smoothing would
         # not conserve, so diffuse the extensive energy instead).
         energy = self._diffuse(energy, self.blur_sigma)
@@ -245,15 +270,16 @@ class Simulation:
         oxygen: np.ndarray,
         x_wind_vel: np.ndarray,
         y_wind_vel: np.ndarray,
-        reference_wind_magnitude: float,
     ) -> np.ndarray:
-        # Closed domain (no-flux walls): oxygen is neither lost nor replenished at
-        # the edges. Conservative flux advection with saturation keeps the total
-        # constant while capping each cell at 1.0 (saturated cells reject inflow).
-        x_vel, y_vel = self._advection_velocity(
-            x_wind_vel, y_wind_vel, reference_wind_magnitude,
-            self.oxygen_advection_strength, self.oxygen_diffusion_sigma, self.diffusion_substeps,
-        )
+        # Closed domain (no-flux walls): oxygen is neither lost nor replenished at the
+        # edges. Oxygen rides the *actual* wind (scaled by advection_strength), then
+        # diffuses; both are conservative, and the saturating advection caps each cell
+        # at 1.0 (saturated cells reject inflow). Advecting with the real wind — rather
+        # than a wind-magnitude-normalised displacement — keeps oxygen transport tied to
+        # the wind speed, so diffusion can balance it instead of it snapping to a piled
+        # steady state.
+        x_vel = (x_wind_vel * self.oxygen_advection_strength).astype(np.float32)
+        y_vel = (y_wind_vel * self.oxygen_advection_strength).astype(np.float32)
         return self._advect_and_diffuse_field(
             oxygen, x_vel, y_vel, self.oxygen_diffusion_sigma, saturate=True
         )

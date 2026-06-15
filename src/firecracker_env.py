@@ -37,7 +37,6 @@ BLUE_CHANNEL: int = 2
 
 _AIR_TEMP_DISPLAY_THRESHOLD:       float = 1e-2
 _WIND_DISPLAY_THRESHOLD:       float = 1e-4
-_PRESSURE_DISPLAY_THRESHOLD:   float = 1e-2
 
 # EMA weight for the upper bound of the fuel-temperature and radiant-heat color
 # scales. Smaller = steadier (slower to track the peak); larger = more responsive.
@@ -186,15 +185,12 @@ def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
 
 def build_pressure_surface(pressure: np.ndarray, scale: int) -> pygame.Surface:
     rows, cols = pressure.shape
-    p_min = float(pressure.min())
+    # Anchored at zero, normalised by the current max (like the temperature view): a
+    # uniform field renders uniformly bright, and a gradient's spread visibly shrinks as
+    # it equalises — unlike a min-max scale, which re-stretches the residual every frame.
     p_max = float(pressure.max())
-    p_range = p_max - p_min
-    absolute = np.clip(pressure, 0.0, 1.0)
-    minmax = (pressure - p_min) / p_range if p_range > 0.0 else absolute
-    t = min(p_range / _PRESSURE_DISPLAY_THRESHOLD, 1.0)
-    normalized = t * minmax + (1.0 - t) * absolute
-    fade = min(p_max / _PRESSURE_DISPLAY_THRESHOLD, 1.0)
-    blue = (normalized * fade * MAX_CHANNEL_VALUE).astype(np.uint8)
+    normalized = np.clip(pressure / p_max, 0.0, 1.0) if p_max > 0.0 else np.zeros_like(pressure)
+    blue = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
     blue_scaled = np.repeat(np.repeat(blue, scale, axis=0), scale, axis=1)
     rgb = np.zeros((rows * scale, cols * scale, 3), dtype=np.uint8)
     rgb[:, :, BLUE_CHANNEL] = blue_scaled
@@ -242,12 +238,11 @@ def build_terrain_surface(terrain: np.ndarray, scale: int) -> pygame.Surface:
 
 def build_column_height_surface(height: np.ndarray, scale: int) -> pygame.Surface:
     rows, cols = height.shape
-    # Min-max normalised relief of the air-column top: dark = short columns (cold/low
-    # terrain), bright cyan = tall columns (warm/high terrain).
-    h_min = float(height.min())
+    # Relief of the air-column top, anchored at zero and normalised by the current max
+    # (like the temperature view): dark = short columns (cold/low terrain), bright cyan =
+    # tall columns (warm/high terrain). Column height is always non-negative.
     h_max = float(height.max())
-    h_range = h_max - h_min
-    normalized = (height - h_min) / h_range if h_range > 0.0 else np.zeros_like(height)
+    normalized = np.clip(height / h_max, 0.0, 1.0) if h_max > 0.0 else np.zeros_like(height)
     r = (normalized * 40).astype(np.uint8)
     g = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
     b = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
@@ -474,7 +469,7 @@ class FirecrackerEnv(gymnasium.Env):
             self._air_temperatures, self._fuel_temperatures, self._fuel, self._mass
         )
         self._oxygen = self._sim.diffuse_and_advect_oxygen(
-            self._oxygen, self._x_wind_vel, self._y_wind_vel, self._reference_wind_magnitude
+            self._oxygen, self._x_wind_vel, self._y_wind_vel
         )
         # Fresh-air replenishment toward the elevation oxygen profile (combustion below
         # still draws this down, so a vigorous fire can outpace it locally).
