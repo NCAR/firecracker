@@ -66,6 +66,7 @@ class ViewMode(Enum):
     FUEL_TEMPERATURE = 6
     RADIANT_HEAT = 7
     TERRAIN = 8
+    COLUMN_HEIGHT = 9
 
 
 # Populated from ViewMode values so new modes are picked up automatically.
@@ -238,6 +239,27 @@ def build_terrain_surface(terrain: np.ndarray, scale: int) -> pygame.Surface:
     return surface
 
 
+def build_column_height_surface(height: np.ndarray, scale: int) -> pygame.Surface:
+    rows, cols = height.shape
+    # Min-max normalised relief of the air-column top: dark = short columns (cold/low
+    # terrain), bright cyan = tall columns (warm/high terrain).
+    h_min = float(height.min())
+    h_max = float(height.max())
+    h_range = h_max - h_min
+    normalized = (height - h_min) / h_range if h_range > 0.0 else np.zeros_like(height)
+    r = (normalized * 40).astype(np.uint8)
+    g = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
+    b = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
+    rgb = np.stack([
+        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
+        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
+    ], axis=-1)
+    surface = pygame.Surface((cols * scale, rows * scale))
+    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
+    return surface
+
+
 def build_fire_surface(
     fuel_temperatures: np.ndarray,       # (N, H, W)
     fuel: np.ndarray,                    # (N, H, W)
@@ -325,7 +347,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._reference_wind_magnitude: float = 0.0
         self._fuel: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
-        self._pressure: np.ndarray | None = None
+        self._mass: np.ndarray | None = None   # column mass = surface pressure
         self._terrain: np.ndarray | None = None
         # Relaxation targets (initial profiles) and per-cell temperature rate.
         self._temp_eq: np.ndarray | None = None
@@ -348,6 +370,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._fuel_temperature_surface: pygame.Surface | None = None
         self._radiant_flux_surface: pygame.Surface | None = None
         self._terrain_surface: pygame.Surface | None = None
+        self._column_height_surface: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
         self._show_wind_overlay: bool = False
@@ -380,6 +403,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._air_temperatures = self._sim.elevation_falloff(
             self._terrain, self._sim.temperature_lapse_rate
         )
+        # Radiative-equilibrium target: the clean elevation profile, captured before
+        # any spawned fire perturbs the field.
+        self._temp_eq = self._air_temperatures.copy()
 
         N = self._sim.num_fuel_types
         self._fuel = np.zeros((N, self.grid_size, self.grid_size), dtype=np.float32)
@@ -413,18 +439,17 @@ class FirecrackerEnv(gymnasium.Env):
             r = int(self.np_random.integers(0, self.grid_size))
             c = int(self.np_random.integers(0, self.grid_size))
             self._spawn_fire_patch(r, c)
-        self._pressure = np.exp(
-            -self._sim.pressure_temp_scale * self._air_temperatures
-        ).astype(np.float32)
-        self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_pressure(self._pressure)
+        # Column mass (surface pressure), initialised at its leveled rest state so the
+        # mass field starts balanced (uses the clean elevation temperature profile).
+        self._mass = self._sim.equilibrium_mass(self._terrain, self._temp_eq)
+        self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_pressure(self._mass)
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
         )
         # Oxygen also thins exponentially with elevation (1.0 at sea level).
         self._oxygen = self._sim.elevation_falloff(self._terrain, self._sim.oxygen_lapse_rate)
-        # Relaxation targets are the initial profiles; the rate field is elevation-based
-        # (all static within an episode, so cache them once here).
-        self._temp_eq = self._air_temperatures.copy()
+        # Oxygen replenishment target and the elevation-based temperature rate field
+        # (static within an episode, cached once).
         self._oxygen_eq = self._oxygen.copy()
         self._temp_relax_rate = self._sim.temperature_relax_rate(self._terrain)
         self._last_radiant_flux = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
@@ -443,12 +468,20 @@ class FirecrackerEnv(gymnasium.Env):
     def step(
         self, action: int
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
-        self._air_temperatures = self._sim.diffuse_and_advect(
-            self._air_temperatures, self._x_wind_vel, self._y_wind_vel, self._reference_wind_magnitude
+        # Convective transport: mass and energy (E = m*T) flow together down the
+        # transport potential Phi = c_p*m + c_b*H, so heat is carried by the air mass
+        # (convection) with no compression term and no gravity waves. Temperature is the
+        # diagnostic T = E/m recovered afterward.
+        energy = self._mass * self._air_temperatures
+        self._mass, energy = self._sim.transport_mass_energy(
+            self._mass, energy, self._terrain, self._air_temperatures
         )
-        self._air_temperatures = self._sim.relax_to_equilibrium(
-            self._air_temperatures, self._temp_eq, self._temp_relax_rate
-        )
+        self._air_temperatures = (energy / np.maximum(self._mass, 1e-6)).astype(np.float32)
+        # Surface radiative relaxation (sun warms, space cools); a sink/source forcing.
+        if self._sim.relaxation_enabled:
+            self._air_temperatures = self._sim.relax_to_equilibrium(
+                self._air_temperatures, self._temp_eq, self._temp_relax_rate
+            )
         self._air_temperatures, self._fuel_temperatures = self._sim.exchange_fuel_air_heat(
             self._air_temperatures, self._fuel_temperatures, self._fuel
         )
@@ -457,18 +490,21 @@ class FirecrackerEnv(gymnasium.Env):
         )
         # Fresh-air replenishment toward the elevation oxygen profile (combustion below
         # still draws this down, so a vigorous fire can outpace it locally).
-        self._oxygen = self._sim.relax_to_equilibrium(
-            self._oxygen, self._oxygen_eq, self._sim.oxygen_rate
-        )
-        self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen = self._sim.update_fire(
-            self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen
-        )
-        self._fuel_temperatures, self._last_radiant_flux = self._sim.apply_radiant_heat(
-            self._fuel_temperatures, self._fuel, self._oxygen
-        )
-        self._pressure = self._sim.update_pressure(self._pressure, self._air_temperatures)
+        if self._sim.relaxation_enabled:
+            self._oxygen = self._sim.relax_to_equilibrium(
+                self._oxygen, self._oxygen_eq, self._sim.oxygen_rate
+            )
+        if self._sim.fire_enabled:
+            self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen = self._sim.update_fire(
+                self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen
+            )
+            self._fuel_temperatures, self._last_radiant_flux = self._sim.apply_radiant_heat(
+                self._fuel_temperatures, self._fuel, self._oxygen
+            )
+        # Refresh the surface wind (-grad pressure) for display and next tick's oxygen
+        # advection. The wind is purely diagnostic; mass moves via the transport above.
         self._x_wind_vel, self._y_wind_vel = self._sim.update_wind(
-            self._pressure, self._x_wind_vel, self._y_wind_vel
+            self._mass, self._x_wind_vel, self._y_wind_vel
         )
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
@@ -543,23 +579,30 @@ class FirecrackerEnv(gymnasium.Env):
             return self._fuel_temperature_surface
         if self._current_mode == ViewMode.TERRAIN:
             return self._terrain_surface
+        if self._current_mode == ViewMode.COLUMN_HEIGHT:
+            return self._column_height_surface
         return self._radiant_flux_surface
 
     def _rebuild_surfaces_if_dirty(self) -> None:
         if not self._surfaces_dirty:
             return
-        self._color_surface = build_color_surface(self._air_temperatures, self._pixel_scale)
+        temp = self._air_temperatures
+        wx, wy = self._x_wind_vel, self._y_wind_vel
+        pressure_field = self._mass
+        wind_ref = float(np.sqrt(wx ** 2 + wy ** 2).max())
+
+        self._color_surface = build_color_surface(temp, self._pixel_scale)
         self._wind_surface = build_wind_surface(
-            self._x_wind_vel, self._y_wind_vel, self._air_temperatures,
-            self._pixel_scale, self._reference_wind_magnitude,
+            wx, wy, temp, self._pixel_scale, wind_ref,
         )
         self._fire_surface = build_fire_surface(
             self._fuel_temperatures, self._fuel, self._oxygen, self._pixel_scale,
             self._sim.ignition_thresholds, self._sim.fuel_burnt_threshold,
-            self._sim.oxygen_extinction_threshold, self._show_fire_overlay,
+            self._sim.oxygen_extinction_threshold,
+            self._show_fire_overlay and self._sim.fire_enabled,
         )
         self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
-        self._pressure_surface = build_pressure_surface(self._pressure, self._pixel_scale)
+        self._pressure_surface = build_pressure_surface(pressure_field, self._pixel_scale)
         self._fuel_temperature_surface = build_color_surface(
             self._fuel_temperatures.max(axis=0), self._pixel_scale,
             upper_bound=self._fuel_temp_display_scale,
@@ -570,6 +613,10 @@ class FirecrackerEnv(gymnasium.Env):
         )
         # Static after reset, but rebuilt with the batch for consistency (cost is negligible).
         self._terrain_surface = build_terrain_surface(self._terrain, self._pixel_scale)
+        self._column_height_surface = build_column_height_surface(
+            self._sim.column_height(self._mass, self._terrain, self._air_temperatures),
+            self._pixel_scale,
+        )
         self._surfaces_dirty = False
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
@@ -618,7 +665,7 @@ class FirecrackerEnv(gymnasium.Env):
             (self._fuel_temperatures >= ign) &
             (self._fuel > self._sim.fuel_burnt_threshold) &
             (self._oxygen[np.newaxis] > self._sim.oxygen_extinction_threshold)
-        )
+        ) if self._sim.fire_enabled else np.zeros_like(self._fuel, dtype=bool)
         info = {
             "air_temperature": self._sim.compute_air_temperature(self._air_temperatures),
             "air_temp_min":    float(self._air_temperatures.min()),

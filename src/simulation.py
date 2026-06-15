@@ -53,16 +53,23 @@ class Simulation:
 
         # Newtonian relaxation toward the elevation equilibrium profiles (radiative
         # forcing for temperature, fresh-air replenishment for oxygen).
+        self.relaxation_enabled:    bool  = bool(relaxation.get("enabled", True))
         self.temperature_rate_low:  float = float(relaxation.get("temperature_rate_low",  0.02))
         self.temperature_rate_high: float = float(relaxation.get("temperature_rate_high", 0.30))
         self.oxygen_rate:           float = float(relaxation.get("oxygen_rate",           0.05))
 
-        pressure = (cfg or {}).get("pressure", {})
+        convection = (cfg or {}).get("convection", {})
 
-        self.pressure_temp_scale:        float = float(pressure.get("temp_scale",        0.2))
-        self.pressure_relaxation_rate:   float = float(pressure.get("relaxation_rate",   0.1))
-        self.pressure_equalization_rate: float = float(pressure.get("equalization_rate", 0.1))
+        # Single-layer mass/energy convection. Surface pressure is the column mass m;
+        # the column height H = gamma*terrain + m*(1 + alpha*T) is taller for warm/high
+        # columns. Mass and energy flow down the transport potential Phi = c_p*m + c_b*H,
+        # so both the pressure gradient and the height gradient drive the air.
+        self.thermal_expansion:    float = float(convection.get("thermal_expansion",    0.5))
+        self.terrain_height_scale: float = float(convection.get("terrain_height_scale", 0.5))
+        self.buoyancy_transport_rate: float = float(convection.get("buoyancy_transport_rate", 0.1))
+        self.pressure_transport_rate: float = float(convection.get("pressure_transport_rate", 0.1))
 
+        self.fire_enabled:                bool  = bool(fire.get("enabled", True))
         self.oxygen_consumption_rate:     float = float(fire.get("oxygen_consumption_rate",     0.01))
         self.fuel_burnt_threshold:        float = float(fire.get("burnt_threshold",             0.01))
         self.oxygen_extinction_threshold: float = float(fire.get("oxygen_extinction_threshold", 0.05))
@@ -307,20 +314,34 @@ class Simulation:
     def compute_air_temperature(air_temperatures: np.ndarray) -> float:
         return float(air_temperatures.mean())
 
-    def diffuse_and_advect(
+    def transport_mass_energy(
         self,
+        mass: np.ndarray,
+        energy: np.ndarray,
+        terrain: np.ndarray,
         air_temperatures: np.ndarray,
-        x_wind_vel: np.ndarray,
-        y_wind_vel: np.ndarray,
-        reference_wind_magnitude: float,
-    ) -> np.ndarray:
-        x_vel, y_vel = self._advection_velocity(
-            x_wind_vel, y_wind_vel, reference_wind_magnitude,
-            self.wind_advection_strength, self.blur_sigma, self.diffusion_substeps,
-        )
-        return self._advect_and_diffuse_field(
-            air_temperatures, x_vel, y_vel, self.blur_sigma
-        )
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Convective transport: flux both mass and energy down the transport potential.
+
+        Phi = c_p * m + c_b * H, where H = gamma*terrain + m*(1 + alpha*T) is the column
+        height. The flow velocity u = -grad(Phi) carries both mass and energy in the
+        same conservative upwind flux, so energy moves with the air (convection) without
+        any compression term. Because u is the gradient of a scalar potential, the
+        dynamics are purely relaxational — no gravity-wave feedback. Both the mass and
+        the energy totals are conserved exactly (no-flux walls).
+        """
+        height = self.column_height(mass, terrain, air_temperatures)
+        phi = self.pressure_transport_rate * mass + self.buoyancy_transport_rate * height
+        grad_y, grad_x = np.gradient(phi)
+        # Down-gradient velocity (cells per tick), lightly smoothed to de-noise.
+        x_vel = gaussian_filter(-grad_x, sigma=self.wind_smooth_sigma).astype(np.float32)
+        y_vel = gaussian_filter(-grad_y, sigma=self.wind_smooth_sigma).astype(np.float32)
+        mass = self._advect_field(mass, x_vel, y_vel)
+        energy = self._advect_field(energy, x_vel, y_vel)
+        # A little conservative thermal mixing on the energy (intensive T smoothing would
+        # not conserve, so diffuse the extensive energy instead).
+        energy = self._diffuse(energy, self.blur_sigma)
+        return mass.astype(np.float32), energy.astype(np.float32)
 
     def temperature_relax_rate(self, terrain: np.ndarray) -> np.ndarray:
         """Per-cell radiative relaxation rate: slow in valleys, fast at altitude."""
@@ -357,24 +378,37 @@ class Simulation:
             oxygen, x_vel, y_vel, self.oxygen_diffusion_sigma, saturate=True
         )
 
-    def update_pressure(
-        self,
-        pressure: np.ndarray,
-        air_temperatures: np.ndarray,
-    ) -> np.ndarray:
-        lap   = laplace(pressure, mode='reflect').astype(np.float32)
-        p_eq  = np.exp(-self.pressure_temp_scale * air_temperatures).astype(np.float32)
-        new_p = (
-            pressure
-            + self.pressure_equalization_rate * lap
-            + self.pressure_relaxation_rate * (p_eq - pressure)
-        )
-        return np.clip(new_p, 0.0, 1.0).astype(np.float32)
+    def column_height(self, mass: np.ndarray, terrain: np.ndarray, air_temperatures: np.ndarray) -> np.ndarray:
+        """Column-top geopotential: terrain raises the base, temperature expands the column."""
+        return (
+            self.terrain_height_scale * terrain
+            + mass * (1.0 + self.thermal_expansion * air_temperatures)
+        ).astype(np.float32)
+
+    def equilibrium_mass(self, terrain: np.ndarray, air_temperatures: np.ndarray) -> np.ndarray:
+        """Closed-form rest state (mean 1) of the transport: the mass that makes Phi uniform.
+
+        At rest grad(Phi)=0, i.e. Phi = c_p*m + c_b*H = C with H = gamma*terrain +
+        m*(1+alpha*T). Solving per cell with k = c_p + c_b*(1 + alpha*T):
+            m = (C - c_b*gamma*terrain) / k
+        and C is fixed by total mass = N cells:
+            C = (N + c_b*gamma*sum[terrain/k]) / sum[1/k]
+        Note grad(m) is generally non-zero at rest, so a steady ambient surface wind
+        (-grad m) persists even though the net mass flux is zero.
+        """
+        c_p = self.pressure_transport_rate
+        c_b = self.buoyancy_transport_rate
+        gamma = self.terrain_height_scale
+        k = c_p + c_b * (1.0 + self.thermal_expansion * air_temperatures)
+        inv = 1.0 / k
+        n_cells = float(terrain.size)
+        c = (n_cells + c_b * gamma * float((terrain * inv).sum())) / float(inv.sum())
+        return ((c - c_b * gamma * terrain) * inv).astype(np.float32)
 
     def compute_wind_from_pressure(
-        self, pressure: np.ndarray
+        self, surface_pressure: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        grad_y, grad_x = np.gradient(pressure)
+        grad_y, grad_x = np.gradient(surface_pressure)
         # Wind flows from high to low pressure, so negate the gradient.
         x_wind = gaussian_filter(-grad_x, sigma=self.wind_smooth_sigma).astype(np.float32)
         y_wind = gaussian_filter(-grad_y, sigma=self.wind_smooth_sigma).astype(np.float32)
@@ -382,11 +416,11 @@ class Simulation:
 
     def update_wind(
         self,
-        pressure: np.ndarray,
+        surface_pressure: np.ndarray,
         x_wind_vel: np.ndarray,
         y_wind_vel: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        new_x, new_y = self.compute_wind_from_pressure(pressure)
+        new_x, new_y = self.compute_wind_from_pressure(surface_pressure)
         x_wind = (self.wind_temporal_smoothing * new_x + (1.0 - self.wind_temporal_smoothing) * x_wind_vel).astype(np.float32)
         y_wind = (self.wind_temporal_smoothing * new_y + (1.0 - self.wind_temporal_smoothing) * y_wind_vel).astype(np.float32)
         return x_wind, y_wind
