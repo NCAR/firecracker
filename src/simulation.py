@@ -434,35 +434,38 @@ class Simulation:
         air_temperatures: np.ndarray,   # (H, W)
         fuel_temperatures: np.ndarray,  # (N, H, W)
         fuel: np.ndarray,               # (N, H, W)
+        air_mass: np.ndarray,           # (H, W)
     ) -> tuple[np.ndarray, np.ndarray]:
         h = self.heat_capacities[:, np.newaxis, np.newaxis]    # (N, 1, 1)
         k = self.fuel_transfer_rates[:, np.newaxis, np.newaxis]  # (N, 1, 1)
 
-        mask    = fuel > self.fuel_burnt_threshold              # (N, H, W)
-        dT      = air_temperatures[np.newaxis] - fuel_temperatures  # (N, H, W)
-        C_fuel  = h * fuel                                      # (N, H, W)
+        C_fuel = h * fuel                                      # (N, H, W) fuel thermal mass
+        # Air thermal mass is the column mass (surface pressure): a dense/high-pressure
+        # column changes temperature less for the same heat, a thin column more.
+        C_air  = np.maximum(air_mass, 1e-6)[np.newaxis]        # (1, H, W)
+        total  = C_air + C_fuel                                # >= C_air > 0, always safe
 
-        # Avoid dividing by zero for non-participating cells.
-        safe_C = np.where(mask, C_fuel, 1.0)
+        # Mass-weighted equilibrium temperature of each air/fuel pair (the conserved
+        # mean the pair relaxes toward).
+        T_eq = (C_air * air_temperatures[np.newaxis] + C_fuel * fuel_temperatures) / total
 
-        # Unconstrained Newton step and equilibrium step (maximum without overshoot).
-        dT_fuel_raw = k * dT / safe_C
-        dT_fuel_eq  = dT / (1.0 + safe_C)
+        # Exact two-body relaxation over one tick: the air/fuel gap decays by
+        # exp(-k / C_red), where C_red = C_air*C_fuel/total is the reduced heat capacity.
+        # This folds the conduction rate and BOTH masses into a single factor in (0, 1],
+        # so each side lands on the equilibrium side without overshoot for any rate or
+        # masses — no clamping and no fictitious unit capacities needed.
+        # Massless ash (C_fuel -> 0) drives C_red -> 0 and T_eq -> air temp, so the
+        # exponent -> -inf and decay -> 0: the fuel equilibrates instantly to the air and
+        # returns ~no energy to it. The transfer rate k is always positive, so the only
+        # division by zero here is this benign C_fuel -> 0 limit (exp(-inf) = 0, no NaN).
+        with np.errstate(divide="ignore"):
+            decay = np.exp(-k * total / (C_air * C_fuel)).astype(np.float32)
 
-        # Take the smaller magnitude — whichever doesn't cross equilibrium.
-        dT_fuel = np.where(
-            np.abs(dT_fuel_raw) <= np.abs(dT_fuel_eq),
-            dT_fuel_raw,
-            dT_fuel_eq,
-        )
-        # Burnt-out cells (mask=False) are ~massless: snap them straight to air
-        # temperature (dT_fuel = dT). They carry no thermal mass, so the dT_air term
-        # below leaves the air essentially unchanged — massless ash holds no heat.
-        dT_fuel = np.where(mask, dT_fuel, dT).astype(np.float32)
+        dT_fuel = ((T_eq - fuel_temperatures) * (1.0 - decay)).astype(np.float32)  # (N, H, W)
 
-        # Air loses the sum of heat transferred to all fuel types (energy conserving).
-        # Depleted cells contribute ~0 because C_fuel = h*fuel ≈ 0.
-        dT_air = -np.sum(C_fuel * dT_fuel, axis=0).astype(np.float32)
+        # Air loses exactly the energy each fuel type gained (summed over types, divided
+        # by the air's own thermal mass), so total air+fuel energy is conserved.
+        dT_air = -(np.sum(C_fuel * dT_fuel, axis=0) / C_air[0]).astype(np.float32)
 
         return (air_temperatures + dT_air).astype(np.float32), (fuel_temperatures + dT_fuel).astype(np.float32)
 

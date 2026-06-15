@@ -483,7 +483,7 @@ class FirecrackerEnv(gymnasium.Env):
                 self._air_temperatures, self._temp_eq, self._temp_relax_rate
             )
         self._air_temperatures, self._fuel_temperatures = self._sim.exchange_fuel_air_heat(
-            self._air_temperatures, self._fuel_temperatures, self._fuel
+            self._air_temperatures, self._fuel_temperatures, self._fuel, self._mass
         )
         self._oxygen = self._sim.diffuse_and_advect_oxygen(
             self._oxygen, self._x_wind_vel, self._y_wind_vel, self._reference_wind_magnitude
