@@ -94,6 +94,13 @@ kernel_radius     = 10       # max range of radiation in grid cells
 emission_scale    = 0.001    # multiplier on fuel temperature emission
 emission_exponent = 2.0      # nonlinearity of emission vs fuel temperature (blackbody ~4)
 
+[maps]
+# Maps are fully-baked initial states loaded from disk. Generate them with
+#     python src/gen_maps.py --count 8 --out maps
+# reset() errors if no map is available, so generate at least one before running.
+dir  = "maps"   # directory to load maps from
+name = ""       # specific map filename to load; empty = pick a random map each reset
+
 [environment]
 grid_size          = 256      # simulation grid cells (N x N)
 window_size        = 512      # display window size in pixels (square)

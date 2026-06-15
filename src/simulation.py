@@ -7,7 +7,6 @@ No pygame dependency; safe to import in headless training environments.
 
 import math
 import numpy as np
-import noise
 from scipy.ndimage import gaussian_filter, laplace
 from scipy.signal import fftconvolve
 
@@ -20,7 +19,6 @@ class Simulation:
         sim    = (cfg or {}).get("simulation", {})
         wind   = (cfg or {}).get("wind", {})
         oxygen = (cfg or {}).get("oxygen", {})
-        noise  = (cfg or {}).get("noise", {})
         fire   = (cfg or {}).get("fire", {})
 
         self.simulation_steps_per_second: int   = int(sim.get("steps_per_second",        10))
@@ -34,20 +32,6 @@ class Simulation:
 
         self.oxygen_diffusion_sigma:    float = float(oxygen.get("diffusion_sigma",    3.0))
         self.oxygen_advection_strength: float = float(oxygen.get("advection_strength", 3.0))
-
-        self.noise_scale:       float = float(noise.get("scale",      64.0))
-        self.noise_octaves:     int   = int(noise.get("octaves",       4))
-        self.noise_persistence: float = float(noise.get("persistence", 0.5))
-        self.noise_lacunarity:  float = float(noise.get("lacunarity",  2.0))
-
-        terrain = (cfg or {}).get("terrain", {})
-
-        self.terrain_scale:       float = float(terrain.get("scale",      96.0))
-        self.terrain_octaves:     int   = int(terrain.get("octaves",       6))
-        self.terrain_persistence: float = float(terrain.get("persistence", 0.5))
-        self.terrain_lacunarity:  float = float(terrain.get("lacunarity",  2.0))
-        self.temperature_lapse_rate: float = float(terrain.get("temperature_lapse_rate", 3.0))
-        self.oxygen_lapse_rate:      float = float(terrain.get("oxygen_lapse_rate",      1.5))
 
         relaxation = (cfg or {}).get("relaxation", {})
 
@@ -91,15 +75,6 @@ class Simulation:
         self.consumption_rates   = np.array([_ft(n, "consumption_rate",       0.001) for n in self.fuel_type_names], dtype=np.float32)
         self.burn_heat_scales    = np.array([_ft(n, "burn_heat_scale",        500.0) for n in self.fuel_type_names], dtype=np.float32)
         self.fuel_transfer_rates = np.array([_ft(n, "fuel_air_transfer_rate", 0.01)  for n in self.fuel_type_names], dtype=np.float32)
-        self.fuel_noise_scales   = np.array([_ft(n, "noise_scale",            32.0)  for n in self.fuel_type_names], dtype=np.float32)
-        self.altitude_falloffs   = np.array([_ft(n, "altitude_falloff",        1.0)  for n in self.fuel_type_names], dtype=np.float32)
-        self.spawn_densities     = np.array([_ft(n, "spawn_density",           0.5)  for n in self.fuel_type_names], dtype=np.float32)
-
-        # Tree-specific discretisation: per-cell tree counts are drawn from an
-        # exponential whose mean is the local density, then capped.
-        tree_cfg = fuel_types_cfg.get("tree", {})
-        self.fuel_per_tree:      float = float(tree_cfg.get("fuel_per_tree",      0.33))
-        self.max_trees_per_cell: int   = int(tree_cfg.get("max_trees_per_cell",   3))
 
         radiant = (cfg or {}).get("radiant_heat", {})
         self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",      20))
@@ -107,101 +82,6 @@ class Simulation:
         self.radiant_emission_exponent: float = float(radiant.get("emission_exponent", 2.0))
 
         self._radiant_kernel = self._build_radiant_kernel(self.radiant_kernel_radius)
-
-    # ---------------------------------------------------------------------------
-    # Grid initialisation
-    # ---------------------------------------------------------------------------
-
-    def sample_perlin_grid(
-        self,
-        size: int,
-        base: int,
-        scale: float | None = None,
-        octaves: int | None = None,
-        persistence: float | None = None,
-        lacunarity: float | None = None,
-    ) -> np.ndarray:
-        if scale is None:
-            scale = self.noise_scale
-        if octaves is None:
-            octaves = self.noise_octaves
-        if persistence is None:
-            persistence = self.noise_persistence
-        if lacunarity is None:
-            lacunarity = self.noise_lacunarity
-        grid = np.empty((size, size), dtype=np.float32)
-        for row in range(size):
-            for col in range(size):
-                grid[row, col] = noise.pnoise2(
-                    col / scale,
-                    row / scale,
-                    octaves=octaves,
-                    persistence=persistence,
-                    lacunarity=lacunarity,
-                    base=base,
-                )
-        return grid
-
-    @staticmethod
-    def normalize_grid(grid: np.ndarray) -> np.ndarray:
-        lo = grid.min()
-        hi = grid.max()
-        if hi == lo:
-            return np.zeros_like(grid)
-        return ((grid - lo) / (hi - lo)).astype(np.float32)
-
-    def create_grid(
-        self,
-        size: int,
-        scale: float | None = None,
-        base: int | None = None,
-        octaves: int | None = None,
-        persistence: float | None = None,
-        lacunarity: float | None = None,
-    ) -> np.ndarray:
-        if scale is None:
-            scale = self.noise_scale
-        if base is None:
-            base = np.random.randint(0, 256)
-        raw = self.sample_perlin_grid(
-            size, base, scale=scale,
-            octaves=octaves, persistence=persistence, lacunarity=lacunarity,
-        )
-        return self.normalize_grid(raw)
-
-    def create_terrain(self, size: int, base: int | None = None) -> np.ndarray:
-        """Normalised [0, 1] elevation height map from octave Perlin noise.
-
-        The normalised map is squared to bias toward flat low-elevation
-        terrain with sharper, less frequent high-elevation peaks.
-        """
-        height = self.create_grid(
-            size,
-            scale=self.terrain_scale,
-            base=base,
-            octaves=self.terrain_octaves,
-            persistence=self.terrain_persistence,
-            lacunarity=self.terrain_lacunarity,
-        )
-        return (height ** 2).astype(np.float32)
-
-    def altitude_vegetation_multiplier(self, terrain: np.ndarray, fuel_index: int) -> np.ndarray:
-        """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
-        return ((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index])).astype(np.float32)
-
-    @staticmethod
-    def elevation_falloff(terrain: np.ndarray, rate: float) -> np.ndarray:
-        """Field that decays exponentially with elevation: exp(-rate * h), 1.0 at sea level."""
-        return np.exp(-rate * terrain).astype(np.float32)
-
-    def sample_tree_counts(self, density: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        """Stochastic per-cell tree counts.
-
-        Each cell's count is floor(Exp(mean=density)) capped at max_trees_per_cell,
-        so cells with higher density average more trees (mean 0 -> always 0).
-        """
-        samples = rng.exponential(np.maximum(density, 0.0))
-        return np.minimum(np.floor(samples), self.max_trees_per_cell).astype(np.float32)
 
     # ---------------------------------------------------------------------------
     # Diffusion / advection
@@ -384,26 +264,6 @@ class Simulation:
             self.terrain_height_scale * terrain
             + mass * (1.0 + self.thermal_expansion * air_temperatures)
         ).astype(np.float32)
-
-    def equilibrium_mass(self, terrain: np.ndarray, air_temperatures: np.ndarray) -> np.ndarray:
-        """Closed-form rest state (mean 1) of the transport: the mass that makes Phi uniform.
-
-        At rest grad(Phi)=0, i.e. Phi = c_p*m + c_b*H = C with H = gamma*terrain +
-        m*(1+alpha*T). Solving per cell with k = c_p + c_b*(1 + alpha*T):
-            m = (C - c_b*gamma*terrain) / k
-        and C is fixed by total mass = N cells:
-            C = (N + c_b*gamma*sum[terrain/k]) / sum[1/k]
-        Note grad(m) is generally non-zero at rest, so a steady ambient surface wind
-        (-grad m) persists even though the net mass flux is zero.
-        """
-        c_p = self.pressure_transport_rate
-        c_b = self.buoyancy_transport_rate
-        gamma = self.terrain_height_scale
-        k = c_p + c_b * (1.0 + self.thermal_expansion * air_temperatures)
-        inv = 1.0 / k
-        n_cells = float(terrain.size)
-        c = (n_cells + c_b * gamma * float((terrain * inv).sum())) / float(inv.sum())
-        return ((c - c_b * gamma * terrain) * inv).astype(np.float32)
 
     def compute_wind_from_pressure(
         self, surface_pressure: np.ndarray

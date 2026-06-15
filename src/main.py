@@ -39,18 +39,9 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print("  [oxygen]")
     print(f"    diffusion_sigma        : {sim.oxygen_diffusion_sigma}")
     print(f"    advection_strength     : {sim.oxygen_advection_strength}")
-    print("  [noise]")
-    print(f"    scale                  : {sim.noise_scale}")
-    print(f"    octaves                : {sim.noise_octaves}")
-    print(f"    persistence            : {sim.noise_persistence}")
-    print(f"    lacunarity             : {sim.noise_lacunarity}")
-    print("  [terrain]")
-    print(f"    scale                  : {sim.terrain_scale}")
-    print(f"    octaves                : {sim.terrain_octaves}")
-    print(f"    persistence            : {sim.terrain_persistence}")
-    print(f"    lacunarity             : {sim.terrain_lacunarity}")
-    print(f"    temperature_lapse_rate : {sim.temperature_lapse_rate}")
-    print(f"    oxygen_lapse_rate      : {sim.oxygen_lapse_rate}")
+    print("  [maps]")
+    print(f"    dir                    : {env._maps_dir}")
+    print(f"    name                   : {env._map_name or '(random)'}")
     print("  [relaxation]")
     print(f"    enabled                : {sim.relaxation_enabled}")
     print(f"    temperature_rate_low   : {sim.temperature_rate_low}")
@@ -72,12 +63,6 @@ def print_config_info(env: FirecrackerEnv) -> None:
         print(f"      consumption_rate       : {sim.consumption_rates[i]}")
         print(f"      burn_heat_scale        : {sim.burn_heat_scales[i]}")
         print(f"      fuel_air_transfer_rate : {sim.fuel_transfer_rates[i]}")
-        print(f"      noise_scale            : {sim.fuel_noise_scales[i]}")
-        print(f"      altitude_falloff       : {sim.altitude_falloffs[i]}")
-        print(f"      spawn_density          : {sim.spawn_densities[i]}")
-    print("  [tree spawning]")
-    print(f"    fuel_per_tree          : {sim.fuel_per_tree}")
-    print(f"    max_trees_per_cell     : {sim.max_trees_per_cell}")
     print("  [radiant_heat]")
     print(f"    kernel_radius          : {sim.radiant_kernel_radius}")
     print(f"    emission_scale         : {sim.radiant_emission_scale}")
@@ -109,8 +94,10 @@ def print_episode_info(info: dict, label: str) -> None:
     print(INFO_SEPARATOR)
 
 
-def run(config: dict) -> None:
-    env = FirecrackerEnv(config=config, render_mode="human")
+def run(config: dict, map_name: str | None = None, maps_dir: str | None = None) -> None:
+    env = FirecrackerEnv(
+        config=config, render_mode="human", map_name=map_name, maps_dir=maps_dir
+    )
 
     step_interval = 1.0 / env._sim.simulation_steps_per_second
     ms_per_step   = env._sim.ms_per_step
@@ -178,5 +165,13 @@ if __name__ == "__main__":
         "--config", metavar="PATH",
         help="path to a TOML config file (default: cfg/default.toml)",
     )
+    parser.add_argument(
+        "--map", metavar="NAME",
+        help="specific map to load from the maps dir (default: random)",
+    )
+    parser.add_argument(
+        "--maps-dir", metavar="PATH",
+        help="directory to load maps from (overrides config)",
+    )
     args = parser.parse_args()
-    run(load_config(args.config))
+    run(load_config(args.config), map_name=args.map, maps_dir=args.maps_dir)

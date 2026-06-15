@@ -15,6 +15,7 @@ import gymnasium
 from gymnasium import spaces
 
 from simulation import Simulation
+from map_loader import load_map, resolve_map, validate_against_config
 
 # ---------------------------------------------------------------------------
 # Display constants
@@ -314,6 +315,8 @@ class FirecrackerEnv(gymnasium.Env):
         self,
         config: dict | None = None,
         render_mode: str | None = None,
+        map_name: str | None = None,
+        maps_dir: str | None = None,
     ):
         super().__init__()
         assert render_mode is None or render_mode in self.metadata["render_modes"], (
@@ -324,6 +327,14 @@ class FirecrackerEnv(gymnasium.Env):
 
         env_cfg  = (config or {}).get("environment", {})
         fire_cfg = (config or {}).get("fire", {})
+        maps_cfg = (config or {}).get("maps", {})
+
+        # Map selection: a name (specific map) or None (random pick at reset).
+        # Explicit constructor args win over config.
+        self._maps_dir: str = maps_dir if maps_dir is not None else str(maps_cfg.get("dir", "maps"))
+        self._map_name: str | None = (
+            map_name if map_name is not None else (str(maps_cfg.get("name", "")) or None)
+        )
 
         self.grid_size   = int(env_cfg.get("grid_size",   DEFAULT_GRID_SIZE))
         self.window_size = int(env_cfg.get("window_size", DEFAULT_WINDOW_SIZE))
@@ -354,6 +365,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen_eq: np.ndarray | None = None
         self._temp_relax_rate: np.ndarray | None = None
         self._last_radiant_flux: np.ndarray | None = None
+        self._current_map: str | None = None   # filename of the loaded map
         # EMA-smoothed upper bounds for the mode 6 / mode 7 color scales.
         self._fuel_temp_display_scale: float = 0.0
         self._radiant_flux_display_scale: float = 0.0
@@ -394,64 +406,40 @@ class FirecrackerEnv(gymnasium.Env):
         options: dict | None = None,
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-        # Elevation height map drives initial temperature, oxygen, and vegetation.
-        self._terrain = self._sim.create_terrain(
-            self.grid_size, base=int(self.np_random.integers(0, 256))
-        )
 
-        # Air temperature falls off exponentially with elevation (1.0 at sea level).
-        self._air_temperatures = self._sim.elevation_falloff(
-            self._terrain, self._sim.temperature_lapse_rate
-        )
-        # Radiative-equilibrium target: the clean elevation profile, captured before
-        # any spawned fire perturbs the field.
-        self._temp_eq = self._air_temperatures.copy()
+        # Load a fully-baked initial state from disk. `options={"map": name}` overrides
+        # the configured selection for targeted (e.g. test) scenarios; otherwise a
+        # named map is loaded, or a random one is picked when no name is set.
+        map_name = (options or {}).get("map", self._map_name)
+        map_path = resolve_map(self._maps_dir, map_name, self.np_random)
+        m = load_map(map_path)
+        validate_against_config(m, self.grid_size, self._sim.fuel_type_names)
+        self._current_map = map_path.name
 
-        N = self._sim.num_fuel_types
-        self._fuel = np.zeros((N, self.grid_size, self.grid_size), dtype=np.float32)
+        self._terrain           = m.terrain
+        self._air_temperatures  = m.air_temperatures
+        self._temp_eq           = m.temp_eq
+        self._oxygen            = m.oxygen
+        self._oxygen_eq         = m.oxygen_eq
+        self._mass              = m.mass
+        self._fuel              = m.fuel
+        self._fuel_temperatures = m.fuel_temperatures
 
-        # Grass (type 0): continuous Perlin noise scaled to [0, 0.5], thinned by elevation.
-        grass_noise = self._sim.create_grid(
-            self.grid_size,
-            scale=float(self._sim.fuel_noise_scales[0]),
-            base=int(self.np_random.integers(0, 256)),
-        )
-        grass_alt = self._sim.altitude_vegetation_multiplier(self._terrain, 0)
-        self._fuel[0] = (grass_noise * float(self._sim.spawn_densities[0]) * grass_alt).astype(np.float32)
-
-        # Trees (type 1): per-cell counts drawn from an exponential whose mean is the
-        # elevation-thinned noise density, capped at max_trees_per_cell, then scaled
-        # to fuel mass. Higher density -> more trees on average.
-        if N > 1:
-            tree_noise = self._sim.create_grid(
-                self.grid_size,
-                scale=float(self._sim.fuel_noise_scales[1]),
-                base=int(self.np_random.integers(0, 256)),
-            )
-            tree_alt = self._sim.altitude_vegetation_multiplier(self._terrain, 1)
-            density = tree_noise * float(self._sim.spawn_densities[1]) * tree_alt
-            tree_counts = self._sim.sample_tree_counts(density, self.np_random)
-            self._fuel[1] = (tree_counts * self._sim.fuel_per_tree).astype(np.float32)
-
-        # Each fuel type starts at ambient air temperature.
-        self._fuel_temperatures = np.tile(self._air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)
-        if self._spawn_fire:
-            r = int(self.np_random.integers(0, self.grid_size))
-            c = int(self.np_random.integers(0, self.grid_size))
-            self._spawn_fire_patch(r, c)
-        # Column mass (surface pressure), initialised at its leveled rest state so the
-        # mass field starts balanced (uses the clean elevation temperature profile).
-        self._mass = self._sim.equilibrium_mass(self._terrain, self._temp_eq)
+        # Recompute the cheap dynamics-derived fields from the loaded state so the
+        # relaxation/wind knobs stay live without having to regenerate maps.
+        self._temp_relax_rate = self._sim.temperature_relax_rate(self._terrain)
         self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_pressure(self._mass)
         self._reference_wind_magnitude = float(
             np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
         )
-        # Oxygen also thins exponentially with elevation (1.0 at sea level).
-        self._oxygen = self._sim.elevation_falloff(self._terrain, self._sim.oxygen_lapse_rate)
-        # Oxygen replenishment target and the elevation-based temperature rate field
-        # (static within an episode, cached once).
-        self._oxygen_eq = self._oxygen.copy()
-        self._temp_relax_rate = self._sim.temperature_relax_rate(self._terrain)
+
+        # Optional ignition overlay (random spawn). Maps describe the world at rest;
+        # fire is a runtime concern applied on top of the loaded state.
+        if self._spawn_fire:
+            r = int(self.np_random.integers(0, self.grid_size))
+            c = int(self.np_random.integers(0, self.grid_size))
+            self._spawn_fire_patch(r, c)
+
         self._last_radiant_flux = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         # Seed the display scales from the initial state so the first frames are scaled sanely.
         self._fuel_temp_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._fuel_temperatures.max())
@@ -680,6 +668,7 @@ class FirecrackerEnv(gymnasium.Env):
             "terrain_mean":    float(self._terrain.mean()),
             "terrain_min":     float(self._terrain.min()),
             "terrain_max":     float(self._terrain.max()),
+            "map":             self._current_map,
             "step":            self._step_count,
         }
         for i, name in enumerate(self._sim.fuel_type_names):
