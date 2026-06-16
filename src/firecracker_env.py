@@ -15,7 +15,7 @@ import pygame
 import gymnasium
 from gymnasium import spaces
 
-from simulation import Simulation
+from simulation import Simulation, SimState
 from map_loader import load_map, resolve_map, validate_against_config
 
 
@@ -467,44 +467,11 @@ class FirecrackerEnv(gymnasium.Env):
     def step(
         self, action: int
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
-        # Convective transport: mass and energy (E = m*T) flow together down the
-        # transport potential Phi = c_p*m + c_b*H, so heat is carried by the air mass
-        # (convection) with no compression term and no gravity waves. Temperature is the
-        # diagnostic T = E/m recovered afterward.
-        energy = self._mass * self._air_temperatures
-        self._mass, energy = self._sim.transport_mass_energy(
-            self._mass, energy, self._terrain, self._air_temperatures
-        )
-        self._air_temperatures = energy / self._mass.clamp(min=1e-6)
-        # Surface radiative relaxation (sun warms, space cools); a sink/source forcing.
-        if self._sim.relaxation_enabled:
-            self._air_temperatures = self._sim.relax_to_equilibrium(
-                self._air_temperatures, self._temp_eq, self._temp_relax_rate
-            )
-        self._air_temperatures, self._fuel_temperatures = self._sim.exchange_fuel_air_heat(
-            self._air_temperatures, self._fuel_temperatures, self._fuel, self._mass
-        )
-        self._oxygen = self._sim.diffuse_and_advect_oxygen(
-            self._oxygen, self._x_wind_vel, self._y_wind_vel
-        )
-        # Fresh-air replenishment toward the elevation oxygen profile (combustion below
-        # still draws this down, so a vigorous fire can outpace it locally).
-        if self._sim.relaxation_enabled:
-            self._oxygen = self._sim.relax_to_equilibrium(
-                self._oxygen, self._oxygen_eq, self._sim.oxygen_rate
-            )
-        if self._sim.fire_enabled:
-            self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen = self._sim.update_fire(
-                self._air_temperatures, self._fuel_temperatures, self._fuel, self._oxygen
-            )
-            self._fuel_temperatures, self._last_radiant_flux = self._sim.apply_radiant_heat(
-                self._fuel_temperatures, self._fuel, self._oxygen
-            )
-        # Refresh the surface wind (-grad pressure) for display and next tick's oxygen
-        # advection. The wind is purely diagnostic; mass moves via the transport above.
-        self._x_wind_vel, self._y_wind_vel = self._sim.update_wind(
-            self._mass, self._x_wind_vel, self._y_wind_vel
-        )
+        # Advance every field one tick via the shared physics step (the same routine the
+        # batched rollout collector uses). The convective transport carries mass and energy
+        # (E = m*T) together down the transport potential, fire/radiant/relaxation forcings
+        # follow, and the diagnostic wind is refreshed for the next tick's oxygen advection.
+        self._store_field_state(self._sim.step_fields(self._field_state()))
         # Track EMA-smoothed peaks (toward a fraction of the max) so the mode 6 / mode 7
         # color scales don't flicker. Display-only, so the host syncs are skipped on the
         # headless training path (render_mode=None).
@@ -626,6 +593,34 @@ class FirecrackerEnv(gymnasium.Env):
     def _to_tensor(self, arr: np.ndarray) -> torch.Tensor:
         """Move a host numpy field onto the simulation device as a float32 tensor."""
         return torch.as_tensor(arr, dtype=self._sim.dtype, device=self._sim.device)
+
+    def _field_state(self) -> SimState:
+        """Bundle this (single-world) env's fields into a SimState for step_fields."""
+        return SimState(
+            mass=self._mass,
+            air_temperatures=self._air_temperatures,
+            fuel_temperatures=self._fuel_temperatures,
+            fuel=self._fuel,
+            oxygen=self._oxygen,
+            terrain=self._terrain,
+            temp_eq=self._temp_eq,
+            oxygen_eq=self._oxygen_eq,
+            temp_relax_rate=self._temp_relax_rate,
+            x_wind_vel=self._x_wind_vel,
+            y_wind_vel=self._y_wind_vel,
+            radiant_flux=self._last_radiant_flux,
+        )
+
+    def _store_field_state(self, s: SimState) -> None:
+        """Write a stepped SimState's mutable fields back onto the env attributes."""
+        self._mass              = s.mass
+        self._air_temperatures  = s.air_temperatures
+        self._fuel_temperatures = s.fuel_temperatures
+        self._fuel              = s.fuel
+        self._oxygen            = s.oxygen
+        self._x_wind_vel        = s.x_wind_vel
+        self._y_wind_vel        = s.y_wind_vel
+        self._last_radiant_flux = s.radiant_flux
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
         rows_idx = torch.arange(self.grid_size, device=self._sim.device).view(-1, 1)

@@ -103,6 +103,25 @@ sky_escape_fraction = 0.2    # fraction of emitted energy lost upward to space (
 dir  = "maps"   # directory to load maps from
 name = ""       # specific map filename to load; empty = pick a random map each reset
 
+[rollout]
+# Batched rollout collector (src/rollout.py) for world-model training. One Simulation
+# steps num_envs worlds in parallel; each tick's B x C x N x N observation is pooled, and
+# the trainer draws random near-I.I.D. minibatches from the pool.
+#
+# Consecutive ticks barely differ, so only every stride-th frame is stored, keeping the pool
+# small and decorrelated.
+#
+# Pool memory = (steps // stride) * num_envs * C * N * N * bytes(buffer_dtype). With the
+# defaults below at N=256, C=3: (1024//16) * 64 * 3 * 256*256 * 4 B ~= 3.2 GB. The pool
+# defaults to the CPU; shrink steps/num_envs, raise stride, or set buffer_dtype = "float16"
+# (halves it) to fit your hardware; stepping always runs on the simulation device.
+num_envs       = 64        # B: worlds stepped in parallel (sampled with replacement from the maps dir)
+steps          = 1024      # ticks stepped per collect()
+stride         = 16        # store every stride-th frame; pool holds (steps // stride) * num_envs samples
+minibatch_size = 256       # samples per sample_minibatch() draw
+buffer_device  = "cpu"     # where the sample pool lives ("cpu" or "cuda")
+buffer_dtype   = "float32" # pool storage dtype ("float32" or "float16")
+
 [environment]
 # device selects where the simulation tensors live: "cuda" for an NVIDIA GPU,
 # "cpu" to force the CPU. Omit (or leave commented) to auto-select cuda when

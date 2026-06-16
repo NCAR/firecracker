@@ -10,11 +10,41 @@ dependency; safe to import in headless training environments.
 """
 
 import math
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 
 # Stability cap for the explicit Laplacian diffusion coefficient (2D: must be < 0.25).
 _MAX_DIFFUSION_COEFF: float = 0.2
+
+# Observation channels, in order, produced by Simulation.build_observation. Each is a
+# single (H, W) field reduced across fuel types. Extend this (and build_observation) to
+# grow the channel count C.
+OBS_CHANNELS: tuple[str, ...] = ("fuel_temperature", "fuel", "terrain")
+
+
+@dataclass
+class SimState:
+    """The full set of per-tick simulation fields, shared by the single-world env and the
+    batched rollout collector. Every field is a torch tensor whose trailing two axes are
+    (H, W); a leading batch axis B is optional and handled transparently by the
+    rank-agnostic Simulation ops. The *_eq / terrain / temp_relax_rate fields are constant
+    for an episode but travel with the state so step_fields stays a pure function of it.
+    """
+
+    mass:              torch.Tensor   # column mass = surface pressure
+    air_temperatures:  torch.Tensor
+    fuel_temperatures: torch.Tensor   # per-type stack: trailing axes (..., N_fuel, H, W)
+    fuel:              torch.Tensor   # per-type stack
+    oxygen:            torch.Tensor
+    terrain:           torch.Tensor
+    temp_eq:           torch.Tensor   # temperature relaxation target
+    oxygen_eq:         torch.Tensor   # oxygen replenishment target
+    temp_relax_rate:   torch.Tensor   # per-cell radiative relaxation rate
+    x_wind_vel:        torch.Tensor
+    y_wind_vel:        torch.Tensor
+    radiant_flux:      torch.Tensor   # last per-cell absorbed radiant flux (diagnostic)
 
 
 def _resolve_device(name: str | None) -> torch.device:
@@ -120,8 +150,11 @@ class Simulation:
         # duplicates the edge sample, which for this 1-pixel stencil is exactly torch's
         # 'replicate' padding: the ghost cell equals the edge, so the boundary stencil
         # sums to zero and the total is conserved.
-        x = F.pad(field[None, None], (1, 1, 1, 1), mode="replicate")
-        return F.conv2d(x, self._laplace_kernel)[0, 0]
+        # Rank-agnostic: flatten every leading dim (none, (N,), (B,), or (B, N)) into the
+        # conv batch axis so this works on 2-D fields and batched/per-type stacks alike.
+        *lead, h, w = field.shape
+        x = F.pad(field.reshape(-1, 1, h, w), (1, 1, 1, 1), mode="replicate")
+        return F.conv2d(x, self._laplace_kernel).reshape(*lead, h, w)
 
     def _gaussian_blur(self, field: torch.Tensor, sigma: float) -> torch.Tensor:
         # Separable Gaussian smoothing (used only for the diagnostic wind field). The
@@ -133,18 +166,23 @@ class Simulation:
         coords = torch.arange(-radius, radius + 1, dtype=self.dtype, device=self.device)
         k = torch.exp(-0.5 * (coords / sigma) ** 2)
         k = k / k.sum()
-        x = field[None, None]
+        # Rank-agnostic: fold any leading dims into the conv batch axis (see _laplace).
+        *lead, h, w = field.shape
+        x = field.reshape(-1, 1, h, w)
         x = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="reflect"), k.view(1, 1, 1, -1))
         x = F.conv2d(F.pad(x, (0, 0, radius, radius), mode="reflect"), k.view(1, 1, -1, 1))
-        return x[0, 0]
+        return x.reshape(*lead, h, w)
 
     def _radiant_convolve(self, field: torch.Tensor) -> torch.Tensor:
         # Inverse-square redistribution. conv2d with zero padding sized to keep the
         # output the same shape drops energy that lands off the grid — the same
         # boundary loss scipy.signal.fftconvolve(mode='same') produces. The kernel is
         # radially symmetric, so cross-correlation equals true convolution.
-        x = field[None, None]
-        return F.conv2d(x, self._radiant_kernel, padding=self.radiant_kernel_radius)[0, 0]
+        # Rank-agnostic: fold any leading dims into the conv batch axis (see _laplace).
+        *lead, h, w = field.shape
+        x = field.reshape(-1, 1, h, w)
+        out = F.conv2d(x, self._radiant_kernel, padding=self.radiant_kernel_radius)
+        return out.reshape(*lead, h, w)
 
     # ---------------------------------------------------------------------------
     # Diffusion / advection
@@ -197,10 +235,12 @@ class Simulation:
         # One CFL-safe (<= 1 cell) first-order upwind step with no-flux walls.
         # Each shared face flux is added to one neighbour and subtracted from the
         # other, so the interior total is conserved exactly (telescoping sum).
-        uf = 0.5 * (x_vel[:, :-1] + x_vel[:, 1:])   # x-velocity on interior vertical faces
-        fx = uf.clamp(min=0.0) * field[:, :-1] + uf.clamp(max=0.0) * field[:, 1:]
-        vf = 0.5 * (y_vel[:-1, :] + y_vel[1:, :])   # y-velocity on interior horizontal faces
-        fy = vf.clamp(min=0.0) * field[:-1, :] + vf.clamp(max=0.0) * field[1:, :]
+        # All slices index the trailing (row, col) axes via ellipsis, so this works on
+        # 2-D fields and on batched (B, H, W) stacks identically.
+        uf = 0.5 * (x_vel[..., :-1] + x_vel[..., 1:])   # x-velocity on interior vertical faces
+        fx = uf.clamp(min=0.0) * field[..., :-1] + uf.clamp(max=0.0) * field[..., 1:]
+        vf = 0.5 * (y_vel[..., :-1, :] + y_vel[..., 1:, :])   # y-velocity on interior horizontal faces
+        fy = vf.clamp(min=0.0) * field[..., :-1, :] + vf.clamp(max=0.0) * field[..., 1:, :]
 
         if saturate:
             # Saturation: a cell at capacity (1.0) cannot accept more; the rejected
@@ -208,24 +248,24 @@ class Simulation:
             # ratio of its destination cell. This conserves (flux still added once /
             # subtracted once) while keeping every cell <= 1.0.
             inflow = torch.zeros_like(field)
-            inflow[:, 1:]  += fx.clamp(min=0.0)     # fx > 0 flows into the right cell
-            inflow[:, :-1] += (-fx).clamp(min=0.0)  # fx < 0 flows into the left cell
-            inflow[1:, :]  += fy.clamp(min=0.0)
-            inflow[:-1, :] += (-fy).clamp(min=0.0)
+            inflow[..., 1:]  += fx.clamp(min=0.0)     # fx > 0 flows into the right cell
+            inflow[..., :-1] += (-fx).clamp(min=0.0)  # fx < 0 flows into the left cell
+            inflow[..., 1:, :]  += fy.clamp(min=0.0)
+            inflow[..., :-1, :] += (-fy).clamp(min=0.0)
             capacity = (1.0 - field).clamp(min=0.0)
             accept = torch.where(
                 inflow > 0.0,
                 (capacity / inflow.clamp(min=1e-12)).clamp(max=1.0),
                 torch.ones_like(inflow),
             )
-            fx = fx * torch.where(fx > 0.0, accept[:, 1:], accept[:, :-1])
-            fy = fy * torch.where(fy > 0.0, accept[1:, :], accept[:-1, :])
+            fx = fx * torch.where(fx > 0.0, accept[..., 1:], accept[..., :-1])
+            fy = fy * torch.where(fy > 0.0, accept[..., 1:, :], accept[..., :-1, :])
 
         out = field.clone()
-        out[:, :-1] -= fx
-        out[:, 1:]  += fx
-        out[:-1, :] -= fy
-        out[1:, :]  += fy
+        out[..., :-1] -= fx
+        out[..., 1:]  += fx
+        out[..., :-1, :] -= fy
+        out[..., 1:, :]  += fy
         return out
 
     def _advect_field(
@@ -256,20 +296,22 @@ class Simulation:
         # potential gradient itself. Each face flux is added to one neighbour and
         # subtracted from the other (telescoping), so both totals are conserved under
         # no-flux walls.
-        dphix = phi[:, 1:] - phi[:, :-1]    # Phi[R] - Phi[L] across vertical faces
-        dphiy = phi[1:, :] - phi[:-1, :]
-        mfx = 0.5 * (mass[:, :-1] + mass[:, 1:]) * dphix * dt    # flux L -> R (sign folded in)
-        efx = 0.5 * (energy[:, :-1] + energy[:, 1:]) * dphix * dt
-        mfy = 0.5 * (mass[:-1, :] + mass[1:, :]) * dphiy * dt
-        efy = 0.5 * (energy[:-1, :] + energy[1:, :]) * dphiy * dt
+        # All slices index the trailing (row, col) axes via ellipsis, so this works on
+        # 2-D fields and on batched (B, H, W) stacks identically.
+        dphix = phi[..., 1:] - phi[..., :-1]    # Phi[R] - Phi[L] across vertical faces
+        dphiy = phi[..., 1:, :] - phi[..., :-1, :]
+        mfx = 0.5 * (mass[..., :-1] + mass[..., 1:]) * dphix * dt    # flux L -> R (sign folded in)
+        efx = 0.5 * (energy[..., :-1] + energy[..., 1:]) * dphix * dt
+        mfy = 0.5 * (mass[..., :-1, :] + mass[..., 1:, :]) * dphiy * dt
+        efy = 0.5 * (energy[..., :-1, :] + energy[..., 1:, :]) * dphiy * dt
 
         m, e = mass.clone(), energy.clone()
         # Down-gradient: a cell loses to lower-Phi neighbours. dphix>0 means the right cell
         # is higher, so flux runs R -> L: the left cell gains (+), the right loses (-).
-        m[:, :-1] += mfx; m[:, 1:] -= mfx
-        e[:, :-1] += efx; e[:, 1:] -= efx
-        m[:-1, :] += mfy; m[1:, :] -= mfy
-        e[:-1, :] += efy; e[1:, :] -= efy
+        m[..., :-1] += mfx; m[..., 1:] -= mfx
+        e[..., :-1] += efx; e[..., 1:] -= efx
+        m[..., :-1, :] += mfy; m[..., 1:, :] -= mfy
+        e[..., :-1, :] += efy; e[..., 1:, :] -= efy
         return m, e
 
     def transport_mass_energy(
@@ -364,7 +406,9 @@ class Simulation:
     def compute_wind_from_pressure(
         self, surface_pressure: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        grad_y, grad_x = torch.gradient(surface_pressure)
+        # Differentiate only the trailing (row, col) axes so a leading batch dim is left
+        # untouched (each world gets its own gradient).
+        grad_y, grad_x = torch.gradient(surface_pressure, dim=(-2, -1))
         # Wind flows from high to low pressure, so negate the gradient.
         x_wind = self._gaussian_blur(-grad_x, self.wind_smooth_sigma)
         y_wind = self._gaussian_blur(-grad_y, self.wind_smooth_sigma)
@@ -399,12 +443,13 @@ class Simulation:
         C_fuel = h * fuel                                      # (N, H, W) fuel thermal mass
         # Air thermal mass is the column mass (surface pressure): a dense/high-pressure
         # column changes temperature less for the same heat, a thin column more.
-        C_air  = air_mass.clamp(min=1e-6)[None]               # (1, H, W)
+        # unsqueeze(-3) inserts the fuel-type axis whether or not a batch dim is present.
+        C_air  = air_mass.clamp(min=1e-6).unsqueeze(-3)       # (1, H, W) / (B, 1, H, W)
         total  = C_air + C_fuel                                # >= C_air > 0, always safe
 
         # Mass-weighted equilibrium temperature of each air/fuel pair (the conserved
         # mean the pair relaxes toward).
-        T_eq = (C_air * air_temperatures[None] + C_fuel * fuel_temperatures) / total
+        T_eq = (C_air * air_temperatures.unsqueeze(-3) + C_fuel * fuel_temperatures) / total
 
         # Exact two-body relaxation over one tick: the air/fuel gap decays by
         # exp(-k / C_red), where C_red = C_air*C_fuel/total is the reduced heat capacity.
@@ -421,7 +466,7 @@ class Simulation:
 
         # Air loses exactly the energy each fuel type gained (summed over types, divided
         # by the air's own thermal mass), so total air+fuel energy is conserved.
-        dT_air = -((C_fuel * dT_fuel).sum(dim=0) / C_air[0])
+        dT_air = -((C_fuel * dT_fuel).sum(dim=-3) / C_air.squeeze(-3))
 
         return air_temperatures + dT_air, fuel_temperatures + dT_fuel
 
@@ -440,7 +485,7 @@ class Simulation:
         burning = (
             (fuel_temperatures >= ign) &
             (fuel > self.fuel_burnt_threshold) &
-            (oxygen[None] > self.oxygen_extinction_threshold)
+            (oxygen.unsqueeze(-3) > self.oxygen_extinction_threshold)
         )  # (N, H, W)
 
         fuel_consumed = torch.where(
@@ -453,7 +498,7 @@ class Simulation:
         # tick (summed over types), capped at available oxygen. Tying it to fuel_consumed
         # rather than ambient oxygen avoids a hot cell suffocating itself in one tick.
         oxygen_consumed = torch.minimum(
-            (fuel_consumed * self.oxygen_consumption_rate).sum(dim=0),
+            (fuel_consumed * self.oxygen_consumption_rate).sum(dim=-3),
             oxygen,
         )  # (H, W)
 
@@ -465,7 +510,7 @@ class Simulation:
 
         # Heat released per type, split between air and fuel.
         burn_heat_per_type = fuel_consumed * bhs            # (N, H, W)
-        total_burn_heat    = burn_heat_per_type.sum(dim=0)  # (H, W)
+        total_burn_heat    = burn_heat_per_type.sum(dim=-3)  # (H, W)
 
         air_temperatures = (
             air_temperatures + total_burn_heat * (1.0 - self.burn_heat_fuel_fraction)
@@ -494,7 +539,7 @@ class Simulation:
         burning = (
             (fuel_temperatures >= ign) &
             (fuel > self.fuel_burnt_threshold) &
-            (oxygen[None] > self.oxygen_extinction_threshold)
+            (oxygen.unsqueeze(-3) > self.oxygen_extinction_threshold)
         )  # (N, H, W)
 
         h      = self.heat_capacities
@@ -521,20 +566,88 @@ class Simulation:
         # A fraction escapes upward to space (lost from the grid); the rest is spread to
         # neighbours by the inverse-square kernel. The 'same'-mode convolution also drops
         # energy that would land off the grid edges, an additional (boundary) loss.
-        total_emission = emission.sum(dim=0)                     # (H, W) energy leaving each cell
+        total_emission = emission.sum(dim=-3)                    # (H, W) energy leaving each cell
         to_neighbours  = (1.0 - self.sky_escape_fraction) * total_emission
         radiant_flux = self._radiant_convolve(to_neighbours).clamp(min=0.0)  # (H, W) absorbed per cell
 
         # Distribute absorbed flux to each type proportional to its fuel mass fraction,
         # then divide by thermal mass to get the temperature rise.
-        total_fuel = fuel.sum(dim=0)                             # (H, W)
+        total_fuel = fuel.sum(dim=-3)                            # (H, W)
         safe_total = torch.where(total_fuel > 0, total_fuel, torch.ones_like(total_fuel))
-        fuel_frac  = fuel / safe_total[None]                     # (N, H, W)
+        fuel_frac  = fuel / safe_total.unsqueeze(-3)             # (N, H, W)
 
         dT_fuel = torch.where(
             fuel > self.fuel_burnt_threshold,
-            radiant_flux[None] * fuel_frac / safe_C,
+            radiant_flux.unsqueeze(-3) * fuel_frac / safe_C,
             torch.zeros_like(C_fuel),
         )
 
         return fuel_temperatures + dT_fuel, radiant_flux
+
+    # ---------------------------------------------------------------------------
+    # Full per-tick step + observation
+    # ---------------------------------------------------------------------------
+
+    def step_fields(self, s: SimState) -> SimState:
+        """Advance every field one tick (the pure physics of one env step).
+
+        This is the single source of truth for the per-tick sequence — both
+        FirecrackerEnv.step (single world) and BatchedRollout (B worlds) call it, so they
+        can never drift apart. It carries no rendering/EMA bookkeeping. Because every op is
+        rank-agnostic, the same call advances a 2-D world or a batched (B, H, W) stack.
+
+        The state is mutated in place and returned for convenience.
+        """
+        # Convective transport: mass and energy (E = m*T) flow together down the transport
+        # potential, so heat is carried by the air mass. T = E/m is recovered afterward.
+        energy = s.mass * s.air_temperatures
+        s.mass, energy = self.transport_mass_energy(s.mass, energy, s.terrain, s.air_temperatures)
+        s.air_temperatures = energy / s.mass.clamp(min=1e-6)
+
+        # Surface radiative relaxation (sun warms, space cools); a sink/source forcing.
+        if self.relaxation_enabled:
+            s.air_temperatures = self.relax_to_equilibrium(
+                s.air_temperatures, s.temp_eq, s.temp_relax_rate
+            )
+
+        s.air_temperatures, s.fuel_temperatures = self.exchange_fuel_air_heat(
+            s.air_temperatures, s.fuel_temperatures, s.fuel, s.mass
+        )
+
+        s.oxygen = self.diffuse_and_advect_oxygen(s.oxygen, s.x_wind_vel, s.y_wind_vel)
+        # Fresh-air replenishment toward the elevation oxygen profile (combustion below
+        # still draws this down, so a vigorous fire can outpace it locally).
+        if self.relaxation_enabled:
+            s.oxygen = self.relax_to_equilibrium(s.oxygen, s.oxygen_eq, self.oxygen_rate)
+
+        if self.fire_enabled:
+            s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
+                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen
+            )
+            s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
+                s.fuel_temperatures, s.fuel, s.oxygen
+            )
+
+        # Refresh the surface wind (-grad pressure) for display and next tick's oxygen
+        # advection. The wind is purely diagnostic; mass moves via the transport above.
+        s.x_wind_vel, s.y_wind_vel = self.update_wind(s.mass, s.x_wind_vel, s.y_wind_vel)
+        return s
+
+    @staticmethod
+    def build_observation(
+        fuel_temperatures: torch.Tensor,  # (..., N_fuel, H, W)
+        fuel: torch.Tensor,               # (..., N_fuel, H, W)
+        terrain: torch.Tensor,            # (..., H, W)
+    ) -> torch.Tensor:
+        """Stack the OBS_CHANNELS into a (..., C, H, W) observation.
+
+        Each channel is reduced across fuel types: fuel temperature is the hottest type
+        (amax), fuel/vegetation is the total mass (sum), terrain is passed through. With a
+        leading batch axis the result is the B x C x N x N tensor the world model trains on.
+        """
+        channels = [
+            fuel_temperatures.amax(dim=-3),  # fuel_temperature: hottest fuel type
+            fuel.sum(dim=-3),                # fuel: total vegetation mass
+            terrain,                         # terrain: elevation
+        ]
+        return torch.stack(channels, dim=-3)

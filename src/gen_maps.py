@@ -244,6 +244,10 @@ def main() -> None:
     parser.add_argument("--config", metavar="PATH", help="path to a TOML config file")
     parser.add_argument("--seed", type=int, default=None, help="master seed for reproducibility")
     parser.add_argument("--prefix", default="map", help="output filename prefix")
+    parser.add_argument(
+        "--start-index", type=int, default=0,
+        help="first output file index (e.g. 8 to append after map_0007 without overwriting)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -255,7 +259,7 @@ def main() -> None:
         rng = np.random.default_rng(child)
         map_seed = int(child.generate_state(1)[0])
         m = generate_map(gen, grid_size, rng, seed=map_seed)
-        path = save_map(f"{args.out}/{args.prefix}_{i:04d}.npz", m)
+        path = save_map(f"{args.out}/{args.prefix}_{args.start_index + i:04d}.npz", m)
         print(f"  [{i + 1}/{args.count}] {path}  (seed={map_seed})")
     print("Done.")
 
