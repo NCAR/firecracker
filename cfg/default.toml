@@ -90,9 +90,13 @@ fuel_per_tree          = 1.0    # fuel mass contributed by each tree in a cell
 max_trees_per_cell     = 4      # hard cap on the per-cell tree count
 
 [radiant_heat]
-kernel_radius     = 10       # max range of radiation in grid cells
-emission_scale    = 0.001    # multiplier on fuel temperature emission
-emission_exponent = 2.0      # nonlinearity of emission vs fuel temperature (blackbody ~4)
+# Radiation is conservative: a cell loses exactly the energy it emits (a T^exponent
+# sink, like Stefan-Boltzmann), a fraction escapes to space, and the rest is spread to
+# neighbours by the inverse-square kernel. The T^4 loss self-limits flame temperature.
+kernel_radius      = 10      # max range of radiation in grid cells
+emission_scale     = 1e-6    # multiplier on T^exponent emitted energy per tick
+emission_exponent  = 4.0     # blackbody T^4; emission rises steeply with temperature
+sky_escape_fraction = 0.2    # fraction of emitted energy lost upward to space (0..1)
 
 [maps]
 # Maps are fully-baked initial states loaded from disk. Generate them with

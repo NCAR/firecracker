@@ -79,7 +79,10 @@ class Simulation:
         radiant = (cfg or {}).get("radiant_heat", {})
         self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",      20))
         self.radiant_emission_scale:    float = float(radiant.get("emission_scale",   0.05))
-        self.radiant_emission_exponent: float = float(radiant.get("emission_exponent", 2.0))
+        self.radiant_emission_exponent: float = float(radiant.get("emission_exponent", 4.0))
+        # Fraction of each cell's emitted energy that escapes upward to space (lost from
+        # the grid). The rest is redistributed to neighbours by the inverse-square kernel.
+        self.sky_escape_fraction:       float = float(radiant.get("sky_escape_fraction", 0.2))
 
         self._radiant_kernel = self._build_radiant_kernel(self.radiant_kernel_radius)
 
@@ -92,7 +95,8 @@ class Simulation:
         size = 2 * radius + 1
         rows, cols = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
         r_sq = ((rows - radius) ** 2 + (cols - radius) ** 2).astype(np.float32)
-        # 1/r² inverse-square law; center cell contributes nothing (self-heating handled by combustion).
+        # 1/r² inverse-square law; the center cell contributes nothing (a cell does not
+        # reabsorb its own radiation — that loss is the escape/redistribution in apply_radiant_heat).
         # Avoid dividing by zero at the center by substituting 1.0 before masking it out.
         safe_r_sq = np.where(r_sq > 0, r_sq, 1.0)
         kernel = np.where(r_sq > 0, 1.0 / safe_r_sq, 0.0).astype(np.float32)
@@ -427,27 +431,41 @@ class Simulation:
             (oxygen[np.newaxis] > self.oxygen_extinction_threshold)
         )  # (N, H, W)
 
-        # Total emission summed across all burning types.
+        h      = self.heat_capacities[:, np.newaxis, np.newaxis]
+        C_fuel = h * fuel                                         # (N, H, W) thermal mass
+        safe_C = np.where(fuel > self.fuel_burnt_threshold, C_fuel, 1.0)
+
+        # Energy each burning cell radiates this tick (Stefan-Boltzmann-like, T^exponent).
+        # Capped at the cell's available thermal energy so the explicit emitter cooling
+        # below can never drive temperature negative, even at large emission_scale.
         emission = np.where(
             burning,
             self.radiant_emission_scale * fuel_temperatures ** self.radiant_emission_exponent,
             0.0,
         ).astype(np.float32)
-        total_emission = emission.sum(axis=0)  # (H, W)
+        emission = np.minimum(emission, np.maximum(C_fuel * fuel_temperatures, 0.0))  # (N, H, W)
 
+        # The emitter loses exactly what it radiates (conservation): radiation is a sink,
+        # not a free source. This T^exponent loss self-limits flame temperature.
+        fuel_temperatures = np.maximum(
+            fuel_temperatures - np.where(fuel > self.fuel_burnt_threshold, emission / safe_C, 0.0),
+            0.0,
+        ).astype(np.float32)
+
+        # A fraction escapes upward to space (lost from the grid); the rest is spread to
+        # neighbours by the inverse-square kernel. fftconvolve in 'same' mode also drops
+        # energy that would land off the grid edges, an additional (boundary) loss.
+        total_emission = emission.sum(axis=0)                    # (H, W) energy leaving each cell
+        to_neighbours  = (1.0 - self.sky_escape_fraction) * total_emission
         radiant_flux = np.clip(
-            fftconvolve(total_emission, self._radiant_kernel, mode='same'), 0.0, None
-        ).astype(np.float32)  # (H, W)
+            fftconvolve(to_neighbours, self._radiant_kernel, mode='same'), 0.0, None
+        ).astype(np.float32)  # (H, W) energy absorbed by each cell
 
-        # Distribute flux to each type proportional to its fuel mass fraction,
-        # then divide by thermal mass to get temperature change.
-        total_fuel = fuel.sum(axis=0)                             # (H, W)
+        # Distribute absorbed flux to each type proportional to its fuel mass fraction,
+        # then divide by thermal mass to get the temperature rise.
+        total_fuel = fuel.sum(axis=0)                            # (H, W)
         safe_total = np.where(total_fuel > 0, total_fuel, 1.0)
-        fuel_frac  = fuel / safe_total[np.newaxis]                # (N, H, W)
-
-        h      = self.heat_capacities[:, np.newaxis, np.newaxis]
-        C_fuel = h * fuel
-        safe_C = np.where(fuel > self.fuel_burnt_threshold, C_fuel, 1.0)
+        fuel_frac  = fuel / safe_total[np.newaxis]               # (N, H, W)
 
         dT_fuel = np.where(
             fuel > self.fuel_burnt_threshold,
