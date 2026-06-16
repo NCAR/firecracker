@@ -4,10 +4,8 @@
 [simulation]
 steps_per_second     = 10     # physics ticks per second
 blur_sigma           = 1.0    # Gaussian diffusion width per tick
-diffusion_substeps   = 4      # substeps per tick for numerical stability
 
 [wind]
-advection_strength  = 0.2   # how far the temperature field is advected per substep
 smooth_sigma        = 2.0   # Gaussian smoothing applied to the derived wind field
 temporal_smoothing  = 0.1   # EMA weight toward newly computed wind (0 = frozen, 1 = instant)
 

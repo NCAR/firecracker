@@ -24,9 +24,7 @@ class Simulation:
         self.simulation_steps_per_second: int   = int(sim.get("steps_per_second",        10))
         self.ms_per_step:                 int   = 1000 // self.simulation_steps_per_second
         self.blur_sigma:                  float = float(sim.get("blur_sigma",              1.0))
-        self.diffusion_substeps:          int   = int(sim.get("diffusion_substeps",        4))
 
-        self.wind_advection_strength: float = float(wind.get("advection_strength", 0.4))
         self.wind_smooth_sigma:       float = float(wind.get("smooth_sigma",       2.0))
         self.wind_temporal_smoothing: float = float(wind.get("temporal_smoothing", 0.2))
 
