@@ -11,6 +11,7 @@ bugs that conservation alone missed.
 
 import numpy as np
 
+from conftest import to_numpy
 from scenarios import mass_gradient, oxygen_saturation
 
 
@@ -26,7 +27,7 @@ def test_mass_gradient_stays_monotone(make_env):
         env.step(0)
 
     # Every row must remain non-increasing across columns (small float tolerance).
-    assert np.all(np.diff(env._mass, axis=1) <= 1e-5)
+    assert np.all(np.diff(to_numpy(env._mass), axis=1) <= 1e-5)
 
 
 def test_mass_gradient_equalizes(make_env):
@@ -38,7 +39,7 @@ def test_mass_gradient_equalizes(make_env):
     var1 = float(env._mass.var())
 
     assert var1 < 0.1 * var0                       # substantially equalized
-    np.testing.assert_allclose(env._mass.sum(), env._mass.size, rtol=1e-4)  # mean-1 preserved
+    np.testing.assert_allclose(float(env._mass.sum()), env._mass.numel(), rtol=1e-4)  # mean-1 preserved
 
 
 def test_high_rate_transport_is_stable(make_env):
@@ -54,8 +55,8 @@ def test_high_rate_transport_is_stable(make_env):
     for _ in range(200):
         env.step(0)
 
-    assert np.isfinite(env._mass).all()
-    assert env._mass.min() > 0.0          # no cell evacuated by anti-diffusion
+    assert np.isfinite(to_numpy(env._mass)).all()
+    assert float(env._mass.min()) > 0.0          # no cell evacuated by anti-diffusion
     assert float(env._mass.var()) < 0.05 * var0  # equalized, not concentrated
 
 
@@ -64,10 +65,10 @@ def test_oxygen_does_not_freeze(make_env):
     env = make_env(*oxygen_saturation())
     for _ in range(5):
         env.step(0)
-    early = env._oxygen.copy()
+    early = to_numpy(env._oxygen)
     for _ in range(45):
         env.step(0)
-    later = env._oxygen.copy()
+    later = to_numpy(env._oxygen)
 
     # It should have changed appreciably between step 5 and step 50.
     assert np.abs(later - early).max() > 1e-3
@@ -76,11 +77,11 @@ def test_oxygen_does_not_freeze(make_env):
 def test_oxygen_step_diffuses(make_env):
     """The sharp 0.4/1.0 oxygen boundary must smooth out toward uniform, staying capped."""
     env = make_env(*oxygen_saturation())
-    o0 = env._oxygen.sum()
+    o0 = float(env._oxygen.sum())
     var0 = float(env._oxygen.var())
     for _ in range(200):
         env.step(0)
 
     assert float(env._oxygen.var()) < 0.3 * var0   # boundary has blurred toward uniform
-    assert env._oxygen.max() <= 1.0 + 1e-6         # still capped
-    np.testing.assert_allclose(env._oxygen.sum(), o0, rtol=1e-4)  # conserved
+    assert float(env._oxygen.max()) <= 1.0 + 1e-6  # still capped
+    np.testing.assert_allclose(float(env._oxygen.sum()), o0, rtol=1e-4)  # conserved

@@ -104,6 +104,10 @@ dir  = "maps"   # directory to load maps from
 name = ""       # specific map filename to load; empty = pick a random map each reset
 
 [environment]
+# device selects where the simulation tensors live: "cuda" for an NVIDIA GPU,
+# "cpu" to force the CPU. Omit (or leave commented) to auto-select cuda when
+# available, else cpu — the same code path runs on both.
+# device           = "cuda"
 grid_size          = 256      # simulation grid cells (N x N)
 window_size        = 512      # display window size in pixels (square)
 max_steps          = 10_000   # episode length before truncation

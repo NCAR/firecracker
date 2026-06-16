@@ -20,6 +20,7 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print(" Configuration")
     print(INFO_SEPARATOR)
     print("  [environment]")
+    print(f"    device                 : {sim.device}")
     print(f"    grid_size              : {env.grid_size} x {env.grid_size}  ({env.grid_size ** 2} cells)")
     print(f"    window_size            : {env.window_size} x {env.window_size} px")
     print(f"    max_steps              : {env.max_steps}")
@@ -90,6 +91,48 @@ def print_episode_info(info: dict, label: str) -> None:
         if key.startswith("fuel_") or key.startswith("cells_burning_"):
             print(f"  {key:<30}: {val:.6f}" if isinstance(val, float) else f"  {key:<30}: {val}")
     print(INFO_SEPARATOR)
+
+
+def run_headless(config: dict, map_name: str | None = None, maps_dir: str | None = None) -> None:
+    """Run with no window and no real-time throttle: step as fast as the device allows.
+
+    There is no keyboard/mouse, so the episode runs to truncation (max_steps) or until
+    interrupted (Ctrl-C). Set [fire].spawn_fire = true in the config to ignite, since
+    there is no window to click. Throughput is printed periodically.
+    """
+    env = FirecrackerEnv(
+        config=config, render_mode=None, map_name=map_name, maps_dir=maps_dir
+    )
+    print_config_info(env)
+    log_episodes = bool((config or {}).get("environment", {}).get("print_episode_info", True))
+
+    obs, info = env.reset()
+    if log_episodes:
+        print_episode_info(info, "Episode 1 — start")
+
+    log_interval = max(1, env.max_steps // 20)   # ~20 progress lines per episode
+    start = time.monotonic()
+    window_start, window_steps = start, 0
+    try:
+        while True:
+            obs, reward, terminated, truncated, info = env.step(0)
+            window_steps += 1
+            if info["step"] % log_interval == 0:
+                now = time.monotonic()
+                rate = window_steps / (now - window_start)
+                print(f"  step {info['step']:>7d} / {env.max_steps}   {rate:8.1f} ticks/s   "
+                      f"cells_burning={info['cells_burning']}")
+                window_start, window_steps = now, 0
+            if terminated or truncated:
+                break
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+
+    elapsed = time.monotonic() - start
+    if log_episodes:
+        print_episode_info(info, "Episode 1 — end")
+    print(f"Ran {info['step']} steps in {elapsed:.2f}s  ({info['step'] / elapsed:.1f} ticks/s average).")
+    env.close()
 
 
 def run(config: dict, map_name: str | None = None, maps_dir: str | None = None) -> None:
@@ -171,5 +214,10 @@ if __name__ == "__main__":
         "--maps-dir", metavar="PATH",
         help="directory to load maps from (overrides config)",
     )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="run with no window and no real-time throttle (fastest; runs to max_steps)",
+    )
     args = parser.parse_args()
-    run(load_config(args.config), map_name=args.map, maps_dir=args.maps_dir)
+    runner = run_headless if args.headless else run
+    runner(load_config(args.config), map_name=args.map, maps_dir=args.maps_dir)

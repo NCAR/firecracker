@@ -10,12 +10,18 @@ import math
 from enum import Enum
 
 import numpy as np
+import torch
 import pygame
 import gymnasium
 from gymnasium import spaces
 
 from simulation import Simulation
 from map_loader import load_map, resolve_map, validate_against_config
+
+
+def _to_numpy(t: torch.Tensor) -> np.ndarray:
+    """Move a (possibly GPU-resident) tensor to a host numpy array for rendering/info."""
+    return t.detach().cpu().numpy()
 
 # ---------------------------------------------------------------------------
 # Display constants
@@ -350,7 +356,6 @@ class FirecrackerEnv(gymnasium.Env):
         self._fuel_temperatures: np.ndarray | None = None
         self._x_wind_vel: np.ndarray | None = None
         self._y_wind_vel: np.ndarray | None = None
-        self._reference_wind_magnitude: float = 0.0
         self._fuel: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
         self._mass: np.ndarray | None = None   # column mass = surface pressure
@@ -359,6 +364,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._temp_eq: np.ndarray | None = None
         self._oxygen_eq: np.ndarray | None = None
         self._temp_relax_rate: np.ndarray | None = None
+        self._terrain_stats: list[float] = [0.0, 0.0, 0.0]   # (mean, min, max), set at reset
         self._last_radiant_flux: np.ndarray | None = None
         self._current_map: str | None = None   # filename of the loaded map
         # EMA-smoothed upper bounds for the mode 6 / mode 7 color scales.
@@ -411,22 +417,27 @@ class FirecrackerEnv(gymnasium.Env):
         validate_against_config(m, self.grid_size, self._sim.fuel_type_names)
         self._current_map = map_path.name
 
-        self._terrain           = m.terrain
-        self._air_temperatures  = m.air_temperatures
-        self._temp_eq           = m.temp_eq
-        self._oxygen            = m.oxygen
-        self._oxygen_eq         = m.oxygen_eq
-        self._mass              = m.mass
-        self._fuel              = m.fuel
-        self._fuel_temperatures = m.fuel_temperatures
+        # Maps load from disk as numpy (map_loader is source-agnostic); move every field
+        # onto the simulation device so the per-step physics stays GPU-resident.
+        self._terrain           = self._to_tensor(m.terrain)
+        self._air_temperatures  = self._to_tensor(m.air_temperatures)
+        self._temp_eq           = self._to_tensor(m.temp_eq)
+        self._oxygen            = self._to_tensor(m.oxygen)
+        self._oxygen_eq         = self._to_tensor(m.oxygen_eq)
+        self._mass              = self._to_tensor(m.mass)
+        self._fuel              = self._to_tensor(m.fuel)
+        self._fuel_temperatures = self._to_tensor(m.fuel_temperatures)
 
         # Recompute the cheap dynamics-derived fields from the loaded state so the
         # relaxation/wind knobs stay live without having to regenerate maps.
         self._temp_relax_rate = self._sim.temperature_relax_rate(self._terrain)
         self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_pressure(self._mass)
-        self._reference_wind_magnitude = float(
-            np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
-        )
+
+        # Terrain is static for the episode, so reduce its stats once here (one host
+        # transfer) instead of re-syncing them every step in _build_info.
+        self._terrain_stats = torch.stack(
+            [self._terrain.mean(), self._terrain.min(), self._terrain.max()]
+        ).tolist()
 
         # Optional ignition overlay (random spawn). Maps describe the world at rest;
         # fire is a runtime concern applied on top of the loaded state.
@@ -435,10 +446,15 @@ class FirecrackerEnv(gymnasium.Env):
             c = int(self.np_random.integers(0, self.grid_size))
             self._spawn_fire_patch(r, c)
 
-        self._last_radiant_flux = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        # Seed the display scales from the initial state so the first frames are scaled sanely.
-        self._fuel_temp_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._fuel_temperatures.max())
-        self._radiant_flux_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._last_radiant_flux.max())
+        self._last_radiant_flux = torch.zeros(
+            (self.grid_size, self.grid_size), dtype=self._sim.dtype, device=self._sim.device
+        )
+        # Seed the display scales from the initial state so the first frames are scaled
+        # sanely. These drive the mode 6/7 color scales only, so they (and their host
+        # syncs) are skipped entirely on the headless training path (render_mode=None).
+        if self.render_mode is not None:
+            self._fuel_temp_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._fuel_temperatures.max())
+            self._radiant_flux_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._last_radiant_flux.max())
         self._step_count = 0
         self._running = True
         self._paused = False
@@ -446,7 +462,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._step_once = False
         self._surfaces_dirty = True
 
-        return self._air_temperatures.copy(), self._build_info()
+        return _to_numpy(self._air_temperatures), self._build_info()
 
     def step(
         self, action: int
@@ -459,7 +475,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._mass, energy = self._sim.transport_mass_energy(
             self._mass, energy, self._terrain, self._air_temperatures
         )
-        self._air_temperatures = (energy / np.maximum(self._mass, 1e-6)).astype(np.float32)
+        self._air_temperatures = energy / self._mass.clamp(min=1e-6)
         # Surface radiative relaxation (sun warms, space cools); a sink/source forcing.
         if self._sim.relaxation_enabled:
             self._air_temperatures = self._sim.relax_to_equilibrium(
@@ -489,26 +505,25 @@ class FirecrackerEnv(gymnasium.Env):
         self._x_wind_vel, self._y_wind_vel = self._sim.update_wind(
             self._mass, self._x_wind_vel, self._y_wind_vel
         )
-        self._reference_wind_magnitude = float(
-            np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2).max()
-        )
         # Track EMA-smoothed peaks (toward a fraction of the max) so the mode 6 / mode 7
-        # color scales don't flicker.
-        a = _DISPLAY_SCALE_EMA_ALPHA
-        f = _DISPLAY_SCALE_MAX_FRACTION
-        self._fuel_temp_display_scale = (
-            a * f * float(self._fuel_temperatures.max()) + (1.0 - a) * self._fuel_temp_display_scale
-        )
-        self._radiant_flux_display_scale = (
-            a * f * float(self._last_radiant_flux.max()) + (1.0 - a) * self._radiant_flux_display_scale
-        )
+        # color scales don't flicker. Display-only, so the host syncs are skipped on the
+        # headless training path (render_mode=None).
+        if self.render_mode is not None:
+            a = _DISPLAY_SCALE_EMA_ALPHA
+            f = _DISPLAY_SCALE_MAX_FRACTION
+            self._fuel_temp_display_scale = (
+                a * f * float(self._fuel_temperatures.max()) + (1.0 - a) * self._fuel_temp_display_scale
+            )
+            self._radiant_flux_display_scale = (
+                a * f * float(self._last_radiant_flux.max()) + (1.0 - a) * self._radiant_flux_display_scale
+            )
         self._step_count += 1
         self._surfaces_dirty = True
 
         reward = 0.0
         terminated = False
         truncated = self._step_count >= self.max_steps
-        return self._air_temperatures.copy(), reward, terminated, truncated, self._build_info()
+        return _to_numpy(self._air_temperatures), reward, terminated, truncated, self._build_info()
 
     def render(self) -> np.ndarray | None:
         if self.render_mode == "human":
@@ -569,9 +584,18 @@ class FirecrackerEnv(gymnasium.Env):
     def _rebuild_surfaces_if_dirty(self) -> None:
         if not self._surfaces_dirty:
             return
-        temp = self._air_temperatures
-        wx, wy = self._x_wind_vel, self._y_wind_vel
-        pressure_field = self._mass
+        # The surface builders are CPU/pygame numpy code, so pull the state to the host
+        # once here — the numpy/tensor boundary lives at the render edge.
+        temp = _to_numpy(self._air_temperatures)
+        wx, wy = _to_numpy(self._x_wind_vel), _to_numpy(self._y_wind_vel)
+        pressure_field = _to_numpy(self._mass)
+        fuel_temps = _to_numpy(self._fuel_temperatures)
+        fuel = _to_numpy(self._fuel)
+        oxygen = _to_numpy(self._oxygen)
+        column_height = _to_numpy(
+            self._sim.column_height(self._mass, self._terrain, self._air_temperatures)
+        )
+        ignition_thresholds = _to_numpy(self._sim.ignition_thresholds).reshape(-1)
         wind_ref = float(np.sqrt(wx ** 2 + wy ** 2).max())
 
         self._color_surface = build_color_surface(temp, self._pixel_scale)
@@ -579,31 +603,33 @@ class FirecrackerEnv(gymnasium.Env):
             wx, wy, temp, self._pixel_scale, wind_ref,
         )
         self._fire_surface = build_fire_surface(
-            self._fuel_temperatures, self._fuel, self._oxygen, self._pixel_scale,
-            self._sim.ignition_thresholds, self._sim.fuel_burnt_threshold,
+            fuel_temps, fuel, oxygen, self._pixel_scale,
+            ignition_thresholds, self._sim.fuel_burnt_threshold,
             self._sim.oxygen_extinction_threshold,
             self._show_fire_overlay and self._sim.fire_enabled,
         )
-        self._oxygen_surface = build_oxygen_surface(self._oxygen, self._pixel_scale)
+        self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(pressure_field, self._pixel_scale)
         self._fuel_temperature_surface = build_color_surface(
-            self._fuel_temperatures.max(axis=0), self._pixel_scale,
+            fuel_temps.max(axis=0), self._pixel_scale,
             upper_bound=self._fuel_temp_display_scale,
         )
         self._radiant_flux_surface = build_radiant_heat_surface(
-            self._last_radiant_flux, self._pixel_scale,
+            _to_numpy(self._last_radiant_flux), self._pixel_scale,
             upper_bound=self._radiant_flux_display_scale,
         )
         # Static after reset, but rebuilt with the batch for consistency (cost is negligible).
-        self._terrain_surface = build_terrain_surface(self._terrain, self._pixel_scale)
-        self._column_height_surface = build_column_height_surface(
-            self._sim.column_height(self._mass, self._terrain, self._air_temperatures),
-            self._pixel_scale,
-        )
+        self._terrain_surface = build_terrain_surface(_to_numpy(self._terrain), self._pixel_scale)
+        self._column_height_surface = build_column_height_surface(column_height, self._pixel_scale)
         self._surfaces_dirty = False
 
+    def _to_tensor(self, arr: np.ndarray) -> torch.Tensor:
+        """Move a host numpy field onto the simulation device as a float32 tensor."""
+        return torch.as_tensor(arr, dtype=self._sim.dtype, device=self._sim.device)
+
     def _spawn_fire_patch(self, row: int, col: int) -> None:
-        rows_idx, cols_idx = np.ogrid[:self.grid_size, :self.grid_size]
+        rows_idx = torch.arange(self.grid_size, device=self._sim.device).view(-1, 1)
+        cols_idx = torch.arange(self.grid_size, device=self._sim.device).view(1, -1)
         patch = (rows_idx - row) ** 2 + (cols_idx - col) ** 2 <= self._fire_spawn_radius ** 2
         self._air_temperatures[patch] = float(self._sim.ignition_thresholds.max()) * 2.0
         for n in range(self._sim.num_fuel_types):
@@ -642,34 +668,67 @@ class FirecrackerEnv(gymnasium.Env):
         return running, mode, fire_click
 
     def _build_info(self) -> dict:
-        wind_speeds = np.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2)
-        ign = self._sim.ignition_thresholds[:, np.newaxis, np.newaxis]
+        wind_speeds = torch.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2)
+        ign = self._sim.ignition_thresholds   # already (N, 1, 1)
         burning_per_type = (
             (self._fuel_temperatures >= ign) &
             (self._fuel > self._sim.fuel_burnt_threshold) &
-            (self._oxygen[np.newaxis] > self._sim.oxygen_extinction_threshold)
-        ) if self._sim.fire_enabled else np.zeros_like(self._fuel, dtype=bool)
+            (self._oxygen[None] > self._sim.oxygen_extinction_threshold)
+        ) if self._sim.fire_enabled else torch.zeros_like(self._fuel, dtype=torch.bool)
+
+        # Reduce every metric on-device, then pull the whole batch back in a SINGLE
+        # host transfer (.tolist()). Doing per-scalar float() instead would force a
+        # separate device sync for each of the ~5*N+10 values, stalling every step.
+        fuel_flat  = self._fuel.flatten(1)                 # (N, H*W)
+        ftemp_flat = self._fuel_temperatures.flatten(1)    # (N, H*W)
+        scalars = torch.stack([
+            self._air_temperatures.mean(),
+            self._air_temperatures.amin(),
+            self._air_temperatures.amax(),
+            self._air_temperatures.std(),
+            wind_speeds.mean(),
+            wind_speeds.amax(),
+            wind_speeds.std(),
+            self._oxygen.mean(),
+            self._oxygen.amin(),
+            burning_per_type.any(dim=0).sum().to(self._sim.dtype),
+        ])
+        per_type = torch.cat([
+            fuel_flat.mean(dim=1),
+            fuel_flat.amax(dim=1),
+            ftemp_flat.mean(dim=1),
+            ftemp_flat.amax(dim=1),
+            burning_per_type.flatten(1).sum(dim=1).to(self._sim.dtype),
+        ])
+        vals = torch.cat([scalars, per_type]).tolist()     # one device->host sync
+
+        (air_mean, air_min, air_max, air_std,
+         wind_mean, wind_max, wind_std, ox_mean, ox_min, cells_burning) = vals[:10]
+        n = self._sim.num_fuel_types
+        block = vals[10:]   # five N-length blocks: fuel mean/max, fuel-temp mean/max, burn count
+        terrain_mean, terrain_min, terrain_max = self._terrain_stats
+
         info = {
-            "air_temperature": self._sim.compute_air_temperature(self._air_temperatures),
-            "air_temp_min":    float(self._air_temperatures.min()),
-            "air_temp_max":    float(self._air_temperatures.max()),
-            "air_temp_std":    float(self._air_temperatures.std()),
-            "wind_mean":       float(wind_speeds.mean()),
-            "wind_max":        float(wind_speeds.max()),
-            "wind_std":        float(wind_speeds.std()),
-            "oxygen_mean":     float(self._oxygen.mean()),
-            "oxygen_min":      float(self._oxygen.min()),
-            "cells_burning":   int(burning_per_type.any(axis=0).sum()),
-            "terrain_mean":    float(self._terrain.mean()),
-            "terrain_min":     float(self._terrain.min()),
-            "terrain_max":     float(self._terrain.max()),
+            "air_temperature": air_mean,
+            "air_temp_min":    air_min,
+            "air_temp_max":    air_max,
+            "air_temp_std":    air_std,
+            "wind_mean":       wind_mean,
+            "wind_max":        wind_max,
+            "wind_std":        wind_std,
+            "oxygen_mean":     ox_mean,
+            "oxygen_min":      ox_min,
+            "cells_burning":   int(cells_burning),
+            "terrain_mean":    terrain_mean,
+            "terrain_min":     terrain_min,
+            "terrain_max":     terrain_max,
             "map":             self._current_map,
             "step":            self._step_count,
         }
         for i, name in enumerate(self._sim.fuel_type_names):
-            info[f"fuel_{name}_mean"]      = float(self._fuel[i].mean())
-            info[f"fuel_{name}_max"]       = float(self._fuel[i].max())
-            info[f"fuel_temp_{name}_mean"] = float(self._fuel_temperatures[i].mean())
-            info[f"fuel_temp_{name}_max"]  = float(self._fuel_temperatures[i].max())
-            info[f"cells_burning_{name}"]  = int(burning_per_type[i].sum())
+            info[f"fuel_{name}_mean"]      = block[i]
+            info[f"fuel_{name}_max"]       = block[n + i]
+            info[f"fuel_temp_{name}_mean"] = block[2 * n + i]
+            info[f"fuel_temp_{name}_max"]  = block[3 * n + i]
+            info[f"cells_burning_{name}"]  = int(block[4 * n + i])
         return info

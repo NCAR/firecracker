@@ -22,6 +22,7 @@ from scenarios import (  # noqa: E402,F401
     DEFAULT_GRID,
     build_map,
     make_config,
+    to_numpy,
     total_air_energy,
     total_mass,
     total_oxygen,

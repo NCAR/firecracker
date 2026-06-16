@@ -9,7 +9,7 @@ scenarios are rendered by tools/visualize.py.
 
 import numpy as np
 
-from conftest import total_air_energy, total_mass, total_oxygen
+from conftest import to_numpy, total_air_energy, total_mass, total_oxygen
 from scenarios import corner_blob, hot_blob, oxygen_saturation, uniform
 
 
@@ -17,13 +17,13 @@ def test_uniform_field_is_stationary(make_env):
     """With no gradients anywhere, nothing should move: the step is a no-op."""
     env = make_env(*uniform())
 
-    before = (env._mass.copy(), env._air_temperatures.copy(), env._oxygen.copy())
+    before = (to_numpy(env._mass), to_numpy(env._air_temperatures), to_numpy(env._oxygen))
     for _ in range(5):
         env.step(0)
 
-    np.testing.assert_allclose(env._mass, before[0], atol=1e-6)
-    np.testing.assert_allclose(env._air_temperatures, before[1], atol=1e-6)
-    np.testing.assert_allclose(env._oxygen, before[2], atol=1e-6)
+    np.testing.assert_allclose(to_numpy(env._mass), before[0], atol=1e-6)
+    np.testing.assert_allclose(to_numpy(env._air_temperatures), before[1], atol=1e-6)
+    np.testing.assert_allclose(to_numpy(env._oxygen), before[2], atol=1e-6)
 
 
 def test_transport_conserves_mass_and_energy(make_env):
@@ -34,7 +34,7 @@ def test_transport_conserves_mass_and_energy(make_env):
     for _ in range(25):
         env.step(0)
 
-    assert np.isfinite(env._air_temperatures).all()
+    assert np.isfinite(to_numpy(env._air_temperatures)).all()
     np.testing.assert_allclose(total_mass(env), m0, rtol=1e-4)
     np.testing.assert_allclose(total_air_energy(env), e0, rtol=1e-4)
 
@@ -63,5 +63,5 @@ def test_oxygen_advection_conserves_and_saturates(make_env):
     for _ in range(20):
         env.step(0)
 
-    assert env._oxygen.max() <= 1.0 + 1e-6
+    assert float(env._oxygen.max()) <= 1.0 + 1e-6
     np.testing.assert_allclose(total_oxygen(env), o0, rtol=1e-4)

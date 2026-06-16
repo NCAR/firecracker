@@ -10,6 +10,7 @@ and assert a hot fire stays finite.
 """
 
 import numpy as np
+import torch
 
 from conftest import make_config
 from simulation import Simulation
@@ -26,8 +27,12 @@ def _sim(scale: float = 1e-6, exponent: float = 4.0) -> Simulation:
     return Simulation(config)
 
 
+def _full(sim, shape, value) -> torch.Tensor:
+    return torch.full(shape, float(value), dtype=sim.dtype, device=sim.device)
+
+
 def _fuel_energy(sim, fuel_temps, fuel) -> float:
-    c_fuel = sim.heat_capacities[:, None, None] * fuel
+    c_fuel = sim.heat_capacities * fuel   # heat_capacities is already (N, 1, 1)
     return float((c_fuel * fuel_temps).sum())
 
 
@@ -35,9 +40,9 @@ def test_radiant_heat_is_a_net_sink():
     """Total fuel thermal energy must not increase: radiation only redistributes and loses."""
     sim = _sim()
     shape = (16, 16)
-    fuel = np.full((1, *shape), 1.0, dtype=np.float32)
-    fuel_temps = np.full((1, *shape), 10.0, dtype=np.float32)  # all burning, hot
-    oxygen = np.ones(shape, dtype=np.float32)
+    fuel = _full(sim, (1, *shape), 1.0)
+    fuel_temps = _full(sim, (1, *shape), 10.0)  # all burning, hot
+    oxygen = _full(sim, shape, 1.0)
 
     e0 = _fuel_energy(sim, fuel_temps, fuel)
     new_ft, _flux = sim.apply_radiant_heat(fuel_temps, fuel, oxygen)
@@ -51,29 +56,29 @@ def test_radiant_heat_does_not_diverge():
     """A uniformly hot fire must stay finite and bounded under repeated radiation."""
     sim = _sim()
     shape = (16, 16)
-    fuel = np.full((1, *shape), 1.0, dtype=np.float32)
-    fuel_temps = np.full((1, *shape), 50.0, dtype=np.float32)
-    oxygen = np.ones(shape, dtype=np.float32)
+    fuel = _full(sim, (1, *shape), 1.0)
+    fuel_temps = _full(sim, (1, *shape), 50.0)
+    oxygen = _full(sim, shape, 1.0)
 
     for _ in range(200):
         fuel_temps, _ = sim.apply_radiant_heat(fuel_temps, fuel, oxygen)
 
-    assert np.isfinite(fuel_temps).all()
-    assert fuel_temps.max() <= 50.0 + 1e-3   # pure radiation can only cool, never heat above start
-    assert fuel_temps.min() >= 0.0           # emitter cooling never drives temperature negative
+    assert torch.isfinite(fuel_temps).all()
+    assert float(fuel_temps.max()) <= 50.0 + 1e-3   # pure radiation can only cool, never heat above start
+    assert float(fuel_temps.min()) >= 0.0           # emitter cooling never drives temperature negative
 
 
 def test_radiant_heat_redistributes_to_neighbours():
     """A single hot cell must cool while its neighbours warm (no self-heating)."""
     sim = _sim(scale=1e-4)               # strong enough to move temperatures visibly in one tick
     shape = (16, 16)
-    fuel = np.full((1, *shape), 1.0, dtype=np.float32)
-    fuel_temps = np.zeros((1, *shape), dtype=np.float32)
+    fuel = _full(sim, (1, *shape), 1.0)
+    fuel_temps = torch.zeros((1, *shape), dtype=sim.dtype, device=sim.device)
     fuel_temps[0, 8, 8] = 20.0           # one hot, burning cell
-    oxygen = np.ones(shape, dtype=np.float32)
+    oxygen = _full(sim, shape, 1.0)
 
     new_ft, _ = sim.apply_radiant_heat(fuel_temps, fuel, oxygen)
 
-    assert new_ft[0, 8, 8] < 20.0        # the emitter cooled
-    assert new_ft[0, 8, 9] > 0.0         # a neighbour was warmed
-    assert np.isfinite(new_ft).all()
+    assert float(new_ft[0, 8, 8]) < 20.0     # the emitter cooled
+    assert float(new_ft[0, 8, 9]) > 0.0      # a neighbour was warmed
+    assert torch.isfinite(new_ft).all()

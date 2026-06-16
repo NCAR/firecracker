@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 
 # The src/ modules import each other flatly (e.g. `from simulation import ...`),
 # so put src/ on the path before importing them.
@@ -101,6 +102,11 @@ def build_map(
 # ---------------------------------------------------------------------------
 # Invariant probes
 # ---------------------------------------------------------------------------
+
+def to_numpy(x) -> np.ndarray:
+    """Host numpy view of a sim field, which is now a (possibly GPU) torch tensor."""
+    return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
 
 def total_mass(env) -> float:
     return float(env._mass.sum())
