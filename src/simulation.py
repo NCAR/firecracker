@@ -15,6 +15,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+import physics_constants as pc
+
 # Stability cap for the explicit Laplacian diffusion coefficient (2D: must be < 0.25).
 _MAX_DIFFUSION_COEFF: float = 0.2
 
@@ -62,14 +64,22 @@ class Simulation:
         fire   = (cfg or {}).get("fire", {})
         env    = (cfg or {}).get("environment", {})
 
-        # Single device for all state; float32 throughout (A100-friendly, ample precision
-        # for this conservation-driven model).
+        # Single device for all state. float64 throughout: the SI state spans ~1e-1..1e9
+        # (mass ~1e4 kg/m^2, energy ~1e9 J, T ~3e2 K), which erodes float32 and the tight
+        # conservation tolerances, so the physical model runs in double precision.
         self.device: torch.device = _resolve_device(env.get("device"))
-        self.dtype:  torch.dtype  = torch.float32
+        self.dtype:  torch.dtype  = torch.float64
 
         self.simulation_steps_per_second: int   = int(sim.get("steps_per_second",        10))
         self.ms_per_step:                 int   = 1000 // self.simulation_steps_per_second
         self.blur_sigma:                  float = float(sim.get("blur_sigma",              1.0))
+
+        # Physical discretisation scales. dx is the cell edge length; dt is the wall-clock
+        # duration of one tick. Both are needed by the SI physics (Phase 2+); they are wired
+        # in here so every subsystem reads them from one place.
+        units = (cfg or {}).get("units", {})
+        self.cell_size_m: float = float(units.get("cell_size_m", pc.DEFAULT_CELL_SIZE_M))
+        self.dt:          float = 1.0 / self.simulation_steps_per_second
 
         self.wind_smooth_sigma:       float = float(wind.get("smooth_sigma",       2.0))
         self.wind_temporal_smoothing: float = float(wind.get("temporal_smoothing", 0.2))

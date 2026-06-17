@@ -1,5 +1,19 @@
 # Firecracker simulation configuration
 # All parameters have defaults in the source; values here override those defaults.
+#
+# State is in SI units: temperature [K], mass [kg/m^2], terrain [m], oxygen [kg/m^3],
+# fuel [kg/m^2], wind [m/s]. Fixed constants of nature and the reference atmosphere
+# live in src/physics_constants.py.
+#
+# NOTE (units migration): map generation, I/O, and rendering are SI as of units_version 1.
+# The dynamics constants under [convection], [relaxation], [fire], [radiant_heat], [wind]
+# and [oxygen] are still the pre-SI values; they are redefined as the physical solvers
+# land (Phases 2-5 of docs/units.md). Stepping is not yet physically meaningful.
+
+[units]
+# Physical discretisation. Each cell is cell_size_m on a side; the tick duration is
+# 1/steps_per_second seconds (see [simulation]).
+cell_size_m = 10.0
 
 [simulation]
 steps_per_second     = 10     # physics ticks per second
@@ -21,16 +35,17 @@ persistence = 0.5
 lacunarity  = 2.0
 
 [terrain]
-# Octave Perlin noise for the elevation height map, normalised to [0, 1].
-# More octaves layer in finer-resolution detail on top of the broad relief.
+# Octave Perlin noise for the elevation height map, normalised to [0, 1] then scaled
+# to metres by elev_max. More octaves layer finer detail on top of the broad relief.
 scale       = 96.0
 octaves     = 6
 persistence = 0.5
 lacunarity  = 2.0
-# Initial air temperature and oxygen fall off exponentially with elevation as
-# exp(-rate * h): 1.0 at sea level (h=0), decaying toward the peaks (h=1).
-temperature_lapse_rate = 3.0   # steeper -> colder peaks
-oxygen_lapse_rate      = 1.5   # steeper -> thinner air at altitude
+elev_max    = 500.0     # peak elevation [m] (the normalised relief is scaled by this)
+# Air temperature falls with elevation at the environmental lapse rate: T = T_REF - rate*z.
+# Oxygen and column mass follow the hydrostatic profile (see physics_constants.py), so
+# there is no separate oxygen falloff knob any more.
+temperature_lapse_rate = 0.0065   # K/m (6.5 K per km)
 
 [relaxation]
 # Newtonian relaxation pulls each cell toward its elevation equilibrium profile
@@ -66,25 +81,25 @@ spawn_radius                = 5      # radius (in grid cells) of the circular ig
 # ---------------------------------------------------------------------------
 
 [fuel_types.grass]
-heat_capacity          = 0.5    # thermal mass per unit of fuel
-ignition_threshold     = 1.5    # fuel temperature required to ignite
-consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fuel temperature
-burn_heat_scale        = 100.0  # heat released per unit of fuel consumed
-fuel_air_transfer_rate = 0.05   # rate of heat exchange with air
+heat_capacity          = 0.5    # thermal mass per unit of fuel (pre-SI; -> J/(kg*K) in Phase 4)
+ignition_threshold     = 573.0  # pyrolysis onset temperature [K] (~300 C)
+consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fuel temperature (pre-SI)
+burn_heat_scale        = 100.0  # heat released per unit of fuel consumed (pre-SI; -> HHV J/kg in Phase 4)
+fuel_air_transfer_rate = 0.05   # rate of heat exchange with air (pre-SI)
 noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
 altitude_falloff       = 0.5    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
-spawn_density          = 1.0    # scales the [0,1] noise into continuous grass density
+spawn_density          = 1.5    # peak grass loading [kg/m^2] (scales the [0,1] noise)
 
 [fuel_types.tree]
-heat_capacity          = 2.5
-ignition_threshold     = 1.5
-consumption_rate       = 0.001
-burn_heat_scale        = 300.0
-fuel_air_transfer_rate = 0.01
+heat_capacity          = 2.5    # pre-SI; -> J/(kg*K) in Phase 4
+ignition_threshold     = 600.0  # pyrolysis onset temperature [K]
+consumption_rate       = 0.001  # pre-SI
+burn_heat_scale        = 300.0  # pre-SI; -> HHV J/kg in Phase 4
+fuel_air_transfer_rate = 0.01   # pre-SI
 noise_scale            = 32.0
 altitude_falloff       = 3.0    # steep: trees thin out quickly with elevation
 spawn_density          = 2.0    # mean trees per cell per unit elevation-thinned noise (exponential mean scale)
-fuel_per_tree          = 1.0    # fuel mass contributed by each tree in a cell
+fuel_per_tree          = 5.0    # fuel loading contributed by each tree [kg/m^2] (up to 4 trees -> 20 kg/m^2)
 max_trees_per_cell     = 4      # hard cap on the per-cell tree count
 
 [radiant_heat]

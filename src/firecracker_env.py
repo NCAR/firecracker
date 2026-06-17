@@ -41,14 +41,23 @@ BLUE_CHANNEL: int = 2
 # Wind arrow visualization parameters
 # ---------------------------------------------------------------------------
 
-_AIR_TEMP_DISPLAY_THRESHOLD:       float = 1e-2
 _WIND_DISPLAY_THRESHOLD:       float = 1e-4
+
+# Temperature views map a Kelvin window onto the color ramp. The air-temperature view
+# uses a fixed ambient fire-weather window (fire pushes air above the ceiling and simply
+# saturates to the hot color); the fuel-temperature view shares the floor but tracks its
+# ceiling to the (EMA-smoothed) peak so flame structure stays visible.
+DISPLAY_TEMP_FLOOR_K:    float = 290.0
+DISPLAY_AIR_TEMP_CEIL_K: float = 330.0
+DISPLAY_MIN_TEMP_SPAN_K: float = 50.0
+# Kelvin above ignition that spans the fire-overlay color ramp (ignition -> +span).
+FIRE_COLOR_TEMP_SPAN_K:  float = 600.0
 
 # EMA weight for the upper bound of the fuel-temperature and radiant-heat color
 # scales. Smaller = steadier (slower to track the peak); larger = more responsive.
 _DISPLAY_SCALE_EMA_ALPHA: float = 0.1
-# Fraction of the frame max the EMA tracks toward, so cells at/above this fraction
-# of the smoothed peak saturate to the top color.
+# Fraction of the frame max the radiant-heat EMA tracks toward, so cells at/above this
+# fraction of the smoothed peak saturate to the top color.
 _DISPLAY_SCALE_MAX_FRACTION: float = 0.5
 
 WIND_ARROW_STRIDE: int = 16
@@ -86,25 +95,17 @@ MODE_KEYS: dict[int, ViewMode] = {
 # ---------------------------------------------------------------------------
 
 def build_color_surface(
-    air_temperatures: np.ndarray, scale: int, upper_bound: float | None = None
+    field: np.ndarray, scale: int, lo: float, hi: float
 ) -> pygame.Surface:
-    rows, cols = air_temperatures.shape
-    if upper_bound is not None:
-        # Fixed (EMA-smoothed) upper bound: normalize against it and clamp values
-        # above it to the top color, so the scale doesn't flicker with the frame max.
-        normalized = (
-            np.clip(air_temperatures / upper_bound, 0.0, 1.0)
-            if upper_bound > 0.0 else np.zeros_like(air_temperatures)
-        )
-    else:
-        max_temp = float(air_temperatures.max())
-        if max_temp == 0.0:
-            normalized = np.zeros_like(air_temperatures)
-        else:
-            t        = min(max_temp / _AIR_TEMP_DISPLAY_THRESHOLD, 1.0)
-            relative = np.clip(air_temperatures / max_temp, 0.0, 1.0)
-            absolute = np.clip(air_temperatures / _AIR_TEMP_DISPLAY_THRESHOLD, 0.0, 1.0)
-            normalized = t * relative + (1.0 - t) * absolute
+    """Map a temperature field [K] linearly over the window [lo, hi] onto the heat ramp.
+
+    Values at/below lo render dark; at/above hi saturate to the hot color.
+    """
+    rows, cols = field.shape
+    span = hi - lo
+    normalized = (
+        np.clip((field - lo) / span, 0.0, 1.0) if span > 0.0 else np.zeros_like(field)
+    )
     r = (normalized * 255).astype(np.uint8)
     g = ((1.0 - normalized) * 15).astype(np.uint8)
     b = ((1.0 - normalized) * 31).astype(np.uint8)
@@ -180,8 +181,11 @@ def build_wind_surface(
 
 def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
     rows, cols = oxygen.shape
-    # black = full oxygen (1.0), white = no oxygen (0.0)
-    brightness = ((1.0 - np.clip(oxygen, 0.0, 1.0)) * MAX_CHANNEL_VALUE).astype(np.uint8)
+    # O2 is now a partial density [kg/m^3], so normalise against the current max:
+    # black = most oxygen, white = least.
+    o_max = float(oxygen.max())
+    fraction = oxygen / o_max if o_max > 0.0 else np.zeros_like(oxygen)
+    brightness = ((1.0 - np.clip(fraction, 0.0, 1.0)) * MAX_CHANNEL_VALUE).astype(np.uint8)
     brightness_scaled = np.repeat(np.repeat(brightness, scale, axis=0), scale, axis=1)
     rgb = np.stack([brightness_scaled] * 3, axis=-1)
     surface = pygame.Surface((cols * scale, rows * scale))
@@ -227,7 +231,9 @@ def build_radiant_heat_surface(
 
 def build_terrain_surface(terrain: np.ndarray, scale: int) -> pygame.Surface:
     rows, cols = terrain.shape
-    h = np.clip(terrain, 0.0, 1.0)
+    # Terrain is elevation in metres; normalise against the current max for the relief.
+    t_max = float(terrain.max())
+    h = np.clip(terrain / t_max, 0.0, 1.0) if t_max > 0.0 else np.zeros_like(terrain)
     # Elevation relief: dark green valleys -> white peaks.
     r = (h * MAX_CHANNEL_VALUE).astype(np.uint8)
     g = (60.0 + h * (MAX_CHANNEL_VALUE - 60.0)).astype(np.uint8)
@@ -292,10 +298,11 @@ def build_fire_surface(
     rgb[:, :, GREEN_CHANNEL] = (normalized_fuel * MAX_CHANNEL_VALUE).astype(np.uint8)
 
     if show_fire_overlay:
-        # Color gradient based on the hottest fuel type; scale from min ignition threshold.
+        # Color gradient based on the hottest fuel type; a fixed Kelvin span above the
+        # minimum ignition temperature spans the ramp.
         max_fuel_temp = fuel_temperatures.max(axis=0)
         min_ign = float(ignition_thresholds.min())
-        t = np.clip((max_fuel_temp - min_ign) / (24.0 * min_ign), 0.0, 1.0)
+        t = np.clip((max_fuel_temp - min_ign) / FIRE_COLOR_TEMP_SPAN_K, 0.0, 1.0)
         rgb[any_burning, RED_CHANNEL]   = MAX_CHANNEL_VALUE
         rgb[any_burning, GREEN_CHANNEL] = (t[any_burning] * MAX_CHANNEL_VALUE).astype(np.uint8)
 
@@ -453,7 +460,9 @@ class FirecrackerEnv(gymnasium.Env):
         # sanely. These drive the mode 6/7 color scales only, so they (and their host
         # syncs) are skipped entirely on the headless training path (render_mode=None).
         if self.render_mode is not None:
-            self._fuel_temp_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._fuel_temperatures.max())
+            # Fuel-temp scale tracks the actual peak (it is used as the color ceiling);
+            # radiant flux is anchored at 0, so it tracks a fraction of its peak.
+            self._fuel_temp_display_scale = float(self._fuel_temperatures.max())
             self._radiant_flux_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._last_radiant_flux.max())
         self._step_count = 0
         self._running = True
@@ -479,7 +488,7 @@ class FirecrackerEnv(gymnasium.Env):
             a = _DISPLAY_SCALE_EMA_ALPHA
             f = _DISPLAY_SCALE_MAX_FRACTION
             self._fuel_temp_display_scale = (
-                a * f * float(self._fuel_temperatures.max()) + (1.0 - a) * self._fuel_temp_display_scale
+                a * float(self._fuel_temperatures.max()) + (1.0 - a) * self._fuel_temp_display_scale
             )
             self._radiant_flux_display_scale = (
                 a * f * float(self._last_radiant_flux.max()) + (1.0 - a) * self._radiant_flux_display_scale
@@ -565,7 +574,9 @@ class FirecrackerEnv(gymnasium.Env):
         ignition_thresholds = _to_numpy(self._sim.ignition_thresholds).reshape(-1)
         wind_ref = float(np.sqrt(wx ** 2 + wy ** 2).max())
 
-        self._color_surface = build_color_surface(temp, self._pixel_scale)
+        self._color_surface = build_color_surface(
+            temp, self._pixel_scale, DISPLAY_TEMP_FLOOR_K, DISPLAY_AIR_TEMP_CEIL_K,
+        )
         self._wind_surface = build_wind_surface(
             wx, wy, temp, self._pixel_scale, wind_ref,
         )
@@ -577,9 +588,13 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(pressure_field, self._pixel_scale)
+        # Fuel-temperature view: floor at ambient, ceiling tracks the smoothed peak
+        # (clamped to a minimum span so a cold map doesn't over-stretch the ramp).
+        fuel_temp_ceil = max(
+            DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_scale
+        )
         self._fuel_temperature_surface = build_color_surface(
-            fuel_temps.max(axis=0), self._pixel_scale,
-            upper_bound=self._fuel_temp_display_scale,
+            fuel_temps.max(axis=0), self._pixel_scale, DISPLAY_TEMP_FLOOR_K, fuel_temp_ceil,
         )
         self._radiant_flux_surface = build_radiant_heat_surface(
             _to_numpy(self._last_radiant_flux), self._pixel_scale,

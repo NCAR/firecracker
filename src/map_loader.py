@@ -22,6 +22,12 @@ import numpy as np
 
 MAP_SUFFIX = ".npz"
 
+# Bumped whenever the on-disk field semantics change. Maps stamped with a different
+# version — including legacy maps that predate the field, which read back as 0 — are
+# rejected by validate_against_config with a regenerate hint.
+#   v1 = SI units: temperature [K], mass [kg/m^2], terrain [m], oxygen [kg/m^3], fuel [kg/m^2].
+UNITS_VERSION = 1
+
 # Maps live at <repo_root>/maps by default (alongside cfg/), same convention as
 # config.py. A relative maps dir is anchored here so the app finds its maps
 # regardless of the current working directory; absolute paths are left untouched.
@@ -54,6 +60,7 @@ class MapData:
     oxygen_eq:         np.ndarray | None = None  # (H, W) oxygen replenishment target
     seed:              int | None = None
     source:            str = "unknown"
+    units_version:     int = UNITS_VERSION       # field semantics version (see UNITS_VERSION)
 
     def __post_init__(self) -> None:
         if self.temp_eq is None:
@@ -92,6 +99,7 @@ def save_map(path: str | Path, m: MapData) -> Path:
         grid_size=np.int64(m.grid_size),
         seed=np.int64(-1 if m.seed is None else m.seed),
         source=np.str_(m.source),
+        units_version=np.int64(m.units_version),
     )
     return path
 
@@ -101,6 +109,8 @@ def load_map(path: str | Path) -> MapData:
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
         seed = int(data["seed"]) if "seed" in data else -1
+        # Absent on legacy (pre-SI) maps; read back as version 0 so validation rejects them.
+        units_version = int(data["units_version"]) if "units_version" in data else 0
         return MapData(
             terrain=data["terrain"].astype(np.float32),
             air_temperatures=data["air_temperatures"].astype(np.float32),
@@ -114,6 +124,7 @@ def load_map(path: str | Path) -> MapData:
             grid_size=int(data["grid_size"]),
             seed=None if seed < 0 else seed,
             source=str(data["source"]) if "source" in data else "unknown",
+            units_version=units_version,
         )
 
 
@@ -175,6 +186,14 @@ def validate_against_config(
     The fuel axis is positional (indexed against the per-type physics arrays), so
     the fuel-type names must match in both content and order.
     """
+    if m.units_version != UNITS_VERSION:
+        legacy = " (legacy nondimensional map)" if m.units_version == 0 else ""
+        raise ValueError(
+            f"Map units_version {m.units_version}{legacy} does not match the expected "
+            f"{UNITS_VERSION} (SI units). Regenerate the maps, e.g.\n"
+            f"    python src/gen_maps.py --count 8 --out maps"
+        )
+
     expected_2d = (grid_size, grid_size)
     for field_name in ("terrain", "air_temperatures", "mass", "oxygen", "temp_eq", "oxygen_eq"):
         arr = getattr(m, field_name)

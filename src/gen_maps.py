@@ -20,6 +20,7 @@ import argparse
 import numpy as np
 import noise
 
+import physics_constants as pc
 from config import load_config
 from map_loader import MapData, save_map
 
@@ -41,8 +42,10 @@ class MapGenerator:
         self.terrain_octaves     = int(terrain.get("octaves",       6))
         self.terrain_persistence = float(terrain.get("persistence", 0.5))
         self.terrain_lacunarity  = float(terrain.get("lacunarity",  2.0))
-        self.temperature_lapse_rate = float(terrain.get("temperature_lapse_rate", 3.0))
-        self.oxygen_lapse_rate      = float(terrain.get("oxygen_lapse_rate",      1.5))
+        # SI elevation: the normalised [0,1] height map is scaled to metres by elev_max.
+        self.elev_max               = float(terrain.get("elev_max",               500.0))
+        # Environmental lapse rate [K/m]: air temperature falls T_REF - rate*elevation.
+        self.temperature_lapse_rate = float(terrain.get("temperature_lapse_rate", pc.LAPSE_RATE))
 
         # Convection params are dynamics knobs, but the *initial* pressure is the
         # rest state of those dynamics, so the generator reads them too.
@@ -142,10 +145,36 @@ class MapGenerator:
         )
         return (height ** 2).astype(np.float32)
 
-    @staticmethod
-    def elevation_falloff(terrain: np.ndarray, rate: float) -> np.ndarray:
-        """Field that decays exponentially with elevation: exp(-rate * h), 1.0 at sea level."""
-        return np.exp(-rate * terrain).astype(np.float32)
+    def air_temperature_profile(self, elevation_m: np.ndarray) -> np.ndarray:
+        """Air temperature [K] from the environmental lapse rate: T = T_REF - Gamma*z."""
+        return (pc.T_REF - self.temperature_lapse_rate * elevation_m).astype(np.float32)
+
+    def pressure_profile(self, elevation_m: np.ndarray) -> np.ndarray:
+        """Hydrostatic surface pressure [Pa].
+
+        Exact barometric formula for the constant lapse rate Gamma, integrating
+        dp/dz = -p*g/(R_d*T(z)) with T(z) = T_REF - Gamma*z:
+            p(z) = p_REF * (1 - Gamma*z/T_REF) ** (g / (R_d*Gamma))
+        This is consistent with air_temperature_profile and stays accurate to high
+        elevations (no isothermal approximation). It reduces to the isothermal
+        p_REF*exp(-z/H_p) as Gamma -> 0, which is the fallback used when the lapse
+        rate is zero.
+        """
+        gamma = self.temperature_lapse_rate
+        if gamma <= 0.0:
+            return (pc.P_REF * np.exp(-elevation_m / pc.PRESSURE_SCALE_HEIGHT)).astype(np.float32)
+        exponent = pc.GRAVITY / (pc.GAS_CONSTANT_DRY_AIR * gamma)
+        base = 1.0 - gamma * elevation_m / pc.T_REF   # = T(z)/T_REF, positive for z < T_REF/Gamma
+        return (pc.P_REF * base ** exponent).astype(np.float32)
+
+    def column_mass_profile(self, elevation_m: np.ndarray) -> np.ndarray:
+        """Hydrostatic column mass per area [kg/m^2]: m = p / g (weight of the air column)."""
+        return (self.pressure_profile(elevation_m) / pc.GRAVITY).astype(np.float32)
+
+    def oxygen_profile(self, elevation_m: np.ndarray, air_temperatures: np.ndarray) -> np.ndarray:
+        """Ambient O2 partial density [kg/m^3] = O2 mass fraction * air density p/(R_d*T)."""
+        air_density = self.pressure_profile(elevation_m) / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures)
+        return (pc.O2_MASS_FRACTION * air_density).astype(np.float32)
 
     def altitude_vegetation_multiplier(self, terrain: np.ndarray, fuel_index: int) -> np.ndarray:
         """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
@@ -190,27 +219,33 @@ def generate_map(
 
     Fire is intentionally not baked here: ignition (random spawn or click) is a
     runtime concern applied by the environment, so maps describe the world at rest.
-    """
-    terrain = gen.create_terrain(grid_size, rng=rng)
 
-    # Air temperature and oxygen fall off exponentially with elevation (1.0 at sea level).
-    air_temperatures = gen.elevation_falloff(terrain, gen.temperature_lapse_rate)
-    oxygen = gen.elevation_falloff(terrain, gen.oxygen_lapse_rate)
+    All fields are SI: terrain [m], air_temperatures [K], mass [kg/m^2], oxygen
+    [kg/m^3], fuel [kg/m^2].
+    """
+    # Normalised [0,1] relief drives both the elevation (scaled to metres) and the
+    # vegetation thinning (which is a function of fractional altitude).
+    relief = gen.create_terrain(grid_size, rng=rng)
+    terrain = (relief * gen.elev_max).astype(np.float32)
+
+    # Air temperature from the lapse rate; oxygen from the hydrostatic air density.
+    air_temperatures = gen.air_temperature_profile(terrain)
+    oxygen = gen.oxygen_profile(terrain, air_temperatures)
 
     N = gen.num_fuel_types
     fuel = np.zeros((N, grid_size, grid_size), dtype=np.float32)
 
     if N > 0:
-        # Grass (type 0): continuous Perlin density, thinned by elevation.
+        # Grass (type 0): continuous Perlin density [kg/m^2], thinned by altitude.
         grass_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[0]), rng=rng)
-        grass_alt = gen.altitude_vegetation_multiplier(terrain, 0)
+        grass_alt = gen.altitude_vegetation_multiplier(relief, 0)
         fuel[0] = (grass_noise * float(gen.spawn_densities[0]) * grass_alt).astype(np.float32)
 
     if N > 1:
         # Trees (type 1): per-cell counts from an exponential whose mean is the
-        # elevation-thinned noise density, capped, then scaled to fuel mass.
+        # altitude-thinned noise density, capped, then scaled to fuel mass [kg/m^2].
         tree_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[1]), rng=rng)
-        tree_alt = gen.altitude_vegetation_multiplier(terrain, 1)
+        tree_alt = gen.altitude_vegetation_multiplier(relief, 1)
         density = tree_noise * float(gen.spawn_densities[1]) * tree_alt
         tree_counts = gen.sample_tree_counts(density, rng)
         fuel[1] = (tree_counts * gen.fuel_per_tree).astype(np.float32)
@@ -218,8 +253,8 @@ def generate_map(
     # Each fuel type starts at ambient air temperature.
     fuel_temperatures = np.tile(air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)
 
-    # Column mass (surface pressure) at its leveled convective rest state.
-    mass = gen.equilibrium_mass(terrain, air_temperatures)
+    # Column mass at its hydrostatic rest state (weight of the air column above each cell).
+    mass = gen.column_mass_profile(terrain)
 
     return MapData(
         terrain=terrain,
