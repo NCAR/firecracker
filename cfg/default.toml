@@ -20,8 +20,15 @@ steps_per_second     = 10     # physics ticks per second
 blur_sigma           = 1.0    # Gaussian diffusion width per tick
 
 [wind]
-smooth_sigma        = 2.0   # Gaussian smoothing applied to the derived wind field
-temporal_smoothing  = 0.1   # EMA weight toward newly computed wind (0 = frozen, 1 = instant)
+smooth_sigma        = 2.0   # (pre-SI diagnostic wind) Gaussian smoothing; replaced by the Phase 2 solver
+temporal_smoothing  = 0.1   # (pre-SI diagnostic wind) EMA weight; replaced by the Phase 2 solver
+# Per-map synoptic (prevailing) wind: each generated map draws a random bearing and a
+# speed [m/s] uniformly from this range. This is the steady background the momentum drag
+# relaxes toward (Phase 2); terrain then channels/accelerates it.
+# Prevailing baseline 5-15 m/s; terrain channeling/Venturi accelerates it locally toward
+# the solver's ~30 m/s peak-wind calibration target (g'/C_d, CFL).
+ambient_speed_min   = 5.0   # m/s
+ambient_speed_max   = 15.0  # m/s
 
 [oxygen]
 diffusion_sigma    = 3.0   # Gaussian diffusion width for oxygen transport
@@ -65,6 +72,22 @@ thermal_expansion       = 0.5   # alpha: how much temperature expands the column
 terrain_height_scale    = 0.5   # gamma: terrain's contribution to column-top height
 buoyancy_transport_rate = 0.1   # c_b: mass/energy flux down the column-height gradient
 pressure_transport_rate = 0.1   # c_p: mass/energy flux down the surface-pressure gradient
+
+[momentum]
+# Shallow boundary-layer orographic wind (see docs/units.md). The wind is prognostic
+# [m/s], forced by the free-surface gradient -g'*grad(s), s = terrain + eta with the layer
+# thickness eta = m*R_d*T/p_ref. Because the modelled layer is shallow (depth ~ layer_depth_ref,
+# comparable to terrain) the air is squeezed over high terrain, so continuity speeds the wind
+# up over crests and channels it through gaps. A boundary sponge injects the per-map synoptic
+# wind at the upwind edge and absorbs outflow at the downwind edge (open domain); the interior
+# feels only weak surface friction + viscosity, so terrain shapes the flow.
+layer_depth_ref = 1000.0  # h_ref [m]: free-stream boundary-layer depth (sets the level lid)
+reduced_gravity = 0.2     # g' [m/s^2]: free-surface forcing strength (gravity-wave speed sqrt(g'*eta))
+drag_coeff      = 0.0005  # C_d [1/s]: weak interior surface friction (toward rest)
+viscosity       = 50.0    # nu [m^2/s]: eddy viscosity (smoothing)
+sponge_width    = 8       # cells: width of the boundary relaxation (open-domain inflow/outflow)
+sponge_strength = 10.0    # [1/s]: peak edge relaxation rate toward (u_amb, rest mass)
+cfl_target      = 0.5     # max Courant number per substep (advective + gravity-wave speed)
 
 [fire]
 enabled                     = true   # if false, combustion/radiant heat are skipped (watch convection only)

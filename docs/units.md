@@ -20,7 +20,8 @@ These were pinned during design review and are assumed throughout:
 | Choice | Decision |
 |---|---|
 | terrain `elev_max` | **500 m** over the 2.56 km domain |
-| target max wind | **~20 m/s** (calibrate `g′`, `C_d` toward this) |
+| ambient wind | prevailing baseline **5–15 m/s** per map (random bearing) |
+| peak wind | **~30 m/s** calibration target (terrain-channeled gusts; sets `g′`, `C_d`, CFL) |
 | solar forcing | **constant daytime net flux**, sized so radiative equilibrium = `T₀` |
 | Coriolis | **omitted** (negligible at 2.5 km scale) |
 | combustion law | **Arrhenius, O₂-limited** (smooth ignition, no hard threshold) |
@@ -84,7 +85,7 @@ in `cfg/default.toml` under documented, unit-annotated keys.
 
 | Field | Was | Becomes | Unit |
 |---|---|---|---|
-| `mass` | column mass, mean 1 | column mass per area `m` | kg/m² |
+| `mass` | column mass, mean 1 | shallow boundary-layer areal mass `m` (level lid) | kg/m² |
 | `air_temperatures` | ~0.5 | `T` | K |
 | `(x,y)_wind_vel` | cells/tick, diagnostic | prognostic velocity `(u,v)` | m/s |
 | `oxygen` | `[0,1]` fraction | O₂ partial density | kg/m³ |
@@ -103,39 +104,55 @@ so revisit `buffer_dtype` / pool sizing.
 
 ## Governing equations
 
-### Single-layer shallow-water atmosphere (replaces transport + wind)
+### Shallow boundary-layer atmosphere over terrain (replaces transport + wind)
 
-Column-top geopotential height, with a thermally expanding layer (ideal gas: warmer
-columns are taller):
-
-```
-thickness  η(m,T) = m · R_d · T / p_ref      [m]      (vertically integrated layer)
-H(x,y)     = z(x,y) + η(m,T)                  [m]      (column-top height)
-```
-
-Prognostic momentum (pressure-gradient force via reduced gravity g′ on the free
-surface `H`, plus surface drag and eddy viscosity; Coriolis omitted at this scale).
-`g′` and `C_d` are calibrated in Phase 2 so a representative `∇H` drives steady winds
-up to ~20 m/s (drag balance `u ≈ (g′/C_d)|∇H|`):
+The dynamical layer is a **shallow atmospheric boundary layer** (depth ~ `layer_depth_ref`,
+comparable to terrain), **not** the full column — this is what makes terrain a real
+obstacle. Its free-surface height, with a thermally expanding layer (ideal gas: warmer
+layers are taller):
 
 ```
-∂u/∂t + (u·∇)u = -g′ ∂H/∂x - C_d·u + ν ∇²u
-∂v/∂t + (u·∇)v = -g′ ∂H/∂y - C_d·v + ν ∇²v
+thickness  η(m,T) = m · R_d / p_ref · T      [m]   (m is the boundary-layer areal mass)
+s(x,y)     = z(x,y) + η(m,T)                  [m]   (free-surface height)
 ```
 
-Conservative mass continuity and energy advection (same velocity carries both):
+The map's `mass` is initialised to a **level lid** (`s` flat → `η = h_ref + (elev_max − z)`),
+so the layer is thinner over high terrain. Because `η ~ O(1 km)` (not ~8.6 km), a hill is a
+large constriction, and continuity makes the wind speed up where the layer thins.
+
+Prognostic momentum, forced by the free-surface gradient, with weak interior surface
+friction and eddy viscosity (Coriolis omitted at this scale):
+
+```
+∂u/∂t + (u·∇)u = -g′ ∂s/∂x - C_d·u + ν ∇²u
+∂v/∂t + (u·∇)v = -g′ ∂s/∂y - C_d·u + ν ∇²v
+```
+
+Conservative continuity, energy and momentum advection (same velocity carries all):
 
 ```
 ∂m/∂t          + ∇·(m u)              = 0
 ∂(m c_p T)/∂t  + ∇·(m c_p T u)        = Q_rad + Q_burn + Q_cond     [W/m²]
+∂(m u)/∂t      + ∇·(m u ⊗ u)          = forcing
 ```
 
-Discretisation: finite-volume, conservative face fluxes (reuse the telescoping
-upwind/centered structure already in `_advect_upwind` / `_phi_diffuse_step`), no-flux
-walls. **CFL:** advective `|u|dt/dx` is comfortable (~0.2 at 20 m/s), but the
-gravity-wave speed `c = √(g′H)` sets the real limit — substep on `c` as the current
-code substeps on displacement. Reduced gravity `g′` for a thin layer keeps `c` modest;
-**Phase 2 must verify and add substepping.**
+**Open domain via a boundary sponge.** Advection is computed periodically, but within
+`sponge_width` cells of the edges the wind is relaxed toward the per-map synoptic `u_amb`
+and the mass/temperature toward their level-lid rest values (exact-exponential, so stable
+at any strength). The upwind sponge injects the synoptic wind; the downwind sponge absorbs
+outflow and damps wrap-around — so the wind **enters one edge, crosses the terrain, and
+exits**. The interior feels only weak friction, so terrain shapes the flow. (Closed,
+conserving behaviour is recovered with `sponge_strength = drag_coeff = 0`, used by the
+conservation tests.)
+
+**Observed orographic behaviour** (verified): windward blocking (slower), and
+lee/downslope **acceleration** above ambient — the foehn / downslope-wind pattern that
+drives real wildfires. Strength scales with how shallow the layer is (`layer_depth_ref`):
+shallower → stronger channeling and gap winds. **Katabatic** drainage emerges later from
+the `η`-buoyancy term once Phase 3 builds cold-slope temperature gradients.
+
+**CFL:** substepped on `(|u| + √(g′η))·dt/dx`; with `g′ ≈ 0.2`, `η ≈ 1 km`, the gravity-wave
+speed is ~15 m/s (transcritical with the wind → strong terrain response).
 
 ### Radiation (replaces `relax_to_equilibrium` for temperature)
 
@@ -196,10 +213,10 @@ The `T⁴` sink self-limits flame temperature, now with the actual `σ`.
 |---|---|
 | terrain `z` | normalised Perlin × `elev_max` (e.g. 0–500 m) |
 | temperature | `T(z) = T₀ − Γ·z` |
-| mass | hydrostatic `m(z) = p(z)/g`, with the exact barometric `p(z) = p₀·(1−Γz/T₀)^(g/(R_d·Γ))` (isothermal `exp(−z/H_p)` only as the Γ→0 fallback) |
+| mass | shallow boundary-layer areal mass on a level lid: `η = h_ref + (elev_max − z)`, `m = η·p₀/(R_d·T)` (`column_mass_profile`, the full barometric column, is kept only for reference) |
 | oxygen | ambient O₂ density scaled with pressure/altitude |
 | fuel | biomass kg/m² (grass ~0.5–2, forest ~5–20), elevation-thinned |
-| `mass` rest state | re-derive `equilibrium_mass` as the true hydrostatic balance |
+| ambient wind | per-map prevailing `u_amb = (speed·cosθ, speed·sinθ)` [m/s], random bearing θ and speed drawn from a config range; the synoptic target the momentum drag relaxes toward (Phase 2) |
 
 **All 1016 maps in `maps/` and the 7 fixtures become invalid and must be
 regenerated.** Stamp a `units_version` field into each `.npz`; `validate_against_config`
@@ -240,9 +257,20 @@ Each phase is independently testable; we do not change everything at once.
    and `OBS_CHANNELS` normalisation (Phase 6), and the dynamics constants under
    `[convection]`/`[relaxation]`/`[fire]`/`[radiant_heat]`/`[wind]`/`[oxygen]` (Phases 2–5)
    — so stepping the SI maps is not yet physically meaningful.
-2. **Shallow-water core** — momentum + continuity + energy solver replacing
-   `transport_mass_energy` and the wind diagnostic; CFL substepping. *Riskiest phase
-   (new prognostic velocity); most test coverage.*
+2. **Shallow boundary-layer wind core** ✅ *done* — prognostic momentum (`step_dynamics`:
+   `−g′∇s` over a shallow layer + weak friction + viscosity) with conservative
+   continuity/energy/momentum advection, and an **open domain via a boundary sponge**
+   (injects `u_amb` upwind, absorbs outflow downwind). `mass` redefined as the shallow
+   boundary-layer areal mass on a level lid (`units_version → 3`, maps regenerated);
+   `mass_eq` added to `SimState` as the sponge target. `[momentum]` config
+   (`layer_depth_ref`, `reduced_gravity`, `drag_coeff`, `viscosity`, `sponge_width`,
+   `sponge_strength`, `cfl_target`). Verified terrain response: windward blocking +
+   lee/downslope acceleration (foehn pattern), flat-world holds ambient, steady until
+   perturbed; stable under strong wind / steep terrain; closed-core (sponge off) conserves
+   mass/energy/O₂. *Deferred:* radiation-relaxation, fire, oxygen physics remain pre-SI
+   (Phases 3–5); gap channeling is mild at the default `layer_depth_ref` (lower it for
+   stronger channeling); lee-separation/turbulence regime not modelled (hydraulic/foehn
+   regime instead).
 3. **Radiation** — surface energy balance replacing temperature relaxation.
 4. **Combustion** — Arrhenius + stoichiometry + `HHV`; oxygen as a real field; real
    `c_p` in fuel/air conduction.
@@ -257,9 +285,9 @@ Each phase is independently testable; we do not change everything at once.
 The design parameters are pinned (see *Resolved parameters*). What remains is numerical
 calibration done against tests inside the relevant phase, not open design questions:
 
-- **Phase 2:** tune reduced gravity `g′` and drag `C_d` so a representative `∇H` yields
-  steady winds up to ~20 m/s, and confirm the gravity-wave CFL `√(g′H)·dt/dx < 1`
-  (add substepping if not).
+- **Phase 2:** tune reduced gravity `g′` and drag `C_d` so the ambient field settles near
+  the per-map `u_amb` (prevailing 5–15 m/s) with terrain-channeled gusts toward a ~30 m/s
+  peak, and confirm the gravity-wave CFL `√(g′H)·dt/dx < 1` (add substepping if not).
 - **Phase 3:** confirm `S_net ≈ 370 W/m²` lands radiative equilibrium at `T₀`; pick
   emissivity `ε` (≈0.95) and albedo consistent with that net flux.
 - **Phase 4:** tune Arrhenius `A_pre`, `E_a` so cold fuel is inert and ignition onset

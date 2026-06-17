@@ -26,7 +26,10 @@ MAP_SUFFIX = ".npz"
 # version — including legacy maps that predate the field, which read back as 0 — are
 # rejected by validate_against_config with a regenerate hint.
 #   v1 = SI units: temperature [K], mass [kg/m^2], terrain [m], oxygen [kg/m^3], fuel [kg/m^2].
-UNITS_VERSION = 1
+#   v2 = + per-map synoptic ambient wind vector (ambient_wind_x/y) [m/s].
+#   v3 = mass is now the shallow boundary-layer areal mass (level-lid rest state), not the
+#        full hydrostatic column -- so terrain strongly channels the wind.
+UNITS_VERSION = 3
 
 # Maps live at <repo_root>/maps by default (alongside cfg/), same convention as
 # config.py. A relative maps dir is anchored here so the app finds its maps
@@ -50,7 +53,7 @@ class MapData:
 
     terrain:           np.ndarray  # (H, W)
     air_temperatures:  np.ndarray  # (H, W)
-    mass:              np.ndarray  # (H, W) column mass = surface pressure
+    mass:              np.ndarray  # (H, W) shallow boundary-layer areal mass [kg/m^2]
     oxygen:            np.ndarray  # (H, W)
     fuel:              np.ndarray  # (N, H, W)
     fuel_temperatures: np.ndarray  # (N, H, W)
@@ -61,6 +64,10 @@ class MapData:
     seed:              int | None = None
     source:            str = "unknown"
     units_version:     int = UNITS_VERSION       # field semantics version (see UNITS_VERSION)
+    # Per-map synoptic (prevailing) wind [m/s]: the spatially-uniform background the
+    # momentum drag relaxes toward. Spatially constant, so stored as two scalars.
+    ambient_wind_x:    float = 0.0
+    ambient_wind_y:    float = 0.0
 
     def __post_init__(self) -> None:
         if self.temp_eq is None:
@@ -100,6 +107,8 @@ def save_map(path: str | Path, m: MapData) -> Path:
         seed=np.int64(-1 if m.seed is None else m.seed),
         source=np.str_(m.source),
         units_version=np.int64(m.units_version),
+        ambient_wind_x=np.float64(m.ambient_wind_x),
+        ambient_wind_y=np.float64(m.ambient_wind_y),
     )
     return path
 
@@ -125,6 +134,8 @@ def load_map(path: str | Path) -> MapData:
             seed=None if seed < 0 else seed,
             source=str(data["source"]) if "source" in data else "unknown",
             units_version=units_version,
+            ambient_wind_x=float(data["ambient_wind_x"]) if "ambient_wind_x" in data else 0.0,
+            ambient_wind_y=float(data["ambient_wind_y"]) if "ambient_wind_y" in data else 0.0,
         )
 
 

@@ -20,6 +20,7 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+import physics_constants as pc          # noqa: E402
 from map_loader import MapData          # noqa: E402
 from firecracker_env import ViewMode    # noqa: E402
 from gen_maps import MapGenerator       # noqa: E402
@@ -37,18 +38,23 @@ def make_config(
     *,
     fire: bool = False,
     relaxation: bool = False,
+    momentum: dict | None = None,
 ) -> dict:
     """A minimal config with the major sinks/sources toggled for isolation.
 
-    Convection/wind/oxygen use their code defaults. Each named fuel type gets a
-    subtable so Simulation parses matching fuel_type_names (the rest default).
+    The momentum core uses its code defaults unless `momentum` overrides are given
+    (e.g. {"sponge_strength": 0.0, "drag_coeff": 0.0} for a closed, conservative core).
+    Each named fuel type gets a subtable so Simulation parses matching fuel_type_names.
     """
-    return {
+    config = {
         "environment": {"grid_size": grid_size, "window_size": grid_size, "max_steps": 10_000},
         "fire": {"enabled": fire, "spawn_fire": False},
         "relaxation": {"enabled": relaxation},
         "fuel_types": {name: {"ignition_threshold": 1.5} for name in fuel_type_names},
     }
+    if momentum is not None:
+        config["momentum"] = dict(momentum)
+    return config
 
 
 def build_map(
@@ -61,11 +67,13 @@ def build_map(
     oxygen: np.ndarray | float | None = None,
     fuel: np.ndarray | None = None,
     fuel_temperatures: np.ndarray | None = None,
+    ambient_wind: tuple[float, float] = (0.0, 0.0),
 ) -> MapData:
     """Build a MapData from explicit fields; anything omitted defaults to uniform.
 
     Scalars for air/mass/oxygen are broadcast to a full field, so a test can write
-    e.g. air=0.5 and override just the cells it cares about.
+    e.g. air=0.5 and override just the cells it cares about. ambient_wind is the
+    per-map synoptic wind vector (x, y) [m/s].
     """
     n = len(fuel_type_names)
     shape = (grid_size, grid_size)
@@ -96,6 +104,8 @@ def build_map(
         fuel_temperatures=fuel_temperatures,
         fuel_type_names=list(fuel_type_names),
         grid_size=grid_size,
+        ambient_wind_x=float(ambient_wind[0]),
+        ambient_wind_y=float(ambient_wind[1]),
     )
 
 
@@ -179,6 +189,55 @@ def equilibrium():
 def off_equilibrium():
     terrain = ramp_terrain(DEFAULT_GRID)
     return make_config(), build_map(terrain=terrain, air=0.5, mass=1.0)
+
+
+# ---------------------------------------------------------------------------
+# SI scenario builders (Phase 2 shallow-water core) -> (config, MapData)
+# ---------------------------------------------------------------------------
+
+def _si_state(terrain_m: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """SI air temperature [K], boundary-layer mass [kg/m^2] and oxygen [kg/m^3] for terrain [m]."""
+    gen = MapGenerator(make_config(terrain_m.shape[0]))
+    air = gen.air_temperature_profile(terrain_m)
+    return air, gen.boundary_layer_mass(terrain_m), gen.oxygen_profile(terrain_m, air)
+
+
+def si_flat(grid: int = DEFAULT_GRID, ambient: tuple[float, float] = (0.0, 0.0),
+            elevation_m: float = 0.0):
+    """Flat SI world at one elevation, with a uniform synoptic wind."""
+    terrain = np.full((grid, grid), float(elevation_m), dtype=np.float32)
+    air, mass, oxygen = _si_state(terrain)
+    return make_config(grid), build_map(grid, terrain=terrain, air=air, mass=mass,
+                                        oxygen=oxygen, ambient_wind=ambient)
+
+
+def gaussian_hill(grid: int, peak_m: float) -> np.ndarray:
+    """A single centred Gaussian hill of height peak_m [m]."""
+    rows, cols = np.ogrid[:grid, :grid]
+    c = grid / 2.0
+    r2 = ((rows - c) ** 2 + (cols - c) ** 2) / (2.0 * (grid / 5.0) ** 2)
+    return (peak_m * np.exp(-r2)).astype(np.float32)
+
+
+def si_hill(grid: int = DEFAULT_GRID, ambient: tuple[float, float] = (12.0, 4.0),
+            peak_m: float = 400.0):
+    """SI world with a Gaussian hill (terrain in metres) and a synoptic wind."""
+    terrain = gaussian_hill(grid, peak_m)
+    air, mass, oxygen = _si_state(terrain)
+    return make_config(grid), build_map(grid, terrain=terrain, air=air, mass=mass,
+                                        oxygen=oxygen, ambient_wind=ambient)
+
+
+def si_ridge(grid: int = DEFAULT_GRID, ambient: tuple[float, float] = (15.0, 0.0),
+             peak_m: float = 400.0):
+    """SI world with a ridge running across the x-wind (terrain varies in x only)."""
+    cols = np.arange(grid)
+    c = grid / 2.0
+    profile = peak_m * np.exp(-((cols - c) ** 2) / (2.0 * (grid / 8.0) ** 2))
+    terrain = np.tile(profile.astype(np.float32), (grid, 1))
+    air, mass, oxygen = _si_state(terrain)
+    return make_config(grid), build_map(grid, terrain=terrain, air=air, mass=mass,
+                                        oxygen=oxygen, ambient_wind=ambient)
 
 
 # name -> (builder, view modes to render, timesteps to capture, description)

@@ -29,14 +29,18 @@ def _batched_state(sim: Simulation, maps) -> SimState:
         return torch.as_tensor(arr, dtype=sim.dtype, device=sim.device)
 
     mass, terrain, air = stack("mass"), stack("terrain"), stack("air_temperatures")
-    x_wind, y_wind = sim.compute_wind_from_pressure(mass)
+    # Per-world ambient wind (B, 1, 1); prognostic wind starts at the ambient.
+    u_amb_x = torch.as_tensor([m.ambient_wind_x for m in maps], dtype=sim.dtype, device=sim.device).view(-1, 1, 1)
+    u_amb_y = torch.as_tensor([m.ambient_wind_y for m in maps], dtype=sim.dtype, device=sim.device).view(-1, 1, 1)
+    x_wind, y_wind = torch.zeros_like(mass) + u_amb_x, torch.zeros_like(mass) + u_amb_y
     return SimState(
         mass=mass, air_temperatures=air,
         fuel_temperatures=stack("fuel_temperatures"), fuel=stack("fuel"),
         oxygen=stack("oxygen"), terrain=terrain,
-        temp_eq=stack("temp_eq"), oxygen_eq=stack("oxygen_eq"),
+        temp_eq=stack("temp_eq"), oxygen_eq=stack("oxygen_eq"), mass_eq=mass.clone(),
         temp_relax_rate=sim.temperature_relax_rate(terrain),
-        x_wind_vel=x_wind, y_wind_vel=y_wind, radiant_flux=torch.zeros_like(mass),
+        x_wind_vel=x_wind, y_wind_vel=y_wind,
+        u_amb_x=u_amb_x, u_amb_y=u_amb_y, radiant_flux=torch.zeros_like(mass),
     )
 
 
@@ -84,9 +88,13 @@ def test_uniform_world_unaffected_by_batchmate():
 
 
 def test_batched_conserves_mass_energy_per_world():
-    """Each world in a batch independently conserves mass, energy, and oxygen."""
+    """Each world in a batch independently conserves mass, energy, and oxygen.
+
+    Uses the closed core (no edge sponge / friction) so the totals are conserved; this
+    checks the batched advection is per-world independent and conservative.
+    """
     maps = [hot_blob()[1], mass_gradient()[1], off_equilibrium()[1]]
-    sim = Simulation(make_config())
+    sim = Simulation(make_config(momentum={"sponge_strength": 0.0, "drag_coeff": 0.0}))
     s = _batched_state(sim, maps)
 
     axes = (-2, -1)   # reduce each world's H, W, leaving the batch axis

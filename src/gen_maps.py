@@ -47,6 +47,15 @@ class MapGenerator:
         # Environmental lapse rate [K/m]: air temperature falls T_REF - rate*elevation.
         self.temperature_lapse_rate = float(terrain.get("temperature_lapse_rate", pc.LAPSE_RATE))
 
+        # Per-map synoptic wind: speed [m/s] drawn uniformly from this range, random bearing.
+        wind = (cfg or {}).get("wind", {})
+        self.ambient_speed_min = float(wind.get("ambient_speed_min",  5.0))
+        self.ambient_speed_max = float(wind.get("ambient_speed_max", 15.0))
+
+        # Free-stream depth of the modelled boundary layer [m]; sets the level-lid rest state.
+        momentum = (cfg or {}).get("momentum", {})
+        self.layer_depth_ref = float(momentum.get("layer_depth_ref", 1000.0))
+
         # Convection params are dynamics knobs, but the *initial* pressure is the
         # rest state of those dynamics, so the generator reads them too.
         convection = (cfg or {}).get("convection", {})
@@ -171,6 +180,22 @@ class MapGenerator:
         """Hydrostatic column mass per area [kg/m^2]: m = p / g (weight of the air column)."""
         return (self.pressure_profile(elevation_m) / pc.GRAVITY).astype(np.float32)
 
+    def boundary_layer_mass(self, elevation_m: np.ndarray) -> np.ndarray:
+        """Level-lid boundary-layer mass per area [kg/m^2] -- the shallow-water rest state.
+
+        The modelled layer is a shallow near-surface layer, not the whole column. At rest its
+        free surface s = terrain + h is level, so the layer is thinner over high terrain:
+            h(z) = h_ref + (elev_max - z)        (depth, >= h_ref)
+        The areal mass that gives that hydrostatic thickness (eta = m*R_d*T/p_ref = h) is
+            m = h * p_ref / (R_d * T(z)).
+        Making the layer shallow (h ~ O(km), comparable to terrain) is what lets continuity
+        speed the wind up over crests and channel it through gaps.
+        """
+        lid = self.elev_max + self.layer_depth_ref            # level free-surface height [m]
+        h = lid - elevation_m                                  # layer depth [m]
+        T = self.air_temperature_profile(elevation_m)
+        return (h * pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * T)).astype(np.float32)
+
     def oxygen_profile(self, elevation_m: np.ndarray, air_temperatures: np.ndarray) -> np.ndarray:
         """Ambient O2 partial density [kg/m^3] = O2 mass fraction * air density p/(R_d*T)."""
         air_density = self.pressure_profile(elevation_m) / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures)
@@ -253,8 +278,14 @@ def generate_map(
     # Each fuel type starts at ambient air temperature.
     fuel_temperatures = np.tile(air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)
 
-    # Column mass at its hydrostatic rest state (weight of the air column above each cell).
-    mass = gen.column_mass_profile(terrain)
+    # Shallow boundary-layer mass at its level-lid rest state (thinner over high terrain).
+    mass = gen.boundary_layer_mass(terrain)
+
+    # Per-map synoptic (prevailing) wind: random bearing, speed from the configured range.
+    speed = float(rng.uniform(gen.ambient_speed_min, gen.ambient_speed_max))
+    bearing = float(rng.uniform(0.0, 2.0 * np.pi))
+    ambient_wind_x = speed * np.cos(bearing)
+    ambient_wind_y = speed * np.sin(bearing)
 
     return MapData(
         terrain=terrain,
@@ -269,6 +300,8 @@ def generate_map(
         oxygen_eq=oxygen.copy(),
         seed=seed,
         source="gen_maps",
+        ambient_wind_x=ambient_wind_x,
+        ambient_wind_y=ambient_wind_y,
     )
 
 

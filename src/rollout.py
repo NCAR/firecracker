@@ -138,6 +138,7 @@ class BatchedRollout:
         """(Re)load `B` worlds from the maps dir and build the batched simulation state."""
         fields = {k: [] for k in ("terrain", "air_temperatures", "temp_eq", "oxygen",
                                   "oxygen_eq", "mass", "fuel", "fuel_temperatures")}
+        amb_x, amb_y = [], []
         for _ in range(self.num_envs):
             # Sample with replacement so num_envs can exceed the number of map files.
             path = resolve_map(self._maps_dir, None, self._np_rng)
@@ -145,6 +146,8 @@ class BatchedRollout:
             validate_against_config(m, self.grid_size, self._sim.fuel_type_names)
             for k in fields:
                 fields[k].append(getattr(m, k))
+            amb_x.append(m.ambient_wind_x)
+            amb_y.append(m.ambient_wind_y)
 
         def stack(name: str) -> torch.Tensor:
             arr = np.stack(fields[name])   # leading axis becomes the batch axis B
@@ -153,7 +156,14 @@ class BatchedRollout:
         terrain = stack("terrain")
         mass    = stack("mass")
         air     = stack("air_temperatures")
-        x_wind, y_wind = self._sim.compute_wind_from_pressure(mass)
+        # Per-world synoptic ambient wind, shaped (B, 1, 1) to broadcast against (B, H, W).
+        def amb(values: list) -> torch.Tensor:
+            return torch.as_tensor(values, dtype=self._sim.dtype, device=self._sim.device).view(-1, 1, 1)
+        u_amb_x, u_amb_y = amb(amb_x), amb(amb_y)
+        # Prognostic wind starts at the ambient (broadcast to full fields) so each world
+        # begins near its steady state.
+        x_wind = torch.zeros_like(mass) + u_amb_x
+        y_wind = torch.zeros_like(mass) + u_amb_y
 
         self._state = SimState(
             mass=mass,
@@ -164,9 +174,12 @@ class BatchedRollout:
             terrain=terrain,
             temp_eq=stack("temp_eq"),
             oxygen_eq=stack("oxygen_eq"),
+            mass_eq=mass.clone(),
             temp_relax_rate=self._sim.temperature_relax_rate(terrain),
             x_wind_vel=x_wind,
             y_wind_vel=y_wind,
+            u_amb_x=u_amb_x,
+            u_amb_y=u_amb_y,
             radiant_flux=torch.zeros_like(mass),
         )
         if self._spawn_fire:

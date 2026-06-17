@@ -1,67 +1,48 @@
 """
-Conservation invariants of the full step() pipeline.
+Conservation of the advection core (Phase 2).
 
-All scenarios here run with fire and relaxation disabled and zero fuel, so the
-only active physics is convective transport, diffusion, and oxygen advection —
-the parts that claim *exact* conservation under no-flux walls. The same
-scenarios are rendered by tools/visualize.py.
+The full model uses open (sponge) boundaries, which deliberately add/remove air at the
+edges, so domain totals are NOT conserved in normal operation. To test the conservative
+advection scheme in isolation we close the domain: with the boundary sponge and surface
+friction off, the solver is pure periodic shallow-water transport, which conserves mass,
+energy (sum m*c_p*T) and oxygen to round-off.
 """
 
 import numpy as np
 
-from conftest import to_numpy, total_air_energy, total_mass, total_oxygen
-from scenarios import corner_blob, hot_blob, oxygen_saturation, uniform
+import physics_constants as pc
+from conftest import DEFAULT_GRID, make_config, to_numpy
+from scenarios import si_hill
+
+CP = pc.CP_AIR
+CLOSED = {"sponge_strength": 0.0, "drag_coeff": 0.0}   # no edge sponge, no friction -> closed
 
 
-def test_uniform_field_is_stationary(make_env):
-    """With no gradients anywhere, nothing should move: the step is a no-op."""
-    env = make_env(*uniform())
+def _totals(env):
+    m = env._mass
+    return (float(m.sum()), float((m * CP * env._air_temperatures).sum()), float(env._oxygen.sum()))
 
-    before = (to_numpy(env._mass), to_numpy(env._air_temperatures), to_numpy(env._oxygen))
-    for _ in range(5):
+
+def test_closed_core_conserves(make_env):
+    """Closed (periodic) core: mass, energy and oxygen are conserved as the wind stirs them."""
+    _, m = si_hill(ambient=(12.0, 4.0))
+    env = make_env(make_config(DEFAULT_GRID, momentum=CLOSED), m)
+
+    m0, e0, o0 = _totals(env)
+    for _ in range(50):
         env.step(0)
-
-    np.testing.assert_allclose(to_numpy(env._mass), before[0], atol=1e-6)
-    np.testing.assert_allclose(to_numpy(env._air_temperatures), before[1], atol=1e-6)
-    np.testing.assert_allclose(to_numpy(env._oxygen), before[2], atol=1e-6)
-
-
-def test_transport_conserves_mass_and_energy(make_env):
-    """A hot blob convects and diffuses, but total mass and energy are preserved."""
-    env = make_env(*hot_blob())
-
-    m0, e0 = total_mass(env), total_air_energy(env)
-    for _ in range(25):
-        env.step(0)
+    m1, e1, o1 = _totals(env)
 
     assert np.isfinite(to_numpy(env._air_temperatures)).all()
-    np.testing.assert_allclose(total_mass(env), m0, rtol=1e-4)
-    np.testing.assert_allclose(total_air_energy(env), e0, rtol=1e-4)
+    np.testing.assert_allclose(m1, m0, rtol=1e-9)
+    np.testing.assert_allclose(e1, e0, rtol=1e-6)
+    np.testing.assert_allclose(o1, o0, rtol=1e-9)
 
 
-def test_no_flux_walls_lose_nothing(make_env):
-    """A hot blob jammed into a corner must not leak through the boundary.
-
-    Conservation of the total *is* the no-flux test: if the walls leaked, the
-    totals would drop.
-    """
-    env = make_env(*corner_blob())
-
-    m0, e0 = total_mass(env), total_air_energy(env)
-    for _ in range(40):
+def test_closed_core_keeps_mass_positive(make_env):
+    """The conservative upwind transport never drives the layer mass negative."""
+    _, m = si_hill(ambient=(15.0, 6.0), peak_m=500.0)
+    env = make_env(make_config(DEFAULT_GRID, momentum=CLOSED), m)
+    for _ in range(50):
         env.step(0)
-
-    np.testing.assert_allclose(total_mass(env), m0, rtol=1e-4)
-    np.testing.assert_allclose(total_air_energy(env), e0, rtol=1e-4)
-
-
-def test_oxygen_advection_conserves_and_saturates(make_env):
-    """Oxygen advecting into already-full cells stays conserved and capped at 1.0."""
-    env = make_env(*oxygen_saturation())
-
-    o0 = total_oxygen(env)
-    for _ in range(20):
-        env.step(0)
-
-    assert float(env._oxygen.max()) <= 1.0 + 1e-6
-    np.testing.assert_allclose(total_oxygen(env), o0, rtol=1e-4)
+    assert float(env._mass.min()) > 0.0

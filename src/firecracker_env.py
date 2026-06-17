@@ -365,8 +365,11 @@ class FirecrackerEnv(gymnasium.Env):
         self._y_wind_vel: np.ndarray | None = None
         self._fuel: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
-        self._mass: np.ndarray | None = None   # column mass = surface pressure
+        self._mass: np.ndarray | None = None   # boundary-layer areal mass [kg/m^2]
+        self._mass_eq: torch.Tensor | None = None   # rest-state mass (open-boundary sponge target)
         self._terrain: np.ndarray | None = None
+        self._u_amb_x: torch.Tensor | None = None   # synoptic ambient wind [m/s]
+        self._u_amb_y: torch.Tensor | None = None
         # Relaxation targets (initial profiles) and per-cell temperature rate.
         self._temp_eq: np.ndarray | None = None
         self._oxygen_eq: np.ndarray | None = None
@@ -432,13 +435,19 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen            = self._to_tensor(m.oxygen)
         self._oxygen_eq         = self._to_tensor(m.oxygen_eq)
         self._mass              = self._to_tensor(m.mass)
+        self._mass_eq           = self._mass.clone()   # level-lid rest state -> sponge target
         self._fuel              = self._to_tensor(m.fuel)
         self._fuel_temperatures = self._to_tensor(m.fuel_temperatures)
 
         # Recompute the cheap dynamics-derived fields from the loaded state so the
-        # relaxation/wind knobs stay live without having to regenerate maps.
+        # relaxation knobs stay live without having to regenerate maps.
         self._temp_relax_rate = self._sim.temperature_relax_rate(self._terrain)
-        self._x_wind_vel, self._y_wind_vel = self._sim.compute_wind_from_pressure(self._mass)
+        # Per-map synoptic ambient wind: the momentum drag relaxes toward it, and the
+        # prognostic wind is initialised to it so the world starts near its steady state.
+        self._u_amb_x = self._to_tensor(np.float32(m.ambient_wind_x))
+        self._u_amb_y = self._to_tensor(np.float32(m.ambient_wind_y))
+        self._x_wind_vel = torch.full_like(self._mass, float(m.ambient_wind_x))
+        self._y_wind_vel = torch.full_like(self._mass, float(m.ambient_wind_y))
 
         # Terrain is static for the episode, so reduce its stats once here (one host
         # transfer) instead of re-syncing them every step in _build_info.
@@ -620,9 +629,12 @@ class FirecrackerEnv(gymnasium.Env):
             terrain=self._terrain,
             temp_eq=self._temp_eq,
             oxygen_eq=self._oxygen_eq,
+            mass_eq=self._mass_eq,
             temp_relax_rate=self._temp_relax_rate,
             x_wind_vel=self._x_wind_vel,
             y_wind_vel=self._y_wind_vel,
+            u_amb_x=self._u_amb_x,
+            u_amb_y=self._u_amb_y,
             radiant_flux=self._last_radiant_flux,
         )
 

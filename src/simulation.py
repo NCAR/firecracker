@@ -43,9 +43,12 @@ class SimState:
     terrain:           torch.Tensor
     temp_eq:           torch.Tensor   # temperature relaxation target
     oxygen_eq:         torch.Tensor   # oxygen replenishment target
+    mass_eq:           torch.Tensor   # boundary-layer rest mass (the open-boundary sponge target)
     temp_relax_rate:   torch.Tensor   # per-cell radiative relaxation rate
-    x_wind_vel:        torch.Tensor
-    y_wind_vel:        torch.Tensor
+    x_wind_vel:        torch.Tensor   # prognostic wind velocity u [m/s]
+    y_wind_vel:        torch.Tensor   # prognostic wind velocity v [m/s]
+    u_amb_x:           torch.Tensor   # per-world synoptic ambient wind [m/s], broadcastable to (..., H, W)
+    u_amb_y:           torch.Tensor
     radiant_flux:      torch.Tensor   # last per-cell absorbed radiant flux (diagnostic)
 
 
@@ -59,7 +62,6 @@ def _resolve_device(name: str | None) -> torch.device:
 class Simulation:
     def __init__(self, cfg: dict | None = None):
         sim    = (cfg or {}).get("simulation", {})
-        wind   = (cfg or {}).get("wind", {})
         oxygen = (cfg or {}).get("oxygen", {})
         fire   = (cfg or {}).get("fire", {})
         env    = (cfg or {}).get("environment", {})
@@ -81,11 +83,7 @@ class Simulation:
         self.cell_size_m: float = float(units.get("cell_size_m", pc.DEFAULT_CELL_SIZE_M))
         self.dt:          float = 1.0 / self.simulation_steps_per_second
 
-        self.wind_smooth_sigma:       float = float(wind.get("smooth_sigma",       2.0))
-        self.wind_temporal_smoothing: float = float(wind.get("temporal_smoothing", 0.2))
-
         self.oxygen_diffusion_sigma:    float = float(oxygen.get("diffusion_sigma",    3.0))
-        self.oxygen_advection_strength: float = float(oxygen.get("advection_strength", 3.0))
 
         relaxation = (cfg or {}).get("relaxation", {})
 
@@ -96,16 +94,18 @@ class Simulation:
         self.temperature_rate_high: float = float(relaxation.get("temperature_rate_high", 0.30))
         self.oxygen_rate:           float = float(relaxation.get("oxygen_rate",           0.05))
 
-        convection = (cfg or {}).get("convection", {})
-
-        # Single-layer mass/energy convection. Surface pressure is the column mass m;
-        # the column height H = gamma*terrain + m*(1 + alpha*T) is taller for warm/high
-        # columns. Mass and energy flow down the transport potential Phi = c_p*m + c_b*H,
-        # so both the pressure gradient and the height gradient drive the air.
-        self.thermal_expansion:    float = float(convection.get("thermal_expansion",    0.5))
-        self.terrain_height_scale: float = float(convection.get("terrain_height_scale", 0.5))
-        self.buoyancy_transport_rate: float = float(convection.get("buoyancy_transport_rate", 0.1))
-        self.pressure_transport_rate: float = float(convection.get("pressure_transport_rate", 0.1))
+        # Phase 2 shallow-water momentum core. Wind is prognostic [m/s]; drag relaxes it
+        # toward the per-map synoptic ambient wind, the column-top height gradient
+        # (H = terrain + eta, eta = m*R_d*T/p_ref) forces it, eddy viscosity smooths it.
+        momentum = (cfg or {}).get("momentum", {})
+        self.layer_depth_ref: float = float(momentum.get("layer_depth_ref", 1000.0))
+        self.reduced_gravity: float = float(momentum.get("reduced_gravity", 0.2))
+        self.drag_coeff:      float = float(momentum.get("drag_coeff",      0.0005))
+        self.viscosity:       float = float(momentum.get("viscosity",       50.0))
+        self.sponge_width:    int   = int(momentum.get("sponge_width",      8))
+        self.sponge_strength: float = float(momentum.get("sponge_strength", 10.0))
+        self.cfl_target:      float = float(momentum.get("cfl_target",      0.5))
+        self._sponge_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         self.fire_enabled:                bool  = bool(fire.get("enabled", True))
         self.oxygen_consumption_rate:     float = float(fire.get("oxygen_consumption_rate",     0.01))
@@ -166,23 +166,6 @@ class Simulation:
         x = F.pad(field.reshape(-1, 1, h, w), (1, 1, 1, 1), mode="replicate")
         return F.conv2d(x, self._laplace_kernel).reshape(*lead, h, w)
 
-    def _gaussian_blur(self, field: torch.Tensor, sigma: float) -> torch.Tensor:
-        # Separable Gaussian smoothing (used only for the diagnostic wind field). The
-        # 1-D kernel is truncated at 4 sigma to match scipy.ndimage.gaussian_filter's
-        # default radius; reflect padding keeps the edges smooth.
-        if sigma <= 0.0:
-            return field
-        radius = max(1, int(4.0 * sigma + 0.5))
-        coords = torch.arange(-radius, radius + 1, dtype=self.dtype, device=self.device)
-        k = torch.exp(-0.5 * (coords / sigma) ** 2)
-        k = k / k.sum()
-        # Rank-agnostic: fold any leading dims into the conv batch axis (see _laplace).
-        *lead, h, w = field.shape
-        x = field.reshape(-1, 1, h, w)
-        x = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="reflect"), k.view(1, 1, 1, -1))
-        x = F.conv2d(F.pad(x, (0, 0, radius, radius), mode="reflect"), k.view(1, 1, -1, 1))
-        return x.reshape(*lead, h, w)
-
     def _radiant_convolve(self, field: torch.Tensor) -> torch.Tensor:
         # Inverse-square redistribution. conv2d with zero padding sized to keep the
         # output the same shape drops energy that lands off the grid — the same
@@ -211,18 +194,6 @@ class Simulation:
         kernel = kernel / kernel.sum()
         return kernel.view(1, 1, size, size)
 
-    def _advect_and_diffuse_field(
-        self,
-        field: torch.Tensor,
-        x_vel: torch.Tensor,
-        y_vel: torch.Tensor,
-        sigma: float,
-        saturate: bool = False,
-    ) -> torch.Tensor:
-        # Operator splitting: conservative flux advection, then conservative diffusion.
-        result = self._advect_field(field, x_vel, y_vel, saturate)
-        return self._diffuse(result, sigma)
-
     def _diffuse(self, field: torch.Tensor, sigma: float) -> torch.Tensor:
         # Explicit Laplacian diffusion with no-flux (reflect) boundaries. The
         # discrete Laplacian sums to zero under reflect, so this conserves the total
@@ -239,135 +210,130 @@ class Simulation:
         return result
 
     @staticmethod
-    def _advect_upwind(
-        field: torch.Tensor, x_vel: torch.Tensor, y_vel: torch.Tensor, saturate: bool = False
-    ) -> torch.Tensor:
-        # One CFL-safe (<= 1 cell) first-order upwind step with no-flux walls.
-        # Each shared face flux is added to one neighbour and subtracted from the
-        # other, so the interior total is conserved exactly (telescoping sum).
-        # All slices index the trailing (row, col) axes via ellipsis, so this works on
-        # 2-D fields and on batched (B, H, W) stacks identically.
-        uf = 0.5 * (x_vel[..., :-1] + x_vel[..., 1:])   # x-velocity on interior vertical faces
-        fx = uf.clamp(min=0.0) * field[..., :-1] + uf.clamp(max=0.0) * field[..., 1:]
-        vf = 0.5 * (y_vel[..., :-1, :] + y_vel[..., 1:, :])   # y-velocity on interior horizontal faces
-        fy = vf.clamp(min=0.0) * field[..., :-1, :] + vf.clamp(max=0.0) * field[..., 1:, :]
-
-        if saturate:
-            # Saturation: a cell at capacity (1.0) cannot accept more; the rejected
-            # flux stays in the upstream cell. Scale each face flux by the acceptance
-            # ratio of its destination cell. This conserves (flux still added once /
-            # subtracted once) while keeping every cell <= 1.0.
-            inflow = torch.zeros_like(field)
-            inflow[..., 1:]  += fx.clamp(min=0.0)     # fx > 0 flows into the right cell
-            inflow[..., :-1] += (-fx).clamp(min=0.0)  # fx < 0 flows into the left cell
-            inflow[..., 1:, :]  += fy.clamp(min=0.0)
-            inflow[..., :-1, :] += (-fy).clamp(min=0.0)
-            capacity = (1.0 - field).clamp(min=0.0)
-            accept = torch.where(
-                inflow > 0.0,
-                (capacity / inflow.clamp(min=1e-12)).clamp(max=1.0),
-                torch.ones_like(inflow),
-            )
-            fx = fx * torch.where(fx > 0.0, accept[..., 1:], accept[..., :-1])
-            fy = fy * torch.where(fy > 0.0, accept[..., 1:, :], accept[..., :-1, :])
-
-        out = field.clone()
-        out[..., :-1] -= fx
-        out[..., 1:]  += fx
-        out[..., :-1, :] -= fy
-        out[..., 1:, :]  += fy
-        return out
-
-    def _advect_field(
-        self, field: torch.Tensor, x_vel: torch.Tensor, y_vel: torch.Tensor, saturate: bool = False
-    ) -> torch.Tensor:
-        # CFL-adaptive substepping: split the displacement so each upwind substep
-        # moves at most one cell, then apply it that many times.
-        max_disp = float(x_vel.abs().max() + y_vel.abs().max())
-        n = max(1, int(math.ceil(max_disp)))
-        sx, sy = x_vel / n, y_vel / n
-        result = field
-        for _ in range(n):
-            result = self._advect_upwind(result, sx, sy, saturate)
-        return result
-
-    @staticmethod
     def compute_air_temperature(air_temperatures: torch.Tensor) -> float:
         return float(air_temperatures.mean())
 
+    # ---------------------------------------------------------------------------
+    # Shallow-water momentum core (Phase 2) — periodic stencils + solver
+    # ---------------------------------------------------------------------------
+
     @staticmethod
-    def _phi_diffuse_step(
-        mass: torch.Tensor, energy: torch.Tensor, phi: torch.Tensor, dt: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # One conservative substep of relaxational diffusion: each face carries a
-        # down-gradient flux F = -q_face * (Phi[R] - Phi[L]) of mass and energy, with the
-        # face quantity q_face taken as the *arithmetic mean* of the two cells. Centered
-        # (not upwind), because this is diffusion, not advection — the "velocity" is the
-        # potential gradient itself. Each face flux is added to one neighbour and
-        # subtracted from the other (telescoping), so both totals are conserved under
-        # no-flux walls.
-        # All slices index the trailing (row, col) axes via ellipsis, so this works on
-        # 2-D fields and on batched (B, H, W) stacks identically.
-        dphix = phi[..., 1:] - phi[..., :-1]    # Phi[R] - Phi[L] across vertical faces
-        dphiy = phi[..., 1:, :] - phi[..., :-1, :]
-        mfx = 0.5 * (mass[..., :-1] + mass[..., 1:]) * dphix * dt    # flux L -> R (sign folded in)
-        efx = 0.5 * (energy[..., :-1] + energy[..., 1:]) * dphix * dt
-        mfy = 0.5 * (mass[..., :-1, :] + mass[..., 1:, :]) * dphiy * dt
-        efy = 0.5 * (energy[..., :-1, :] + energy[..., 1:, :]) * dphiy * dt
+    def _periodic_grad(field: torch.Tensor, dx: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Centered first derivatives [per metre] with periodic wrap on the trailing axes."""
+        gx = (torch.roll(field, -1, dims=-1) - torch.roll(field, 1, dims=-1)) / (2.0 * dx)
+        gy = (torch.roll(field, -1, dims=-2) - torch.roll(field, 1, dims=-2)) / (2.0 * dx)
+        return gx, gy
 
-        m, e = mass.clone(), energy.clone()
-        # Down-gradient: a cell loses to lower-Phi neighbours. dphix>0 means the right cell
-        # is higher, so flux runs R -> L: the left cell gains (+), the right loses (-).
-        m[..., :-1] += mfx; m[..., 1:] -= mfx
-        e[..., :-1] += efx; e[..., 1:] -= efx
-        m[..., :-1, :] += mfy; m[..., 1:, :] -= mfy
-        e[..., :-1, :] += efy; e[..., 1:, :] -= efy
-        return m, e
+    @staticmethod
+    def _periodic_laplacian(field: torch.Tensor, dx: float) -> torch.Tensor:
+        """5-point Laplacian [per m^2] with periodic wrap on the trailing axes."""
+        return (
+            torch.roll(field, 1, dims=-1) + torch.roll(field, -1, dims=-1)
+            + torch.roll(field, 1, dims=-2) + torch.roll(field, -1, dims=-2)
+            - 4.0 * field
+        ) / (dx * dx)
 
-    def transport_mass_energy(
-        self,
-        mass: torch.Tensor,
-        energy: torch.Tensor,
-        terrain: torch.Tensor,
-        air_temperatures: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convective transport: relax mass and energy down the transport-potential gradient.
+    @staticmethod
+    def _advect_periodic(phi: torch.Tensor, dispx: torch.Tensor, dispy: torch.Tensor) -> torch.Tensor:
+        """One conservative first-order upwind advection substep of a density field, periodic.
 
-        Phi = c_p*m + c_b*H, H = gamma*terrain + m*(1 + alpha*T). Since m*(1+alpha*T) =
-        m + alpha*E, Phi is linear in the conserved fields: Phi = (c_p+c_b)*m + c_b*alpha*E
-        + c_b*gamma*terrain. Mass and energy are carried by the same down-gradient flux
-        F = -q * grad(Phi). This is relaxational *diffusion* (the flow vanishes where Phi is
-        uniform), so it is discretised with a conservative centered finite-volume flux —
-        face quantities are arithmetic means, which couples neighbours directly without the
-        odd/even checkerboard a cell-centred central-difference velocity produces.
-
-        Stability is the explicit-diffusion limit (diffusion number <~ 0.25 in 2D), which is
-        far stricter than an advective CFL: with the local diffusivity D = q * dPhi/dq =
-        (c_p+c_b)*m + c_b*alpha*E, the substep count is sized so dt*D stays well under the
-        limit at every cell. Both totals are conserved exactly (no-flux walls); under that
-        step the centered diffusion is monotone, so mass stays non-negative.
+        dispx/dispy are the per-substep displacements in CELLS (velocity * dt / dx) and must
+        be <= 1 in magnitude for CFL stability. Each signed face flux is added to one
+        neighbour and subtracted from the other (a telescoping sum over the periodic ring),
+        so the total of phi is conserved exactly. Rank-agnostic via trailing-axis rolls.
         """
-        c_p, c_b = self.pressure_transport_rate, self.buoyancy_transport_rate
-        gamma, alpha = self.terrain_height_scale, self.thermal_expansion
-        terrain_term = c_b * gamma * terrain
+        # x-faces: face i sits between cell i and its +1 neighbour (wrapping at the edge).
+        uf = 0.5 * (dispx + torch.roll(dispx, -1, dims=-1))
+        flux = uf * torch.where(uf > 0, phi, torch.roll(phi, -1, dims=-1))   # signed flux i -> i+1
+        phi = phi + torch.roll(flux, 1, dims=-1) - flux                       # gain from left, lose to right
+        # y-faces.
+        vf = 0.5 * (dispy + torch.roll(dispy, -1, dims=-2))
+        flux = vf * torch.where(vf > 0, phi, torch.roll(phi, -1, dims=-2))
+        phi = phi + torch.roll(flux, 1, dims=-2) - flux
+        return phi
 
-        def phi_of(m: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
-            return (c_p + c_b) * m + c_b * alpha * e + terrain_term
+    def _sponge_rate(self, shape: tuple[int, int]) -> torch.Tensor:
+        """Boundary relaxation-rate field [1/s], (H, W): peak at the edges, 0 in the interior.
 
-        # Local diffusivity D = q * dPhi/dq = (c_p+c_b)*m + c_b*alpha*E. Explicit 2D
-        # diffusion is stable for dt*D below ~0.25 per axis; use a safety factor of 8 so a
-        # cell's worst-case coupling across all four faces stays well within bounds.
-        diffusivity = max(0.0, float(((c_p + c_b) * mass + c_b * alpha * energy).max()))
-        n = max(1, int(math.ceil(8.0 * diffusivity)))
-        dt = 1.0 / n
+        Implements the open domain: within sponge_width cells of any edge the wind/mass are
+        relaxed toward the free-stream (inflow) and outgoing disturbances are absorbed (outflow),
+        with a smooth quadratic taper so there is no sharp interface to reflect off. Cached per
+        grid shape.
+        """
+        key = shape
+        cached = self._sponge_cache.get(key)
+        if cached is not None:
+            return cached
+        h, w = shape
+        rows = torch.arange(h, device=self.device).view(-1, 1)
+        cols = torch.arange(w, device=self.device).view(1, -1)
+        d = torch.minimum(torch.minimum(rows, (h - 1) - rows), torch.minimum(cols, (w - 1) - cols))
+        width = max(1, self.sponge_width)
+        taper = (1.0 - d.to(self.dtype) / width).clamp(min=0.0) ** 2   # 1 at edge -> 0 at width
+        rate = (self.sponge_strength * taper).to(self.dtype)
+        self._sponge_cache[key] = rate
+        return rate
+
+    def step_dynamics(self, s: SimState) -> SimState:
+        """Advance the prognostic wind, boundary-layer mass and air energy one tick.
+
+        Shallow boundary-layer atmosphere over terrain: the wind is forced by the free-surface
+        gradient (s = terrain + eta, eta = m*R_d*T/p_ref) and smoothed by viscosity, with only
+        weak interior surface friction; mass, energy (E = m*c_p*T) and momentum are advected
+        conservatively by that wind. Because the layer is shallow, terrain squeezes it, so
+        continuity speeds the wind over crests and channels it through gaps. A boundary sponge
+        relaxes the edges toward the per-map synoptic wind and the rest-state mass, making the
+        domain open (inflow upwind, outflow downwind). CFL-substepped on the advective +
+        gravity-wave speed. Rank-agnostic (single world or (B, H, W)).
+        """
+        cp, R_d, p_ref = pc.CP_AIR, pc.GAS_CONSTANT_DRY_AIR, pc.P_REF
+        dx, dt = self.cell_size_m, self.dt
+        g_prime, C_d, nu = self.reduced_gravity, self.drag_coeff, self.viscosity
+
+        m, T = s.mass, s.air_temperatures
+        u, v = s.x_wind_vel, s.y_wind_vel
+
+        # Substep count from the worst-case Courant number: advective speed |u| plus the
+        # gravity-wave speed c = sqrt(g'*eta).
+        eta = m * R_d * T / p_ref
+        wave = float(torch.sqrt((g_prime * eta).clamp(min=0.0)).max())
+        flow = float((u.abs() + v.abs()).max())
+        courant = (flow + wave) * dt / dx
+        n = max(1, int(math.ceil(courant / self.cfl_target)))
+        dts = dt / n
 
         for _ in range(n):
-            mass, energy = self._phi_diffuse_step(mass, energy, phi_of(mass, energy), dt)
+            eta = m * R_d * T / p_ref
+            surface = s.terrain + eta
+            gx, gy = self._periodic_grad(surface, dx)
+            # Forcing: -g'*grad(s) (terrain + buoyancy), weak surface friction, eddy viscosity.
+            u = u + dts * (-g_prime * gx - C_d * u + nu * self._periodic_laplacian(u, dx))
+            v = v + dts * (-g_prime * gy - C_d * v + nu * self._periodic_laplacian(v, dx))
 
-        # A little conservative thermal mixing on the energy (intensive T smoothing would
-        # not conserve, so diffuse the extensive energy instead).
-        energy = self._diffuse(energy, self.blur_sigma)
-        return mass, energy
+            # Conservative transport of mass, energy and momentum by the updated wind.
+            dispx, dispy = u * dts / dx, v * dts / dx
+            energy = m * cp * T
+            mom_x, mom_y = m * u, m * v
+            m      = self._advect_periodic(m,      dispx, dispy)
+            energy = self._advect_periodic(energy, dispx, dispy)
+            mom_x  = self._advect_periodic(mom_x,  dispx, dispy)
+            mom_y  = self._advect_periodic(mom_y,  dispx, dispy)
+
+            m_safe = m.clamp(min=1e-9)
+            u, v = mom_x / m_safe, mom_y / m_safe
+            T = energy / (cp * m_safe)
+
+        # Open-boundary sponge: relax the edge belt toward the free-stream (synoptic wind and
+        # rest-state mass/temperature) so the wind enters upwind and leaves downwind without
+        # piling or reflecting. Exact-exponential, so stable for any sponge strength.
+        decay = torch.exp(-self._sponge_rate(m.shape[-2:]) * dt)
+        u = s.u_amb_x + (u - s.u_amb_x) * decay
+        v = s.u_amb_y + (v - s.u_amb_y) * decay
+        m = s.mass_eq + (m - s.mass_eq) * decay
+        T = s.temp_eq + (T - s.temp_eq) * decay
+
+        s.mass, s.air_temperatures, s.x_wind_vel, s.y_wind_vel = m, T, u, v
+        return s
 
     def temperature_relax_rate(self, terrain: torch.Tensor) -> torch.Tensor:
         """Per-cell radiative relaxation rate: slow in valleys, fast at altitude."""
@@ -393,48 +359,20 @@ class Simulation:
         x_wind_vel: torch.Tensor,
         y_wind_vel: torch.Tensor,
     ) -> torch.Tensor:
-        # Closed domain (no-flux walls): oxygen is neither lost nor replenished at the
-        # edges. Oxygen rides the *actual* wind (scaled by advection_strength), then
-        # diffuses; both are conservative, and the saturating advection caps each cell
-        # at 1.0 (saturated cells reject inflow). Advecting with the real wind — rather
-        # than a wind-magnitude-normalised displacement — keeps oxygen transport tied to
-        # the wind speed, so diffusion can balance it instead of it snapping to a piled
-        # steady state.
-        x_vel = x_wind_vel * self.oxygen_advection_strength
-        y_vel = y_wind_vel * self.oxygen_advection_strength
-        return self._advect_and_diffuse_field(
-            oxygen, x_vel, y_vel, self.oxygen_diffusion_sigma, saturate=True
-        )
+        # Oxygen [kg/m^3] rides the actual wind (conservative periodic advection), then mixes
+        # by a small Gaussian diffusion. CFL-substepped on the displacement. The pre-SI [0,1]
+        # saturation cap is dropped here; the full oxygen physics is reworked in Phase 4.
+        dx, dt = self.cell_size_m, self.dt
+        dispx, dispy = x_wind_vel * dt / dx, y_wind_vel * dt / dx
+        n = max(1, int(math.ceil(float((dispx.abs() + dispy.abs()).max()) / self.cfl_target)))
+        sx, sy = dispx / n, dispy / n
+        for _ in range(n):
+            oxygen = self._advect_periodic(oxygen, sx, sy)
+        return self._diffuse(oxygen, self.oxygen_diffusion_sigma)
 
     def column_height(self, mass: torch.Tensor, terrain: torch.Tensor, air_temperatures: torch.Tensor) -> torch.Tensor:
-        """Column-top geopotential: terrain raises the base, temperature expands the column."""
-        return (
-            self.terrain_height_scale * terrain
-            + mass * (1.0 + self.thermal_expansion * air_temperatures)
-        )
-
-    def compute_wind_from_pressure(
-        self, surface_pressure: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Differentiate only the trailing (row, col) axes so a leading batch dim is left
-        # untouched (each world gets its own gradient).
-        grad_y, grad_x = torch.gradient(surface_pressure, dim=(-2, -1))
-        # Wind flows from high to low pressure, so negate the gradient.
-        x_wind = self._gaussian_blur(-grad_x, self.wind_smooth_sigma)
-        y_wind = self._gaussian_blur(-grad_y, self.wind_smooth_sigma)
-        return x_wind, y_wind
-
-    def update_wind(
-        self,
-        surface_pressure: torch.Tensor,
-        x_wind_vel: torch.Tensor,
-        y_wind_vel: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        new_x, new_y = self.compute_wind_from_pressure(surface_pressure)
-        s = self.wind_temporal_smoothing
-        x_wind = s * new_x + (1.0 - s) * x_wind_vel
-        y_wind = s * new_y + (1.0 - s) * y_wind_vel
-        return x_wind, y_wind
+        """Column-top geopotential height [m]: H = terrain + eta, eta = m*R_d*T/p_ref."""
+        return terrain + mass * pc.GAS_CONSTANT_DRY_AIR * air_temperatures / pc.P_REF
 
     # ---------------------------------------------------------------------------
     # Fire
@@ -608,11 +546,10 @@ class Simulation:
 
         The state is mutated in place and returned for convenience.
         """
-        # Convective transport: mass and energy (E = m*T) flow together down the transport
-        # potential, so heat is carried by the air mass. T = E/m is recovered afterward.
-        energy = s.mass * s.air_temperatures
-        s.mass, energy = self.transport_mass_energy(s.mass, energy, s.terrain, s.air_temperatures)
-        s.air_temperatures = energy / s.mass.clamp(min=1e-6)
+        # Shallow-water momentum core: advance the prognostic wind, then advect mass and
+        # energy (E = m*c_p*T) by it. This refreshes s.x/y_wind_vel too — the wind is now
+        # prognostic, not a diagnostic of the pressure field.
+        self.step_dynamics(s)
 
         # Surface radiative relaxation (sun warms, space cools); a sink/source forcing.
         if self.relaxation_enabled:
@@ -638,9 +575,6 @@ class Simulation:
                 s.fuel_temperatures, s.fuel, s.oxygen
             )
 
-        # Refresh the surface wind (-grad pressure) for display and next tick's oxygen
-        # advection. The wind is purely diagnostic; mass moves via the transport above.
-        s.x_wind_vel, s.y_wind_vel = self.update_wind(s.mass, s.x_wind_vel, s.y_wind_vel)
         return s
 
     @staticmethod
