@@ -168,6 +168,7 @@ class BatchedRollout:
         self._state = SimState(
             mass=mass,
             air_temperatures=air,
+            ground_temperature=stack("temp_eq"),   # surface skin starts at the rest profile
             fuel_temperatures=stack("fuel_temperatures"),
             fuel=stack("fuel"),
             oxygen=stack("oxygen"),
@@ -175,7 +176,6 @@ class BatchedRollout:
             temp_eq=stack("temp_eq"),
             oxygen_eq=stack("oxygen_eq"),
             mass_eq=mass.clone(),
-            temp_relax_rate=self._sim.temperature_relax_rate(terrain),
             x_wind_vel=x_wind,
             y_wind_vel=y_wind,
             u_amb_x=u_amb_x,

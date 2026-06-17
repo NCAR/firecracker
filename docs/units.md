@@ -87,6 +87,7 @@ in `cfg/default.toml` under documented, unit-annotated keys.
 |---|---|---|---|
 | `mass` | column mass, mean 1 | shallow boundary-layer areal mass `m` (level lid) | kg/m² |
 | `air_temperatures` | ~0.5 | `T` | K |
+| `ground_temperature` | — | surface (soil/litter) skin `T_g` (Phase 3) | K |
 | `(x,y)_wind_vel` | cells/tick, diagnostic | prognostic velocity `(u,v)` | m/s |
 | `oxygen` | `[0,1]` fraction | O₂ partial density | kg/m³ |
 | `fuel` (per type) | arbitrary | biomass areal density | kg/m² |
@@ -156,22 +157,29 @@ speed is ~15 m/s (transcritical with the wind → strong terrain response).
 
 ### Radiation (replaces `relax_to_equilibrium` for temperature)
 
-Surface energy balance per column:
+Sunlight is absorbed **at the surface**, not by the air — clear air is nearly transparent to
+shortwave radiation. So the solar flux heats the **ground/litter skin** and the **fuel**, each
+of which emits longwave `εσT⁴`; the air column is warmed only by **sensible exchange** with the
+ground. The two surface bodies share the incoming beam by a **vegetation cover fraction**
+`c = 1 − exp(−fuel_total/κ)` (Beer–Lambert canopy interception), with area shares
+`a_ground = 1−c` and `a_fuel,i = c·fuel_i/fuel_total`. Both the absorbed solar and the emitted
+longwave are area-weighted (this keeps every body's balance vanishing at the rest profile):
 
 ```
-Q_rad = S_net - ε σ T⁴                      [W/m²]
-dT/dt = Q_rad / (m c_p,air)
+S_net   = ε σ temp_eq⁴                                          [W/m²]  (per-cell anchor)
+ground:  C_g dT_g/dt = a_g·S_net − a_g·εσT_g⁴ − k_ga·(T_g − T_a)
+air:     m c_p dT_a/dt = k_ga·(T_g − T_a)                       (transparent to radiation)
+fuel i:  C_fi dT_fi/dt = a_fi·S_net − a_fi·εσT_fi⁴              (C_fi = fuel_i·c_p,fuel)
 ```
 
-`S_net` is the constant net absorbed daytime flux. Size it to the reference state so
-radiative equilibrium sits at `T₀`: `S_net = ε σ T₀⁴ ≈ 0.95·5.67e-8·303.15⁴ ≈
-455 W/m²`. This makes the equilibrium-temperature test exactly `T_eq = (S_net/εσ)^¼ =
-T₀`.
-
-Altitude-dependent cooling now emerges naturally: a thinner (high-altitude) column has
-smaller `m c_p` heat capacity, so it heats/cools faster. `temperature_rate_low/high`
-are **retired**. Oxygen replenishment (`oxygen_rate`) is replaced by mixing toward the
-ambient O₂ profile (or by the advective exchange itself).
+`S_net` is fixed **per-cell** to the map's rest profile (`S_net = εσ temp_eq⁴`), so radiative
+equilibrium sits exactly at `temp_eq` (`= T₀ − Γz`, i.e. `T₀` over flat ground, ≈ 455 W/m²): a
+quiescent world holds station and matches the boundary sponge's `temp_eq` target. **Heat capacity
+sets the response speed**: fine fuel (`C ≈ 10³ J/m²/K`) heats and dries in the sun within minutes,
+the ground skin (`C_g ≈ 10⁵`) follows over hours, and the deep air column (`m c_p ≈ 10⁶`) lags
+over days — so fuels lead the air, as they do in reality. `temperature_rate_low/high` are
+**retired**. The pre-SI fuel↔air conduction (`exchange_fuel_air_heat`) is unchanged here (fixed in
+Phase 4). Oxygen replenishment (`oxygen_rate`) is the only remaining Newtonian relaxation.
 
 ### Combustion (replaces `update_fire`)
 
@@ -285,24 +293,35 @@ Each phase is independently testable; we do not change everything at once.
    *Caveat:* default `layer_depth_ref=1000 m` is the recommended value — **lowering it makes
    valleys *slower*, not faster** (level-lid continuity: fast over thin-layer peaks, slow in
    deep valleys); see Known limitations.
-3. **Radiation** *(next)* — replace temperature `relax_to_equilibrium` with a surface
-   energy balance: `Q_rad = S_net − ε·σ·T⁴` [W/m²], `dT/dt = Q_rad/(m·cp)` over `dt`
-   (`m` = boundary-layer mass). Calibrate `S_net = ε·σ·T_REF⁴ ≈ 455 W/m²` so radiative
-   equilibrium = `T_REF` (`ε≈0.95`). Add a `[radiation]` config block. **Retire**
-   `temperature_rate_low/high` + `temperature_relax_rate` — altitude-dependent cooling now
-   emerges (thin high column = small `m·cp` = faster response). Oxygen replenishment toward
-   `oxygen_eq` can stay or become a mixing term. *Emergent:* cold slopes → smaller `η` →
-   `−g′∇s` downhill force → **katabatic drainage winds**, no momentum-code change. *Test:*
-   uniform world → `T_eq=(S_net/εσ)^¼=T_REF`. Energy now has a source, so keep exact
-   conservation tests on the closed dynamics core only. *Gotcha:* consider exact-exponential
-   form for the `−εσT⁴` sink if stiff (it's gentle, ~0.5 K/step).
+3. **Radiation** ✅ *done* — `Simulation.apply_radiation` replaces the temperature
+   `relax_to_equilibrium` with a **surface energy balance (canopy-split model)**: sunlight is
+   absorbed at the surface (air is shortwave-transparent) and split between the **ground skin**
+   and the **fuel** by a cover fraction `c = 1 − exp(−fuel_total/κ)`; each absorbs `a·S_net` and
+   emits `a·εσT⁴` (area-weighted), the air is warmed only by sensible exchange with the ground
+   (`k_ga·(T_g − T_a)`). `S_net` is fixed **per-cell** to `ε·σ·temp_eq⁴`, so radiative equilibrium
+   = the rest profile `temp_eq` (= `T_REF` over flat ground, ≈ 455 W/m²) and matches the sponge
+   target. **Heat capacity sets the speed**: fine fuel (`C ≈ 10³`) leads in minutes, ground skin
+   (`C_g ≈ 10⁵`) over hours, deep air (`m·cp ≈ 10⁶`) over days — so fuels heat/dry ahead of the
+   air, the key fire-weather effect. New `ground_temperature` field (inits to `temp_eq`, derived —
+   no map regen) + per-type SI `specific_heat` (grass 1800, tree 2300). New `[radiation]` knobs
+   (`emissivity=0.95`, `ground_heat_capacity=1e5`, `ground_air_exchange=10`, `cover_fuel_scale=1`);
+   **retired** `temperature_rate_low/high`, `temperature_relax_rate`, the `temp_relax_rate` field.
+   The pre-SI fuel↔air conduction (`exchange_fuel_air_heat`) and pre-SI `heat_capacity` are left for
+   Phase 4. `relax_to_equilibrium` now drives only oxygen. Forward Euler is stable (area-weighting
+   ties absorbed flux to mass → gentle steps). *Tests* (`tests/test_radiation.py`): equilibrium
+   fixed point, fuel-leads-ground-leads-air, cover shading, bare-ground limit, analytic ground
+   step, 455 W/m² calibration, quiescent world holds station. *Seam:* the fuel longwave `εσT_f⁴`
+   here and Phase 5's flame emission both use `εσT_f⁴` — Phase 5 must **redistribute** that
+   emission to neighbours, not add a second one (no double-count today: `apply_radiant_heat` is
+   still pre-SI). *Emergent (future):* cold slopes → smaller `η` → `−g′∇s` → katabatic drainage.
 4. **Combustion + SI oxygen** — rewrite `update_fire`; fix `exchange_fuel_air_heat`.
    Arrhenius O₂-limited rate `ṙ = A·exp(−E_a/(R·T_fuel))·fuel·[O₂]` [kg/m²/s] (no hard
    threshold; tiny numerical floor). Per tick `Δfuel = ṙ·dt`: `ΔO₂ = s·Δfuel` (s≈1.4,
    capped at available O₂); `Q_burn = HHV·Δfuel` (HHV≈1.6–1.8e7 J/kg) split air/fuel by
    `burn_heat_fuel_fraction`. **Fix:** `exchange_fuel_air_heat` `C_air` must be
-   `air_mass·cp_air` (currently missing `·cp`); `C_fuel = fuel·cp_fuel`; per-fuel
-   `heat_capacity` → J/(kg·K) (grass ~1800, tree ~2300). Oxygen is already kg/m³ advected
+   `air_mass·cp_air` (currently missing `·cp`); `C_fuel = fuel·cp_fuel` — **consolidate onto the
+   SI `specific_heat` key added in Phase 3** (grass 1800, tree 2300) and drop the pre-SI
+   `heat_capacity`. Oxygen is already kg/m³ advected
    by the wind (Phase 2); couple consumption + ambient mixing. Tune `A,E_a` so cold fuel is
    inert, ignition ≈ pyrolysis temps (grass 573 K, tree 600 K, already in cfg). Rewrite
    `[fire]`/`[fuel_types]` combustion constants to SI. Fire heats `T` → `η` → indraft wind
@@ -331,9 +350,10 @@ Each phase is independently testable; we do not change everything at once.
 - **`units_version`** (`map_loader.py`, currently **3**): bump on any on-disk semantics
   change, update the comment, **regenerate all 1024 maps** (`python src/gen_maps.py
   --count 1024 --out maps --seed 0`, ~2 min); `validate_against_config` rejects mismatches.
-- **Pre-SI code still live** (marked): `relax_to_equilibrium`, `update_fire`,
-  `apply_radiant_heat`, `exchange_fuel_air_heat`, and the cfg combustion constants —
-  replaced in Phases 3–5. So stepping with fire/relaxation on is not yet fully physical.
+- **Pre-SI code still live** (marked): `update_fire`, `apply_radiant_heat`,
+  `exchange_fuel_air_heat`, and the cfg combustion constants — replaced in Phases 4–5. So
+  stepping with fire on is not yet fully physical. (`relax_to_equilibrium` is retained but
+  now only drives oxygen replenishment; temperature is the physical balance of Phase 3.)
 - **Closed-core conservation tests**: pass `momentum={"sponge_strength":0,"drag_coeff":0}`
   to recover exact periodic conservation (the open sponge otherwise adds/removes air).
 - **Fire→wind coupling already wired**: forcing `−g′∇s`, `s=terrain+η`, `η=m·R_d·T/p_ref`;
@@ -346,8 +366,8 @@ Each phase is independently testable; we do not change everything at once.
 
 - **Phase 2** *(done; revisit if needed)*: `g′`/`C_d`/`layer_depth_ref` set the foehn/
   channeling strength; defaults give prevailing 5–15 m/s with lee gusts ~20 m/s.
-- **Phase 3**: confirm `S_net ≈ 455 W/m²` lands radiative equilibrium at `T_REF`; pick `ε`
-  (≈0.95) and albedo consistent with that net flux.
+- **Phase 3** *(done)*: per-cell `S_net = εσ·temp_eq⁴` lands radiative equilibrium on the
+  rest profile (`≈ 455 W/m²` at `T_REF`); `ε=0.95`.
 - **Phase 4**: tune Arrhenius `A`, `E_a` so cold fuel is inert and ignition ≈ the cfg
   pyrolysis temps; pin per-fuel `HHV`, `s`, `cp_fuel`.
 

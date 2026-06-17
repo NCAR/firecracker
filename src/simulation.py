@@ -31,20 +31,20 @@ class SimState:
     """The full set of per-tick simulation fields, shared by the single-world env and the
     batched rollout collector. Every field is a torch tensor whose trailing two axes are
     (H, W); a leading batch axis B is optional and handled transparently by the
-    rank-agnostic Simulation ops. The *_eq / terrain / temp_relax_rate fields are constant
-    for an episode but travel with the state so step_fields stays a pure function of it.
+    rank-agnostic Simulation ops. The *_eq / terrain fields are constant for an episode but
+    travel with the state so step_fields stays a pure function of it.
     """
 
     mass:              torch.Tensor   # column mass = surface pressure
     air_temperatures:  torch.Tensor
+    ground_temperature: torch.Tensor  # surface (soil/litter) skin temperature [K]
     fuel_temperatures: torch.Tensor   # per-type stack: trailing axes (..., N_fuel, H, W)
     fuel:              torch.Tensor   # per-type stack
     oxygen:            torch.Tensor
     terrain:           torch.Tensor
-    temp_eq:           torch.Tensor   # temperature relaxation target
+    temp_eq:           torch.Tensor   # rest temperature profile (radiative-equilibrium + sponge target)
     oxygen_eq:         torch.Tensor   # oxygen replenishment target
     mass_eq:           torch.Tensor   # boundary-layer rest mass (the open-boundary sponge target)
-    temp_relax_rate:   torch.Tensor   # per-cell radiative relaxation rate
     x_wind_vel:        torch.Tensor   # prognostic wind velocity u [m/s]
     y_wind_vel:        torch.Tensor   # prognostic wind velocity v [m/s]
     u_amb_x:           torch.Tensor   # per-world synoptic ambient wind [m/s], broadcastable to (..., H, W)
@@ -85,14 +85,23 @@ class Simulation:
 
         self.oxygen_diffusion_sigma:    float = float(oxygen.get("diffusion_sigma",    3.0))
 
-        relaxation = (cfg or {}).get("relaxation", {})
+        # Surface radiative energy balance (Phase 3). Sunlight is absorbed at the surface, not
+        # by the (shortwave-transparent) air: bare ground and fuel each absorb solar S_net and
+        # emit longwave eps*sigma*T^4, split by a vegetation cover fraction. The air is heated
+        # only by sensible exchange with the ground. S_net is anchored per-cell to the rest
+        # profile (S_net = eps*sigma*temp_eq^4), so radiative equilibrium sits at temp_eq
+        # (= T_REF - Gamma*z); the fast (small heat-capacity) fuel/ground lead, the deep air lags.
+        radiation = (cfg or {}).get("radiation", {})
+        self.radiation_enabled:   bool  = bool(radiation.get("enabled", True))
+        self.emissivity:          float = float(radiation.get("emissivity",          pc.EMISSIVITY))
+        self.ground_heat_capacity: float = float(radiation.get("ground_heat_capacity", 1.0e5))
+        self.ground_air_exchange:  float = float(radiation.get("ground_air_exchange",  10.0))
+        self.cover_fuel_scale:     float = float(radiation.get("cover_fuel_scale",     1.0))
 
-        # Newtonian relaxation toward the elevation equilibrium profiles (radiative
-        # forcing for temperature, fresh-air replenishment for oxygen).
-        self.relaxation_enabled:    bool  = bool(relaxation.get("enabled", True))
-        self.temperature_rate_low:  float = float(relaxation.get("temperature_rate_low",  0.02))
-        self.temperature_rate_high: float = float(relaxation.get("temperature_rate_high", 0.30))
-        self.oxygen_rate:           float = float(relaxation.get("oxygen_rate",           0.05))
+        # Oxygen replenishment toward the elevation profile (fresh-air mixing).
+        relaxation = (cfg or {}).get("relaxation", {})
+        self.relaxation_enabled: bool  = bool(relaxation.get("enabled", True))
+        self.oxygen_rate:        float = float(relaxation.get("oxygen_rate", 0.05))
 
         # Phase 2 shallow-water momentum core. Wind is prognostic [m/s]; drag relaxes it
         # toward the per-map synoptic ambient wind, the column-top height gradient
@@ -131,6 +140,10 @@ class Simulation:
             return torch.tensor(values, dtype=self.dtype, device=self.device).view(-1, 1, 1)
 
         self.heat_capacities     = _ft_tensor("heat_capacity",          1.0)
+        # SI specific heat [J/(kg*K)] used by the surface radiation balance (Phase 3). Kept
+        # separate from the pre-SI "heat_capacity" above, which the legacy fire code still uses
+        # until Phase 4 unifies them (grass ~1800, wood ~2300).
+        self.fuel_specific_heat  = _ft_tensor("specific_heat",          2000.0)
         self.ignition_thresholds = _ft_tensor("ignition_threshold",     2.0)
         self.consumption_rates   = _ft_tensor("consumption_rate",       0.001)
         self.burn_heat_scales    = _ft_tensor("burn_heat_scale",        500.0)
@@ -335,12 +348,64 @@ class Simulation:
         s.mass, s.air_temperatures, s.x_wind_vel, s.y_wind_vel = m, T, u, v
         return s
 
-    def temperature_relax_rate(self, terrain: torch.Tensor) -> torch.Tensor:
-        """Per-cell radiative relaxation rate: slow in valleys, fast at altitude."""
-        return (
-            self.temperature_rate_low
-            + (self.temperature_rate_high - self.temperature_rate_low) * terrain
+    def apply_radiation(
+        self,
+        air_temperatures: torch.Tensor,    # air column temperature T_a [K]      (..., H, W)
+        ground_temperature: torch.Tensor,  # surface skin temperature T_g [K]    (..., H, W)
+        fuel_temperatures: torch.Tensor,   # per-type fuel temperature T_f [K]   (..., N, H, W)
+        fuel: torch.Tensor,                # per-type biomass [kg/m^2]           (..., N, H, W)
+        mass: torch.Tensor,                # boundary-layer areal mass m [kg/m^2](..., H, W)
+        temp_eq: torch.Tensor,             # rest temperature profile [K] (sets S_net)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Surface radiative energy balance over one tick (canopy-split model).
+
+        Sunlight is absorbed at the surface -- the air is transparent to shortwave -- and split
+        between bare ground and fuel by a vegetation cover fraction. Each surface body absorbs
+        solar S_net and emits longwave eps*sigma*T^4, both weighted by its area fraction; the
+        air is warmed only by sensible exchange with the ground (fuel<->air conduction stays in
+        exchange_fuel_air_heat). The net flux S_net is fixed per-cell to the rest profile,
+        S_net = eps*sigma*temp_eq^4, so radiative equilibrium sits exactly at temp_eq (= T_REF
+        over flat ground): area-weighting both solar and longwave makes every body's balance
+        vanish at temp_eq. Heat capacity sets the response speed -- fine fuel (~1e3 J/m^2/K)
+        leads, the ground skin (~1e5) follows, the deep air column (~1e6) lags far behind, which
+        is why fuels heat and dry in the sun well ahead of the air. Explicit forward Euler; all
+        fluxes use the pre-step temperatures.
+
+        Returns (air_temperatures, fuel_temperatures, ground_temperature).
+        """
+        eps, sigma, cp_air = self.emissivity, pc.STEFAN_BOLTZMANN, pc.CP_AIR
+        dt = self.dt
+        C_g, k_ga, kappa = self.ground_heat_capacity, self.ground_air_exchange, self.cover_fuel_scale
+
+        s_net = eps * sigma * temp_eq ** 4                         # (..., H, W) per-cell anchor
+
+        # Cover fraction (Beer-Lambert canopy interception) and per-body area shares.
+        fuel_total = fuel.sum(dim=-3)                              # (..., H, W)
+        cover = 1.0 - torch.exp(-fuel_total / kappa)               # (..., H, W) in [0, 1)
+        a_ground = 1.0 - cover                                     # bare-ground area fraction
+        safe_total = fuel_total.clamp(min=1e-12).unsqueeze(-3)
+        a_fuel = cover.unsqueeze(-3) * fuel / safe_total           # (..., N, H, W), sums to cover
+
+        # Ground: absorbs a_ground*S_net, emits a_ground*sigma*T^4, sheds sensible heat to air.
+        q_ground = (
+            a_ground * s_net
+            - a_ground * eps * sigma * ground_temperature ** 4
+            - k_ga * (ground_temperature - air_temperatures)
         )
+        ground_new = ground_temperature + dt * q_ground / C_g
+
+        # Air: warmed only by the ground sensible flux (transparent to solar/longwave).
+        air_new = air_temperatures + dt * k_ga * (ground_temperature - air_temperatures) / (mass * cp_air).clamp(min=1e-9)
+
+        # Fuel (per type): absorbs a_fuel*S_net, emits a_fuel*sigma*T^4. Only where fuel is
+        # present -- a_fuel and the thermal mass both vanish as fuel -> 0, so guard the divide.
+        present = fuel > self.fuel_burnt_threshold
+        C_fuel = (fuel * self.fuel_specific_heat).clamp(min=1e-9)
+        q_fuel = a_fuel * s_net - a_fuel * eps * sigma * fuel_temperatures ** 4
+        dT_fuel = torch.where(present, dt * q_fuel / C_fuel, torch.zeros_like(fuel_temperatures))
+        fuel_new = (fuel_temperatures + dT_fuel).clamp(min=0.0)
+
+        return air_new, fuel_new, ground_new.clamp(min=0.0)
 
     @staticmethod
     def relax_to_equilibrium(
@@ -551,10 +616,11 @@ class Simulation:
         # prognostic, not a diagnostic of the pressure field.
         self.step_dynamics(s)
 
-        # Surface radiative relaxation (sun warms, space cools); a sink/source forcing.
-        if self.relaxation_enabled:
-            s.air_temperatures = self.relax_to_equilibrium(
-                s.air_temperatures, s.temp_eq, s.temp_relax_rate
+        # Surface radiative energy balance: sun warms the ground/fuel skin, longwave cools it,
+        # and the ground sheds sensible heat to the air (which is transparent to radiation).
+        if self.radiation_enabled:
+            s.air_temperatures, s.fuel_temperatures, s.ground_temperature = self.apply_radiation(
+                s.air_temperatures, s.ground_temperature, s.fuel_temperatures, s.fuel, s.mass, s.temp_eq
             )
 
         s.air_temperatures, s.fuel_temperatures = self.exchange_fuel_air_heat(

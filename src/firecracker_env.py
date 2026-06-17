@@ -370,10 +370,10 @@ class FirecrackerEnv(gymnasium.Env):
         self._terrain: np.ndarray | None = None
         self._u_amb_x: torch.Tensor | None = None   # synoptic ambient wind [m/s]
         self._u_amb_y: torch.Tensor | None = None
-        # Relaxation targets (initial profiles) and per-cell temperature rate.
+        # Rest-state targets (initial profiles): radiative-equilibrium temperature and oxygen.
         self._temp_eq: np.ndarray | None = None
         self._oxygen_eq: np.ndarray | None = None
-        self._temp_relax_rate: np.ndarray | None = None
+        self._ground_temperature: torch.Tensor | None = None   # surface skin [K]
         self._terrain_stats: list[float] = [0.0, 0.0, 0.0]   # (mean, min, max), set at reset
         self._last_radiant_flux: np.ndarray | None = None
         self._current_map: str | None = None   # filename of the loaded map
@@ -438,10 +438,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._mass_eq           = self._mass.clone()   # level-lid rest state -> sponge target
         self._fuel              = self._to_tensor(m.fuel)
         self._fuel_temperatures = self._to_tensor(m.fuel_temperatures)
+        # Surface skin starts at the rest temperature profile (radiative-equilibrium target).
+        self._ground_temperature = self._temp_eq.clone()
 
-        # Recompute the cheap dynamics-derived fields from the loaded state so the
-        # relaxation knobs stay live without having to regenerate maps.
-        self._temp_relax_rate = self._sim.temperature_relax_rate(self._terrain)
         # Per-map synoptic ambient wind: the momentum drag relaxes toward it, and the
         # prognostic wind is initialised to it so the world starts near its steady state.
         self._u_amb_x = self._to_tensor(np.float32(m.ambient_wind_x))
@@ -623,6 +622,7 @@ class FirecrackerEnv(gymnasium.Env):
         return SimState(
             mass=self._mass,
             air_temperatures=self._air_temperatures,
+            ground_temperature=self._ground_temperature,
             fuel_temperatures=self._fuel_temperatures,
             fuel=self._fuel,
             oxygen=self._oxygen,
@@ -630,7 +630,6 @@ class FirecrackerEnv(gymnasium.Env):
             temp_eq=self._temp_eq,
             oxygen_eq=self._oxygen_eq,
             mass_eq=self._mass_eq,
-            temp_relax_rate=self._temp_relax_rate,
             x_wind_vel=self._x_wind_vel,
             y_wind_vel=self._y_wind_vel,
             u_amb_x=self._u_amb_x,
@@ -642,6 +641,7 @@ class FirecrackerEnv(gymnasium.Env):
         """Write a stepped SimState's mutable fields back onto the env attributes."""
         self._mass              = s.mass
         self._air_temperatures  = s.air_temperatures
+        self._ground_temperature = s.ground_temperature
         self._fuel_temperatures = s.fuel_temperatures
         self._fuel              = s.fuel
         self._oxygen            = s.oxygen

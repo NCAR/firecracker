@@ -54,14 +54,25 @@ elev_max    = 500.0     # peak elevation [m] (the normalised relief is scaled by
 # there is no separate oxygen falloff knob any more.
 temperature_lapse_rate = 0.0065   # K/m (6.5 K per km)
 
+[radiation]
+# Surface radiative energy balance (see docs/units.md). Sunlight is absorbed at the surface
+# (air is transparent to shortwave) and split between bare ground and fuel by a vegetation
+# cover fraction c = 1 - exp(-total_fuel/cover_fuel_scale). Each surface body absorbs solar
+# S_net and emits longwave eps*sigma*T^4 weighted by its area share; the air is warmed only by
+# sensible exchange with the ground. S_net is fixed per-cell to S_net = eps*sigma*temp_eq^4, so
+# radiative equilibrium sits at the rest profile temp_eq (= T_REF=303.15 K over flat ground,
+# ~455 W/m^2). Heat capacity sets the speed: fine fuel (~1e3 J/m^2/K) heats fast, the ground
+# skin (~1e5) follows, the deep air column (~1e6) lags far behind.
+enabled              = true     # if false, skip the radiative balance (watch pure transport)
+emissivity           = 0.95     # eps: grey-body emissivity of the surface
+ground_heat_capacity = 1.0e5    # C_g [J/m^2/K]: thermal mass of the soil/litter surface skin
+ground_air_exchange  = 10.0     # k_ga [W/m^2/K]: sensible heat transfer ground <-> air column
+cover_fuel_scale     = 1.0      # kappa [kg/m^2]: fuel load at which canopy interception saturates
+
 [relaxation]
-# Newtonian relaxation pulls each cell toward its elevation equilibrium profile
-# (the initial field): radiative forcing for temperature, fresh-air replenishment
-# for oxygen. Replaces the old uniform atmospheric_cooling sink.
-enabled               = true   # if false, skip the radiative sinks/sources (watch pure transport)
-temperature_rate_low  = 0.02   # valleys: slow radiative cooling (heat-retaining blanket)
-temperature_rate_high = 0.30   # peaks: fast heat escape (thin air, low thermal inertia)
-oxygen_rate           = 0.05   # fresh-air replenishment rate; keep below peak burn draw
+# Fresh-air replenishment: relaxes oxygen toward its elevation equilibrium profile.
+enabled     = true   # if false, skip oxygen replenishment
+oxygen_rate = 0.05   # fresh-air replenishment rate; keep below peak burn draw
 
 [convection]
 # Single-layer mass/energy convection. Surface pressure is the column mass m; the
@@ -105,6 +116,7 @@ spawn_radius                = 5      # radius (in grid cells) of the circular ig
 
 [fuel_types.grass]
 heat_capacity          = 0.5    # thermal mass per unit of fuel (pre-SI; -> J/(kg*K) in Phase 4)
+specific_heat          = 1800.0 # SI specific heat [J/(kg*K)] used by the radiation balance (dry grass)
 ignition_threshold     = 573.0  # pyrolysis onset temperature [K] (~300 C)
 consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fuel temperature (pre-SI)
 burn_heat_scale        = 100.0  # heat released per unit of fuel consumed (pre-SI; -> HHV J/kg in Phase 4)
@@ -115,6 +127,7 @@ spawn_density          = 1.5    # peak grass loading [kg/m^2] (scales the [0,1] 
 
 [fuel_types.tree]
 heat_capacity          = 2.5    # pre-SI; -> J/(kg*K) in Phase 4
+specific_heat          = 2300.0 # SI specific heat [J/(kg*K)] used by the radiation balance (wood)
 ignition_threshold     = 600.0  # pyrolysis onset temperature [K]
 consumption_rate       = 0.001  # pre-SI
 burn_heat_scale        = 300.0  # pre-SI; -> HHV J/kg in Phase 4

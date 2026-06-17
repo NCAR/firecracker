@@ -38,6 +38,7 @@ def make_config(
     *,
     fire: bool = False,
     relaxation: bool = False,
+    radiation: bool = False,
     momentum: dict | None = None,
 ) -> dict:
     """A minimal config with the major sinks/sources toggled for isolation.
@@ -50,6 +51,7 @@ def make_config(
         "environment": {"grid_size": grid_size, "window_size": grid_size, "max_steps": 10_000},
         "fire": {"enabled": fire, "spawn_fire": False},
         "relaxation": {"enabled": relaxation},
+        "radiation": {"enabled": radiation},
         "fuel_types": {name: {"ignition_threshold": 1.5} for name in fuel_type_names},
     }
     if momentum is not None:
