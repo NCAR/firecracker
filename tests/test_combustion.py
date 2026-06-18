@@ -8,12 +8,14 @@ underflows) and psi_dif = h*(O2/O2_ref) (O2 film diffusion, the flame-hot cap). 
 exact-exponential Dfuel = fuel*(1 - exp(-a_s*psi*dt)), so a cell burns over a residence time
 tau ~ 1/(a_s*psi) (Phase 5.5) instead of all at once. Burned mass releases its heat of combustion
 HHV, split between fuel and air by burn_heat_fuel_fraction; oxygen [kg/m^3] also couples to the
-areal burn [kg/m^2] through the shallow mixing depth d_mix as a whole-cell inventory backstop.
-These tests pin the inert-cold limit, ignition under heat, the (now series, not linear) oxygen
-throttle, the inventory cap, the stoichiometric O2 budget, the HHV energy split, kinetic
-monotonicity below the transport cap, the multi-tick residence time, and the surface-area (SAV)
-control of burn rate. Rates are checked in regimes chosen so the inventory cap does not bind unless
-a test targets it.
+areal burn [kg/m^2] through the shallow mixing depth d_mix as a whole-cell inventory backstop. The
+air share of the heat is deposited into a shallow plume slab of depth plume_mixing_depth (Phase
+5.5b), using the local near-surface density, so a burn warms the air strongly (a convective signal),
+not over the full ~1 km column. These tests pin the inert-cold limit, ignition under heat, the (now
+series, not linear) oxygen throttle, the inventory cap, the stoichiometric O2 budget, the HHV energy
+split (against the plume capacity), the plume concentration of the air share, kinetic monotonicity
+below the transport cap, the multi-tick residence time, and the surface-area (SAV) control of burn
+rate. Rates are checked in regimes chosen so the inventory cap does not bind unless a test targets it.
 """
 
 import numpy as np
@@ -145,8 +147,12 @@ def test_hhv_energy_split():
     cp_fuel = float(sim.fuel_specific_heat[0])
     f = sim.burn_heat_fuel_fraction
 
-    # Air share: m*c_p_air*dT_air = (1-f)*HHV*Dfuel.
-    air_energy = mass * pc.CP_AIR * (float(air.mean()) - pc.T_REF)
+    # Air share is deposited into the shallow plume slab, not the full column: its capacity is
+    # C_plume = rho(T_a)*d_plume*c_p_air with the local density rho = p_ref/(R_d*T_a) at the
+    # pre-step air temperature (T_REF here). So C_plume*dT_air = (1-f)*HHV*Dfuel.
+    rho = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * pc.T_REF)
+    C_plume = rho * sim.plume_mixing_depth * pc.CP_AIR
+    air_energy = C_plume * (float(air.mean()) - pc.T_REF)
     np.testing.assert_allclose(air_energy, (1.0 - f) * hhv * fuel_burned, rtol=1e-6)
 
     # Fuel share: c_p_fuel*fuel_new*dT_fuel = f*HHV*Dfuel.
@@ -220,3 +226,31 @@ def test_surface_area_to_volume_controls_burn_rate():
     burned_log = 1.0 - float(fuel_l.mean())
     assert burned_grass > 100.0 * burned_log          # ~sigma ratio (300x) -> grass burns far faster
     assert burned_log > 0.0
+
+
+def test_plume_concentrates_combustion_heat():
+    """Phase 5.5b: the air-share heat lands in a shallow plume, so a burn warms the air strongly.
+
+    The heat goes into a d_plume-deep slab (capacity C_plume = rho*d_plume*c_p_air), not the full
+    ~1 km boundary-layer column (m*c_p_air), so the same burn raises the air temperature by the
+    column-to-plume mass ratio more -- the strong, advectable convective signal leg (c) needs. We
+    pin the deposit to C_plume and check it is far larger than the full-column rise would be.
+    """
+    sim = _sim()
+    mass = 1500.0
+    air, _, fuel, _ = _burn(sim, temp=640.0, oxygen=pc.O2_DENSITY_REF, mass=mass)
+
+    fuel_burned = 1.0 - float(fuel.mean())
+    f = sim.burn_heat_fuel_fraction
+    hhv = float(sim.heat_of_combustion[0])
+    air_share = (1.0 - f) * hhv * fuel_burned                       # [J/m^2]
+
+    dT_air = float(air.mean()) - pc.T_REF
+    rho = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * pc.T_REF)
+    C_plume = rho * sim.plume_mixing_depth * pc.CP_AIR
+
+    # The rise matches the plume capacity, and dwarfs what the full column would give.
+    np.testing.assert_allclose(dT_air, air_share / C_plume, rtol=1e-6)
+    dT_column = air_share / (mass * pc.CP_AIR)
+    assert dT_air > 20.0 * dT_column                                # ~m/(rho*d_plume) stronger
+    assert np.isfinite(dT_air)

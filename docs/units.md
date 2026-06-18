@@ -414,11 +414,20 @@ Each phase is independently testable; we do not change everything at once.
      (well above the 573 K knee) and burns down over ~10 s, then self-extinguishes — finite, no
      runaway (the Phase 3 `T⁴` sink bounds it). The ~2400 K peak is hot for grass (real ~1100–1500 K)
      but stable, so flame-temperature calibration moves to (c) rather than being tuned in isolation.
-   - **(b) Shallow plume layer:** the combustion air-share heat currently dumps into the full
+   - **(b) Shallow plume layer** ✅ *done* — the combustion air-share heat was dumped into the full
      boundary-layer column (`m·c_p ≈ 1.2e6`) → only ~16 K per burn, a negligible convective signal.
-     Route it through a shallow near-surface plume depth (like oxygen's `d_mix`) so the air carries
-     a strong thermal signal that wind advects downwind. Couples to the existing `η`-buoyancy →
-     stronger indraft.
+     It is now injected into a shallow near-surface **plume** of depth `plume_mixing_depth` (`d_plume
+     ≈ 30 m`, mirroring oxygen's `d_mix`), using the **local** near-surface density `ρ = p_ref/(R_d·
+     T_a)` (= `m/η` at reference pressure): `C_plume = ρ·d_plume·c_p,air ≈ 3.5e4`, so the same burn
+     warms the air **~34× more** — a strong, advectable thermal signal that lifts `η` → indraft.
+     Being local, hotter air is lighter → smaller capacity → slightly more responsive (a mild
+     feedback, bounded by the Phase 3 `T⁴` sink). This is a deliberate **sub-grid plume scale**: a
+     single-layer model conserving column energy is stuck at ~16 K, so concentrating the air share
+     in a shallow slab is the only way to express plume buoyancy (symmetric to `d_mix` concentrating
+     the O₂ draw). New `[fire].plume_mixing_depth`; no new state field, no `units_version` bump.
+     *Tests:* the HHV split now checks the air rise against `C_plume`, plus a plume-concentration
+     test (air ΔT ≫ the full-column rise, finite). The indraft + downwind-warming + propagating-
+     **front** demonstration lands in leg (c)'s `test_spread` (it needs multi-tick `step_fields`).
    - **(c)** Radiation (Phase 5) + convection (b) then jointly preheat and ignite the fuel ahead;
      calibrate emission/ignition — and the flame temperature itself (rein the ~2400 K leg-(a) peak
      toward a realistic ~1100–1500 K via `burn_heat_fuel_fraction` and the plume depth, since the

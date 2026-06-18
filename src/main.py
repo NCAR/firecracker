@@ -55,6 +55,7 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print(f"    burn_heat_fuel_fraction     : {sim.burn_heat_fuel_fraction}")
     print(f"    combustion_mixing_depth     : {sim.combustion_mixing_depth}")
     print(f"    surface_mass_transfer       : {sim.surface_mass_transfer}")
+    print(f"    plume_mixing_depth          : {sim.plume_mixing_depth}")
     print("  [fuel_types]")
     for i, name in enumerate(sim.fuel_type_names):
         print(f"    [{name}]")
