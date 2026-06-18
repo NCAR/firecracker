@@ -215,9 +215,24 @@ O₂ present, the whole reaction is scaled down (fuel, oxygen, and heat together
 consumed in stoichiometric step — a fire starved of air burns less fuel, not the same fuel with
 the books forced to balance.
 
-The air share warms the column over `m·c_p,air`. Fuel↔air conduction (`exchange_fuel_air_heat`)
-keeps its exact two-body exponential form, now with real heat capacities `C_air = m·c_p,air`,
-`C_fuel = fuel·c_p,fuel`, a conductance `k` in W/(m²·K), and the decay exponent carrying `·dt`.
+The **fuel share** `f·Q_burn` (`f = burn_heat_fuel_fraction`) warms the fuel over its own thermal
+mass and **sets the flame temperature** (bounded by the `T⁴` sink). The **air share** `(1−f)·Q_burn`
+does not warm the deep column: it rises in a shallow buoyant **plume** of depth `d_plume`
+(`C_plume = ρ_local·d_plume·c_p,air`, `ρ_local = p_ref/(R_d·T_a)`; Phase 5.5b), so a burn raises a
+strong, advectable air signal that lifts `η` → indraft. A fraction `convective_fraction` of that
+air share is then **convected onto nearby fuel to ignite it** — the front's propagation driver
+(Phase 5.5c). Radiation (`apply_radiant_heat`) preheats the fuel ahead but is too weak to ignite it
+at realistic flame temperatures, so convection (hot plume gas / flame contact) carries the ignition
+and the spread is convection-dominant, as it is for grass fires. That convective deposit is sourced
+from the fresh burn heat (wind cannot sweep it away), gated to
+sub-flaming fuel (below `flame_gate_temperature`, so flaming fuel stays combustion-controlled and the
+front does not run away), and skewed downwind by a per-cell energy-conserving dipole
+(`deposit = conv(S,K0) − β[conv(S·n̂ₓ,gₓ)+conv(S·n̂_y,g_y)]`, giving the lee bias). Whatever the fuel
+does not absorb stays in the plume air, so energy is conserved (off-grid edge loss aside).
+
+Fuel↔air conduction (`exchange_fuel_air_heat`) keeps its exact two-body exponential form, with real
+heat capacities `C_air = m·c_p,air`, `C_fuel = fuel·c_p,fuel`, a conductance `k` in W/(m²·K), and the
+decay exponent carrying `·dt`.
 
 ### Fire radiant transfer (replaces `apply_radiant_heat`)
 
@@ -375,10 +390,9 @@ Each phase is independently testable; we do not change everything at once.
    real `σ`. No on-disk change — **no `units_version` bump, no map regen**. *Tests*
    (`tests/test_radiant_heat.py`): quiescent world does not spread, sub-ambient fuel is inert, a
    lone hot cell warms neighbours without self-heating, no deposit into fuel-free cells, delivered
-   energy bounded by emission. **Fire does not yet *spread*** — a single cell's radiative
-   preheating is (correctly) too weak to ignite a neighbour alone, and the Phase 4 one-tick
-   burnout leaves an igniting cell with no fuel to emit. Sustained flaming + convective ignition
-   is **Phase 5.5**.
+   energy bounded by emission. At this stage fire did **not yet spread** — a single cell's radiative
+   preheating is (correctly) too weak to ignite a neighbour alone; sustained flaming + convective
+   ignition (**Phase 5.5**, now done) is what makes the front propagate.
 5.5. **Sustained burn + plume convection** *(the "fire spreads" deliverable — surfaced by
    Phase 5)* — Phase 5 confirmed radiation alone can't propagate fire, by design: it preheats.
    Ignition in real fires comes from convection (hot plume gases) and direct flame contact, and
@@ -386,7 +400,7 @@ Each phase is independently testable; we do not change everything at once.
    tick (nothing left to emit), slow burn self-extinguishes below the pyrolysis knee. Energy is
    ample (one grass cell releases ~30× a neighbour's ignition energy); the blockers are
    *sustainability* and *delivery*. Four legs:
-   - **(a) Sustained flaming via surface-area combustion (linchpin)** ✅ *done* (`ac250db`) — the
+   - **(a) Sustained flaming via surface-area combustion (linchpin)** ✅ *done* (`fd2d1c2`) — the
      one-tick burnout is an
      artefact of treating combustion as a *bulk* Arrhenius rate of the fuel's mean temperature. Real
      fuel reacts only at its *surface*, so the burn is surface-area-controlled — which is also why
@@ -427,20 +441,36 @@ Each phase is independently testable; we do not change everything at once.
      the O₂ draw). New `[fire].plume_mixing_depth`; no new state field, no `units_version` bump.
      *Tests:* the HHV split now checks the air rise against `C_plume`, plus a plume-concentration
      test (air ΔT ≫ the full-column rise, finite). The indraft + downwind-warming + propagating-
-     **front** demonstration lands in leg (c)'s `test_spread` (it needs multi-tick `step_fields`).
-   - **(c)** Radiation (Phase 5) + convection (b) then jointly preheat and ignite the fuel ahead;
-     calibrate emission/ignition — and the flame temperature itself (rein the ~2400 K leg-(a) peak
-     toward a realistic ~1100–1500 K via `burn_heat_fuel_fraction` and the plume depth, since the
-     `T⁴` radiative reach scales steeply with it) — and demonstrate a propagating **front** (and
-     lee/downwind bias under ambient wind). Add a spread test over full `step_fields` ticks.
+     **front** demonstration is in leg (c)'s `test_spread` (over multi-tick `step_fields`).
+   - **(c) Convective front propagation** ✅ *done* — calibration confirmed radiation alone **cannot**
+     drive spread: at a realistic flame temperature its `εσT⁴` preheat lifts a neighbour only ~30–90 K
+     (far short of the ~573 K pyrolysis knee), and it ignites a neighbour only by running the flame
+     away to ~4000 K — so radiation stays the *preheat* leg, as designed. Ignition (and thus spread)
+     is driven by **convection**: `update_fire` now convects a fraction (`convective_fraction`, 0.12)
+     of the plume's air-share heat onto nearby fuel to ignite it (hot plume gas / flame contact). The
+     spread is convection-dominant, realistic for grass; radiation contributes preheat ahead of the
+     front but cannot ignite alone. It is sourced from *this
+     tick's* combustion heat (not the advected air field, so wind can't sweep the source away),
+     deposited only into **sub-flaming** fuel (below `flame_gate_temperature`, 700 K — flaming fuel is
+     combustion-controlled, which bounds the front and stops the runaway), over a short
+     `convective_radius_m` (10 m) reach, and **skewed downwind** by a per-cell, energy-conserving
+     **dipole** (`deposit = conv(S,K0) − β[conv(S·ŵₓ,gₓ)+conv(S·ŵ_y,g_y)]`, `β = convective_wind_bias
+     ≤ 1` to keep the upwind weight ≥ 0) — giving the lee bias (the same kernel carries the upslope
+     bias in leg d). The flame temperature is kept realistic by lowering `burn_heat_fuel_fraction` to **0.05**
+     and diluting the plume to `plume_mixing_depth` **100 m**. *Result* (one-shot hot cell, then
+     released): a self-sustaining front at a realistic ~1540 K flame (no runaway) spreading ~2–5 m/s,
+     symmetric with no wind and biased downwind under ambient wind. No new state field, no
+     `units_version` bump. *Tests* (`tests/test_spread.py`, full `step_fields` ticks): one-cell
+     self-propagation (symmetric), downwind bias, physical flame band, and no spontaneous ignition.
    - **(d) Upslope spread bias (Rothermel slope effect):** fire spreads faster uphill, because the
      flame and plume tilt toward the upslope fuel, shortening the flame-to-fuel distance and
      intensifying preheating. Much of this should **emerge** from (b): a buoyant plume over a slope
      flows uphill through the existing free-surface forcing (`−g′∇s`, `s = terrain + η`; combustion
-     heat raises `η` → upslope indraft), so the convective preheat already biases uphill. Add the
-     **radiative** half explicitly by tilting the `_radiant_convolve` kernel toward the upslope
-     (and downwind) direction — a slope/wind-skewed kernel instead of the isotropic inverse-square
-     — so radiant preheating also favors the fuel ahead/above. Calibrate the spread-rate increase
+     heat raises `η` → upslope indraft), so the convective spread already biases uphill. The
+     **dipole kernel built in leg (c)** (`_convective_deposit`, currently skewed by the wind) is the
+     ready-made machinery: add a slope term to its bias direction (`n̂ = normalize(α·∇terrain +
+     γ·wind)`) so the convective ignition also favors the fuel above, and optionally tilt
+     `_radiant_convolve` the same way for the radiative half. Calibrate the spread-rate increase
      against Rothermel's slope factor (rate of spread rising ~`tan²(slope)`), and add a test that
      an ignition on a ramp advances faster upslope than downslope.
    - *Optional:* a **fuel moisture** field — radiation's biggest real preheating job is drying;
@@ -464,10 +494,10 @@ Each phase is independently testable; we do not change everything at once.
   change, update the comment, **regenerate all 1024 maps** (`python src/gen_maps.py
   --count 1024 --out maps --seed 0`, ~2 min); `validate_against_config` rejects mismatches.
 - **No pre-SI physics code remains** — every stage of `step_fields` is now SI (Phases 0–5).
-  A single fire burns physically and radiantly **preheats** its neighbours, but does **not yet
-  spread** (ignition needs sustained flaming + convection — Phase 5.5). (`relax_to_equilibrium`
-  is retained but now only drives oxygen replenishment; temperature is the physical balance of
-  Phase 3.)
+  A fire burns physically, radiantly **preheats** its neighbours, and now **spreads** as a
+  self-sustaining convective front (Phase 5.5a–c); the upslope bias is the remaining leg (d).
+  (`relax_to_equilibrium` is retained but now only drives oxygen replenishment; temperature is the
+  physical balance of Phase 3.)
 - **Closed-core conservation tests**: pass `momentum={"sponge_strength":0,"drag_coeff":0}`
   to recover exact periodic conservation (the open sponge otherwise adds/removes air).
 - **Fire→wind coupling already wired**: forcing `−g′∇s`, `s=terrain+η`, `η=m·R_d·T/p_ref`;
@@ -491,6 +521,11 @@ Each phase is independently testable; we do not change everything at once.
 - **Phase 5** *(done)*: `kernel_radius_m=100` (≈10 cells; inverse-square weight ~1% by there),
   `sky_escape_fraction=0.2`, reusing `ε=0.95` from `[radiation]`. Tuned as a *preheating* leg, not
   an ignition driver — spread calibration is Phase 5.5.
+- **Phase 5.5c** *(done)*: convective spread tuned to a realistic self-sustaining front —
+  `burn_heat_fuel_fraction=0.05` and `plume_mixing_depth=100 m` hold the flame at ~1540 K;
+  `convective_fraction=0.12`, `flame_gate_temperature=700 K`, `convective_radius_m=10`,
+  `convective_wind_bias=1.0` give ~2–5 m/s spread with a clean lee bias. Radiation was confirmed too
+  weak to ignite at realistic flame temps, so convection is the spread driver (radiation stays preheat).
 
 ## Known limitations / deferred
 

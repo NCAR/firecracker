@@ -127,7 +127,7 @@ class Simulation:
         # fuel breathes freely, dense fuel chokes and leans on wind/mixing to keep burning.
         self.fire_enabled:                bool  = bool(fire.get("enabled", True))
         self.fuel_burnt_threshold:        float = float(fire.get("burnt_threshold",          0.01))
-        self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",  0.2))
+        self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",  0.05))
         self.combustion_mixing_depth:     float = float(fire.get("combustion_mixing_depth",  30.0))
         # O2 film-transport coefficient h [kg/(m^2*s)] (Phase 5.5): the diffusive oxygen mass flux
         # reaching a fuel surface, which caps the burn rate once the fuel is flame-hot (the kinetics
@@ -136,7 +136,21 @@ class Simulation:
         # Plume depth d_plume [m] (Phase 5.5b): the shallow near-surface layer the combustion
         # air-share heat is injected into (rather than the full ~1 km column), so the burn raises
         # a strong, advectable air-temperature signal that lifts eta and drives the indraft.
-        self.plume_mixing_depth:          float = float(fire.get("plume_mixing_depth",        30.0))
+        self.plume_mixing_depth:          float = float(fire.get("plume_mixing_depth",        100.0))
+        # Convective fire spread (Phase 5.5c). Radiation preheats the fuel ahead but is too weak to
+        # ignite a neighbour at realistic flame temperatures, so ignition is carried by convection: a
+        # fraction of the plume's air-share heat is convected to nearby fuel to ignite it (hot plume
+        # gas / flame contact) -- the mechanism that propagates the front (convection-dominant spread,
+        # realistic for grass). convective_fraction is that share; it is deposited only into
+        # sub-flaming fuel (below flame_gate_temperature -- flaming fuel is combustion-controlled, so
+        # this bounds the front temperature) over a short convective_radius_m reach, skewed downwind by
+        # convective_wind_bias (a dipole; <=1 keeps the upwind weight non-negative). The downwind skew
+        # gives the lee bias; the same kernel carries the upslope bias in leg (d).
+        self.convective_fraction:         float = float(fire.get("convective_fraction",       0.12))
+        self.flame_gate_temperature:      float = float(fire.get("flame_gate_temperature",    700.0))
+        self.convective_wind_bias:        float = float(fire.get("convective_wind_bias",      1.0))
+        conv_radius_m                           = float(fire.get("convective_radius_m",       10.0))
+        self.convective_radius:           int   = max(1, round(conv_radius_m / self.cell_size_m))
 
         # ---------------------------------------------------------------------------
         # Fuel types — parsed in config order; add subtables to expand.
@@ -187,6 +201,9 @@ class Simulation:
         self.sky_escape_fraction:       float = float(radiant.get("sky_escape_fraction", 0.2))
 
         self._radiant_kernel = self._build_radiant_kernel(self.radiant_kernel_radius)
+        # Convective-ignition dipole kernels (Phase 5.5c): an isotropic K0 plus two antisymmetric
+        # direction kernels (gx, gy) so the deposit can be skewed per-cell by the local wind.
+        self._conv_k0, self._conv_gx, self._conv_gy = self._build_convective_kernels(self.convective_radius)
         # Fixed 5-point Laplacian stencil for explicit diffusion (1,1,3,3) on-device.
         self._laplace_kernel = torch.tensor(
             [[[[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]]],
@@ -235,6 +252,43 @@ class Simulation:
         kernel = torch.where(r_sq > 0, 1.0 / safe_r_sq, torch.zeros_like(r_sq))
         kernel = kernel / kernel.sum()
         return kernel.view(1, 1, size, size)
+
+    def _build_convective_kernels(self, radius: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Isotropic + dipole kernels for the wind-skewed convective ignition (Phase 5.5c).
+
+        K0 is a normalised Gaussian over the neighbourhood (centre excluded -- a cell does not
+        convect to itself). gx, gy are K0 weighted by the unit offset in x/y, so they are
+        antisymmetric (sum to zero). A deposit conv(S,K0) - beta*(conv(S*wx,gx)+conv(S*wy,gy))
+        moves more of S downwind (along the per-cell unit wind w) while conserving the total, for
+        beta<=1 (beyond which the upwind weight would go negative).
+        """
+        size = 2 * radius + 1
+        coords = torch.arange(size, dtype=self.dtype, device=self.device) - radius
+        rows, cols = torch.meshgrid(coords, coords, indexing="ij")
+        r_sq = rows ** 2 + cols ** 2
+        k0 = torch.where(r_sq > 0, torch.exp(-r_sq / (2.0 * (radius / 1.5) ** 2)), torch.zeros_like(r_sq))
+        k0 = k0 / k0.sum()
+        r = torch.sqrt(r_sq.clamp(min=1e-9))
+        gx = torch.where(r_sq > 0, k0 * cols / r, torch.zeros_like(k0))   # +x dipole (cols index x)
+        gy = torch.where(r_sq > 0, k0 * rows / r, torch.zeros_like(k0))   # +y dipole (rows index y)
+        v = lambda t: t.view(1, 1, size, size)
+        return v(k0), v(gx), v(gy)
+
+    def _convective_deposit(self, source: torch.Tensor, wx: torch.Tensor, wy: torch.Tensor) -> torch.Tensor:
+        """Redistribute `source` [.., H, W] to neighbours, skewed downwind by unit wind (wx, wy).
+
+        Energy-conserving (the kernels' weights sum to 1 for any cell) apart from off-grid edge
+        loss, which is a real loss at the open boundary. Rank-agnostic via the trailing-axis conv.
+        """
+        r = self.convective_radius
+        def conv(field: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+            *lead, h, w = field.shape
+            out = F.conv2d(field.reshape(-1, 1, h, w), kernel, padding=r)
+            return out.reshape(*lead, h, w)
+        beta = min(self.convective_wind_bias, 1.0)
+        return conv(source, self._conv_k0) - beta * (
+            conv(source * wx, self._conv_gx) + conv(source * wy, self._conv_gy)
+        )
 
     def _diffuse(self, field: torch.Tensor, sigma: float) -> torch.Tensor:
         # Explicit Laplacian diffusion with no-flux (reflect) boundaries. The
@@ -532,6 +586,8 @@ class Simulation:
         fuel: torch.Tensor,               # (N, H, W)     per-type biomass [kg/m^2]
         oxygen: torch.Tensor,             # (H, W)        O2 partial density [kg/m^3]
         air_mass: torch.Tensor,           # (H, W)        boundary-layer areal mass m [kg/m^2]
+        x_wind_vel: torch.Tensor | None = None,  # (H, W) wind u [m/s] -- skews convective ignition
+        y_wind_vel: torch.Tensor | None = None,  # (H, W) wind v [m/s]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Surface-area-controlled, oxygen-limited combustion over one tick.
 
@@ -549,7 +605,10 @@ class Simulation:
         giving a whole-cell inventory backstop on top of the per-surface film transport. The air
         share of the heat is deposited into a shallow plume slab of depth plume_mixing_depth
         (Phase 5.5b), not the full column, so a burn warms the air strongly enough to drive a
-        convective signal. All rates use pre-step temperatures.
+        convective signal. A fraction of that air share (convective_fraction) is convected to nearby
+        fuel to ignite it (Phase 5.5c) -- the spread driver, since radiation preheats the fuel ahead
+        but is too weak to ignite it alone; skewed downwind by the wind so the spread shows a lee
+        bias. All rates use pre-step temperatures.
         """
         R, cp_air = pc.UNIVERSAL_GAS_CONSTANT, pc.CP_AIR
         dt, d_mix = self.dt, self.combustion_mixing_depth
@@ -590,30 +649,60 @@ class Simulation:
         # Heat released per type [J/m^2], split between air and fuel.
         burn_heat_per_type = hhv * fuel_consumed              # (N, H, W)
         total_burn_heat    = burn_heat_per_type.sum(dim=-3)   # (H, W)
+        f = self.burn_heat_fuel_fraction
 
-        # Combustion gases rise in a shallow buoyant plume of depth d_plume, not mixed through
-        # the full ~1 km boundary-layer column, so the air share is injected into that thin slab
-        # (Phase 5.5b) -- the convective heat the wind advects and that lifts eta -> indraft.
-        # The plume's heat capacity uses the local near-surface density rho = p_ref/(R_d*T_a)
-        # (= m/eta at reference pressure), so the signal scales with the actual air state; hotter
-        # air is lighter, slightly more responsive, bounded by the Phase 3 T^4 sink. This deposits
-        # the heat over ~34x less mass than the column would, so a burn warms the air strongly
-        # enough to drive convection (a deliberate sub-grid plume scale, mirroring oxygen's d_mix).
+        # Fuel self-heat: each type warms by its share f*HHV*Dfuel over its thermal mass fuel*c_p.
+        # This sets the flame temperature (bounded by the Phase 3 T^4 sink); convective ignition
+        # below is gated off above flame_gate so it never drives the flame, only ignites cold fuel.
+        C_fuel  = cp_fuel * fuel
+        safe_C  = torch.where(present, C_fuel, torch.ones_like(C_fuel))
+        dT_self = torch.where(present, burn_heat_per_type * f / safe_C, torch.zeros_like(C_fuel))
+        fuel_temperatures = (fuel_temperatures + dT_self).clamp(min=0.0)
+
+        # Air share (1-f) rises in a shallow buoyant plume of depth d_plume (Phase 5.5b), not the
+        # full ~1 km column, using the local near-surface density rho = p_ref/(R_d*T_a) (= m/eta at
+        # reference pressure): C_plume = rho*d_plume*c_p_air, ~30x less mass than the column, so a
+        # burn warms the air strongly (a sub-grid plume scale, mirroring oxygen's d_mix). Hotter air
+        # is lighter -> smaller capacity -> slightly more responsive, bounded by the T^4 sink.
         rho_local = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures.clamp(min=1.0))  # (H, W)
         C_plume   = rho_local * self.plume_mixing_depth * cp_air                            # (H, W)
-        air_temperatures = (
-            air_temperatures + total_burn_heat * (1.0 - self.burn_heat_fuel_fraction) / C_plume
-        ).clamp(min=0.0)
+        air_share = total_burn_heat * (1.0 - f)              # (H, W) [J/m^2] into the plume
 
-        # Each type's fuel warms by its share over its thermal mass fuel*c_p_fuel.
-        C_fuel  = cp_fuel * fuel
-        safe_C  = torch.where(fuel > self.fuel_burnt_threshold, C_fuel, torch.ones_like(C_fuel))
-        dT_fuel = torch.where(
-            fuel > self.fuel_burnt_threshold,
-            burn_heat_per_type * self.burn_heat_fuel_fraction / safe_C,
-            torch.zeros_like(C_fuel),
-        )
-        fuel_temperatures = (fuel_temperatures + dT_fuel).clamp(min=0.0)
+        # Convective ignition (Phase 5.5c): radiation preheats the fuel ahead but can't ignite a
+        # neighbour at a realistic flame temperature, so a fraction of the fresh air-share heat is
+        # convected to nearby fuel to ignite it -- the propagation driver. It is sourced from this tick's
+        # combustion (not the advected air field, so wind cannot sweep the source away) and skewed
+        # downwind by a per-cell dipole, giving the lee bias. It is deposited only into sub-flaming
+        # fuel (below flame_gate -- flaming fuel is combustion-controlled), with a thermal-mass floor
+        # so near-burnt cells do not superheat, and clamped so one tick cannot drive fuel past the
+        # gate; whatever the fuel does not absorb stays in the plume air, so energy is conserved.
+        if x_wind_vel is None:
+            x_wind_vel = torch.zeros_like(air_temperatures)
+        if y_wind_vel is None:
+            y_wind_vel = torch.zeros_like(air_temperatures)
+        cf = self.convective_fraction
+        speed = torch.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2).clamp(min=1e-9)
+        delivered = self._convective_deposit(
+            cf * air_share, x_wind_vel / speed, y_wind_vel / speed
+        ).clamp(min=0.0)                                      # (H, W) [J/m^2] arriving at neighbours
+
+        C_floor    = (cp_fuel * 10.0 * self.fuel_burnt_threshold).expand_as(C_fuel)  # ~burnt-mass floor
+        C_dep      = torch.maximum(C_fuel, C_floor)
+        fuel_frac  = fuel / fuel.sum(dim=-3).clamp(min=1e-12).unsqueeze(-3)
+        gate       = present & (fuel_temperatures < self.flame_gate_temperature)
+        dT_conv    = torch.where(gate, delivered.unsqueeze(-3) * fuel_frac / C_dep, torch.zeros_like(C_fuel))
+        capped     = torch.minimum(fuel_temperatures + dT_conv,
+                                   torch.full_like(fuel_temperatures, self.flame_gate_temperature))
+        dT_conv    = (capped - fuel_temperatures).clamp(min=0.0)
+        absorbed   = (C_fuel * dT_conv).sum(dim=-3)           # (H, W) [J/m^2] the fuel took up (<= delivered)
+        fuel_temperatures = (fuel_temperatures + dT_conv).clamp(min=0.0)
+
+        # Energy bookkeeping (conserved, off-grid edge loss aside): the source plume keeps the
+        # non-convected share (1-cf)*air_share; each receiver's leftover convected heat that its
+        # fuel did not take up (delivered - absorbed) warms that cell's own plume air.
+        air_temperatures = (
+            air_temperatures + ((1.0 - cf) * air_share + (delivered - absorbed)) / C_plume
+        ).clamp(min=0.0)
 
         return air_temperatures, fuel_temperatures, fuel, oxygen.clamp(min=0.0)
 
@@ -705,7 +794,8 @@ class Simulation:
 
         if self.fire_enabled:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
-                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass
+                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
+                s.x_wind_vel, s.y_wind_vel,
             )
             s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
                 s.fuel_temperatures, s.fuel, s.temp_eq
