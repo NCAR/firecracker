@@ -133,6 +133,10 @@ class Simulation:
         # reaching a fuel surface, which caps the burn rate once the fuel is flame-hot (the kinetics
         # are no longer limiting). Sets the transport-limited surface flux psi_dif = h*(O2/O2_ref).
         self.surface_mass_transfer:       float = float(fire.get("surface_mass_transfer",    0.02))
+        # Plume depth d_plume [m] (Phase 5.5b): the shallow near-surface layer the combustion
+        # air-share heat is injected into (rather than the full ~1 km column), so the burn raises
+        # a strong, advectable air-temperature signal that lifts eta and drives the indraft.
+        self.plume_mixing_depth:          float = float(fire.get("plume_mixing_depth",        30.0))
 
         # ---------------------------------------------------------------------------
         # Fuel types — parsed in config order; add subtables to expand.
@@ -542,8 +546,10 @@ class Simulation:
         releases its heat of combustion HHV, split between fuel and air by burn_heat_fuel_fraction.
         Oxygen is a partial density [kg/m^3] while the burn is areal [kg/m^2], so they also couple
         through the shallow combustion mixing depth d_mix (the near-surface air the fire entrains),
-        giving a whole-cell inventory backstop on top of the per-surface film transport. All rates
-        use pre-step temperatures.
+        giving a whole-cell inventory backstop on top of the per-surface film transport. The air
+        share of the heat is deposited into a shallow plume slab of depth plume_mixing_depth
+        (Phase 5.5b), not the full column, so a burn warms the air strongly enough to drive a
+        convective signal. All rates use pre-step temperatures.
         """
         R, cp_air = pc.UNIVERSAL_GAS_CONSTANT, pc.CP_AIR
         dt, d_mix = self.dt, self.combustion_mixing_depth
@@ -585,10 +591,18 @@ class Simulation:
         burn_heat_per_type = hhv * fuel_consumed              # (N, H, W)
         total_burn_heat    = burn_heat_per_type.sum(dim=-3)   # (H, W)
 
-        # Air warms by its share over the column heat capacity m*c_p_air [J/(m^2*K)].
-        C_air = (air_mass.clamp(min=1e-6) * cp_air)
+        # Combustion gases rise in a shallow buoyant plume of depth d_plume, not mixed through
+        # the full ~1 km boundary-layer column, so the air share is injected into that thin slab
+        # (Phase 5.5b) -- the convective heat the wind advects and that lifts eta -> indraft.
+        # The plume's heat capacity uses the local near-surface density rho = p_ref/(R_d*T_a)
+        # (= m/eta at reference pressure), so the signal scales with the actual air state; hotter
+        # air is lighter, slightly more responsive, bounded by the Phase 3 T^4 sink. This deposits
+        # the heat over ~34x less mass than the column would, so a burn warms the air strongly
+        # enough to drive convection (a deliberate sub-grid plume scale, mirroring oxygen's d_mix).
+        rho_local = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures.clamp(min=1.0))  # (H, W)
+        C_plume   = rho_local * self.plume_mixing_depth * cp_air                            # (H, W)
         air_temperatures = (
-            air_temperatures + total_burn_heat * (1.0 - self.burn_heat_fuel_fraction) / C_air
+            air_temperatures + total_burn_heat * (1.0 - self.burn_heat_fuel_fraction) / C_plume
         ).clamp(min=0.0)
 
         # Each type's fuel warms by its share over its thermal mass fuel*c_p_fuel.
