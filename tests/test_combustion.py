@@ -1,14 +1,19 @@
 """
-Smooth Arrhenius, oxygen-limited combustion (Phase 4).
+Surface-area-controlled, oxygen-limited combustion (Phase 4 + 5.5).
 
-update_fire is a continuous reaction rate k = A*exp(-E_a/(R*T_fuel)) [1/s], throttled by the
-local oxygen fraction, with no hard ignition threshold: cold fuel is inert only because the
-exponential underflows at ambient temperature. Burned mass releases its heat of combustion HHV,
-split between fuel and air by burn_heat_fuel_fraction; oxygen [kg/m^3] couples to the areal burn
-[kg/m^2] through the shallow combustion mixing depth d_mix. These tests pin the inert-cold limit,
-ignition under heat, the oxygen throttle, the stoichiometric O2 budget, the HHV energy split, and
-the Arrhenius monotonicity in temperature. Rates are checked per step in regimes chosen so the
-fuel cap and the oxygen cap do not bind (those limits are exercised separately).
+update_fire burns fuel at its reactive surface, not in bulk: the areal rate is a_s*fuel times a
+surface mass flux psi that puts chemistry in series with oxygen transport -- psi_kin =
+B*exp(-E_a/(R*T_fuel)) (kinetic, the ignition gate; cold fuel is inert as the exponential
+underflows) and psi_dif = h*(O2/O2_ref) (O2 film diffusion, the flame-hot cap). Consumption is the
+exact-exponential Dfuel = fuel*(1 - exp(-a_s*psi*dt)), so a cell burns over a residence time
+tau ~ 1/(a_s*psi) (Phase 5.5) instead of all at once. Burned mass releases its heat of combustion
+HHV, split between fuel and air by burn_heat_fuel_fraction; oxygen [kg/m^3] also couples to the
+areal burn [kg/m^2] through the shallow mixing depth d_mix as a whole-cell inventory backstop.
+These tests pin the inert-cold limit, ignition under heat, the (now series, not linear) oxygen
+throttle, the inventory cap, the stoichiometric O2 budget, the HHV energy split, kinetic
+monotonicity below the transport cap, the multi-tick residence time, and the surface-area (SAV)
+control of burn rate. Rates are checked in regimes chosen so the inventory cap does not bind unless
+a test targets it.
 """
 
 import numpy as np
@@ -20,9 +25,16 @@ from simulation import Simulation
 
 
 def _sim() -> Simulation:
-    # grass falls to the _ft_tensor combustion defaults (A=1e8, E_a=1e5, HHV=1.6e7,
-    # s=1.4, cp=2000); d_mix defaults to 30 m and dt to 0.1 s.
+    # grass falls to the _ft_tensor combustion defaults (B=1e8, E_a=1e5, HHV=1.6e7, s=1.4,
+    # sigma=12000, rho_p=500 -> a_s=24); h=0.02, d_mix=30 m and dt=0.1 s.
     return Simulation(make_config(fuel_type_names=("grass",)))
+
+
+def _cfg_with(*, sav: float) -> dict:
+    """make_config with a chosen surface-area-to-volume for the single grass type."""
+    cfg = make_config(fuel_type_names=("grass",))
+    cfg["fuel_types"]["grass"]["surface_area_to_volume"] = sav
+    return cfg
 
 
 def _f(sim, value, shape=(8, 8)) -> torch.Tensor:
@@ -67,33 +79,44 @@ def test_hot_fuel_ignites_and_releases_heat():
 
 
 def test_oxygen_throttles_and_extinguishes():
-    """With no oxygen the rate vanishes; half the oxygen burns about half the fuel."""
+    """O2 enters the surface flux (psi_dif), so the rate vanishes with no oxygen and rises with it.
+
+    The dependence is no longer linear -- O2 is one of two series resistances (film transport vs
+    chemistry) -- so we pin the qualitative throttle: zero O2 burns nothing, more O2 burns strictly
+    more.
+    """
     sim = _sim()
 
-    # No oxygen -> no reaction at all.
-    air0, ft0, fuel0, oxy0 = _burn(sim, temp=700.0, oxygen=0.0)
+    # No oxygen -> psi_dif = 0 -> the series flux is zero -> no reaction at all.
+    air0, _, fuel0, oxy0 = _burn(sim, temp=700.0, oxygen=0.0)
     np.testing.assert_allclose(fuel0.cpu().numpy(), 1.0, atol=1e-12)
     np.testing.assert_allclose(air0.cpu().numpy(), pc.T_REF, atol=1e-12)
     np.testing.assert_allclose(oxy0.cpu().numpy(), 0.0, atol=1e-12)
 
-    # Rate is linear in the oxygen fraction (in the unsaturated regime): half O2 -> half burn.
-    _, _, fuel_full, _ = _burn(sim, temp=600.0, oxygen=pc.O2_DENSITY_REF)
-    _, _, fuel_half, _ = _burn(sim, temp=600.0, oxygen=0.5 * pc.O2_DENSITY_REF)
-    d_full = 1.0 - float(fuel_full.mean())
-    d_half = 1.0 - float(fuel_half.mean())
-    np.testing.assert_allclose(d_half, 0.5 * d_full, rtol=1e-6)
+    # More oxygen -> more burn (monotonic, via the film-transport term psi_dif = h*(O2/O2_ref)).
+    burned = []
+    for frac in (0.0, 0.5, 1.0):
+        _, _, fuel, _ = _burn(sim, temp=600.0, oxygen=frac * pc.O2_DENSITY_REF)
+        burned.append(1.0 - float(fuel.mean()))
+    assert burned[0] == 0.0
+    assert burned[0] < burned[1] < burned[2]
 
 
-def test_oxygen_limited_burn_is_clamped():
-    """When oxygen runs short it limits fuel too: the reaction scales to the O2 available."""
+def test_oxygen_inventory_cap_binds_at_high_load():
+    """The d_mix inventory backstop: a dense fuel load can out-draw the O2 present in one tick.
+
+    The film-transport throttle (psi_dif) usually self-limits the draw below the cell's O2, but a
+    heavy load (here 300 kg/m^2) demands more O2 than the d_mix slab holds, so the whole-cell
+    inventory limiter scales the reaction to the oxygen available -- all O2 is consumed and the fuel
+    burned matches it stoichiometrically.
+    """
     sim = _sim()
-    o2_start = 0.01                                  # far less than a full hot burn would demand
-    _, _, fuel, oxy = _burn(sim, temp=1000.0, oxygen=o2_start, fuel=1.0)
+    fuel0, o2_start = 300.0, 0.1                      # dense load, modest O2 -> inventory cap binds
+    _, _, fuel, oxy = _burn(sim, temp=1000.0, oxygen=o2_start, fuel=fuel0)
 
-    fuel_burned = 1.0 - float(fuel.mean())
+    fuel_burned = fuel0 - float(fuel.mean())
     s, d_mix = float(sim.stoich_oxygen[0]), sim.combustion_mixing_depth
 
-    assert fuel_burned < 1.0                         # NOT a full burn -- oxygen capped it
     np.testing.assert_allclose(float(oxy.mean()), 0.0, atol=1e-9)   # all oxygen consumed
     # Fuel actually burned matches the oxygen that was available (stoichiometric, not over-drawn).
     np.testing.assert_allclose(s * fuel_burned / d_mix, o2_start, rtol=1e-6)
@@ -132,7 +155,11 @@ def test_hhv_energy_split():
 
 
 def test_arrhenius_monotonic_in_temperature():
-    """Hotter fuel burns faster (within the unsaturated regime)."""
+    """Hotter fuel burns faster while the kinetic flux is limiting (below the transport cap).
+
+    Above the kinetic->diffusion crossover the surface flux saturates at psi_dif, so the burn rate
+    plateaus; here the temperatures sit below it, where psi is still climbing with the Arrhenius term.
+    """
     sim = _sim()
     burned = []
     for temp in (560.0, 600.0, 640.0):
@@ -141,3 +168,55 @@ def test_arrhenius_monotonic_in_temperature():
 
     assert burned[0] < burned[1] < burned[2]
     assert burned[0] > 0.0
+
+
+def test_burn_is_not_one_tick_and_lasts_a_residence_time():
+    """Phase 5.5: a flame-hot cell is consumed gradually over seconds, not all in a single tick.
+
+    Surface-area control + O2 film transport cap the rate, so even at a high flame temperature only
+    a small fraction of the fuel burns per 0.1 s tick, and full burn-down takes a multi-second
+    residence time. (Fuel temperature is pinned to the flame value each tick to isolate the
+    consumption rate -- in the full loop the radiative T^4 sink bounds the flame instead.)
+    """
+    sim = _sim()
+    flame = 1200.0
+
+    # One tick at flame temperature leaves most of the fuel: NOT the old one-tick burnout.
+    _, _, fuel1, _ = _burn(sim, temp=flame, oxygen=pc.O2_DENSITY_REF, fuel=1.0)
+    assert float(fuel1.mean()) > 0.9
+
+    # Burn down with the temperature held at the flame value; count ticks to consume ~90%.
+    shape = (8, 8)
+    air = _f(sim, pc.T_REF)
+    fuel = _f(sim, 1.0).unsqueeze(0)
+    oxy = _f(sim, pc.O2_DENSITY_REF)
+    mass = _f(sim, 1500.0)
+    ticks = 0
+    while float(fuel.mean()) > 0.1 and ticks < 2000:
+        fuel_t = _f(sim, flame).unsqueeze(0)          # re-pin the flame temperature each tick
+        air, _, fuel, oxy = sim.update_fire(air, fuel_t, fuel, oxy, mass)
+        oxy = _f(sim, pc.O2_DENSITY_REF)              # hold ambient O2 (isolate the surface rate)
+        ticks += 1
+
+    residence_s = ticks * sim.dt
+    assert residence_s > 2.0          # a real flaming residence, not a single 0.1 s tick
+    assert residence_s < 120.0        # but grass-fast, not log-slow
+
+
+def test_surface_area_to_volume_controls_burn_rate():
+    """Phase 5.5: high-SAV fuel (grass) burns far faster than low-SAV fuel (a log) at equal state.
+
+    Same material (HHV, density, kinetics), only sigma differs -- grass shaved fine vs a coarse log
+    -- so the reactive surface area a_s = sigma/rho_p sets the rate, the physical reason grass
+    flashes and logs smoulder.
+    """
+    grass = Simulation(_cfg_with(sav=12000.0))
+    log = Simulation(_cfg_with(sav=40.0))
+
+    _, _, fuel_g, _ = _burn(grass, temp=1200.0, oxygen=pc.O2_DENSITY_REF, fuel=1.0)
+    _, _, fuel_l, _ = _burn(log, temp=1200.0, oxygen=pc.O2_DENSITY_REF, fuel=1.0)
+
+    burned_grass = 1.0 - float(fuel_g.mean())
+    burned_log = 1.0 - float(fuel_l.mean())
+    assert burned_grass > 100.0 * burned_log          # ~sigma ratio (300x) -> grass burns far faster
+    assert burned_log > 0.0
