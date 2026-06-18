@@ -275,17 +275,18 @@ def build_fire_surface(
     scale: int,
     ignition_thresholds: np.ndarray,     # (N,)
     fuel_burnt_threshold: float,
-    oxygen_extinction_threshold: float,
     show_fire_overlay: bool = True,
 ) -> pygame.Surface:
     rows, cols = fuel_temperatures.shape[1], fuel_temperatures.shape[2]
     rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
 
+    # Visual "burning": hot enough to pyrolyse, with fuel and oxygen present. Combustion is a
+    # smooth Arrhenius rate (no extinction threshold), so this is a display/diagnostic cutoff only.
     ign = ignition_thresholds[:, np.newaxis, np.newaxis]
     burning_per_type = (
         (fuel_temperatures >= ign) &
         (fuel > fuel_burnt_threshold) &
-        (oxygen[np.newaxis] > oxygen_extinction_threshold)
+        (oxygen[np.newaxis] > 0.0)
     )
     any_burning = burning_per_type.any(axis=0)  # (H, W)
 
@@ -591,7 +592,6 @@ class FirecrackerEnv(gymnasium.Env):
         self._fire_surface = build_fire_surface(
             fuel_temps, fuel, oxygen, self._pixel_scale,
             ignition_thresholds, self._sim.fuel_burnt_threshold,
-            self._sim.oxygen_extinction_threshold,
             self._show_fire_overlay and self._sim.fire_enabled,
         )
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
@@ -695,7 +695,7 @@ class FirecrackerEnv(gymnasium.Env):
         burning_per_type = (
             (self._fuel_temperatures >= ign) &
             (self._fuel > self._sim.fuel_burnt_threshold) &
-            (self._oxygen[None] > self._sim.oxygen_extinction_threshold)
+            (self._oxygen[None] > 0.0)
         ) if self._sim.fire_enabled else torch.zeros_like(self._fuel, dtype=torch.bool)
 
         # Reduce every metric on-device, then pull the whole batch back in a SINGLE

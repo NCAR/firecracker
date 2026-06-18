@@ -183,26 +183,41 @@ Phase 4). Oxygen replenishment (`oxygen_rate`) is the only remaining Newtonian r
 
 ### Combustion (replaces `update_fire`)
 
-Smooth Arrhenius reaction rate, limited by both fuel and oxygen:
+Smooth Arrhenius reaction rate, limited by both fuel and oxygen (molar `R = 8.314`):
 
 ```
-ṙ = A_pre · exp(-E_a / (R T_fuel)) · fuel · [O₂]      [kg/(m²·s)]
+k(T_f)  = A_pre · exp(-E_a / (R · T_f))              [1/s]   Arrhenius rate
+Δfuel   = fuel · k · (O₂ / O₂_ref) · dt              [kg/m²] capped at the fuel present
 ```
 
 No hard ignition threshold — the Arrhenius exponential makes the rate vanishingly small
-at ambient temperature on its own (a tiny numerical floor avoids denormals only).
-`A_pre` and `E_a` are tuned in Phase 4 so cold fuel is inert and ignition onset lands
-near the pyrolysis temperatures in the constants table. Stoichiometric and energetic
-coupling per tick `Δfuel = ṙ·dt`:
+at ambient temperature on its own. The oxygen dependence is the *fractional* availability
+`O₂/O₂_ref` (`O₂_ref` = ambient sea-level O₂ density ≈ 0.27 kg/m³), which keeps `A_pre` a
+clean 1/s and smoothly extinguishes the fire as oxygen is drawn down. `A_pre` and `E_a` are
+tuned so cold fuel is inert and ignition onset lands near the pyrolysis temperatures.
+
+The oxygen field is the **near-surface combustion-layer density** [kg/m³], and `d_mix`
+(~30 m) is that layer's depth. The areal burn draws `s·Δfuel` from a `d_mix`-deep slab, so a
+vigorous fire can locally **deplete its own oxygen**; resupply is modelled separately —
+**advection** feeds fresh air horizontally (the wind, Phase 2) and the **oxygen relaxation**
+mixes it down vertically. This is the **ventilation-limited** regime: sparse fuel breathes
+freely (fuel-limited), dense fuel can clamp O₂ to zero and lean on wind/mixing to keep burning.
+`d_mix` is a modelling scale (like the wind core's `g′`/`ν`) that sets *when* oxygen bites — not
+the ~1 km boundary layer, which would make O₂ effectively unlimited and the field pointless.
 
 ```
-ΔO₂   = s · Δfuel                    (capped at available O₂)
-Q_burn = HHV · Δfuel / dt            [W/m²], split between air and fuel by burn_heat_fuel_fraction
+ΔO₂    = s · Δfuel / d_mix           [kg/m³]
+Q_burn = HHV · Δfuel                 [J/m²], split between air and fuel by burn_heat_fuel_fraction
 ```
 
-Fuel↔air conduction (`exchange_fuel_air_heat`) keeps its exact two-body exponential
-form but with real heat capacities: `C_air = m·c_p,air` (currently missing the
-`·c_p,air`), `C_fuel = fuel·c_p,fuel`, and a conductance `k` in W/(m²·K).
+Both reactants are required, so the limiting is **two-way**: if the oxygen draw would exceed the
+O₂ present, the whole reaction is scaled down (fuel, oxygen, and heat together) so they are
+consumed in stoichiometric step — a fire starved of air burns less fuel, not the same fuel with
+the books forced to balance.
+
+The air share warms the column over `m·c_p,air`. Fuel↔air conduction (`exchange_fuel_air_heat`)
+keeps its exact two-body exponential form, now with real heat capacities `C_air = m·c_p,air`,
+`C_fuel = fuel·c_p,fuel`, a conductance `k` in W/(m²·K), and the decay exponent carrying `·dt`.
 
 ### Fire radiant transfer (replaces `apply_radiant_heat`)
 
@@ -314,19 +329,34 @@ Each phase is independently testable; we do not change everything at once.
    here and Phase 5's flame emission both use `εσT_f⁴` — Phase 5 must **redistribute** that
    emission to neighbours, not add a second one (no double-count today: `apply_radiant_heat` is
    still pre-SI). *Emergent (future):* cold slopes → smaller `η` → `−g′∇s` → katabatic drainage.
-4. **Combustion + SI oxygen** — rewrite `update_fire`; fix `exchange_fuel_air_heat`.
-   Arrhenius O₂-limited rate `ṙ = A·exp(−E_a/(R·T_fuel))·fuel·[O₂]` [kg/m²/s] (no hard
-   threshold; tiny numerical floor). Per tick `Δfuel = ṙ·dt`: `ΔO₂ = s·Δfuel` (s≈1.4,
-   capped at available O₂); `Q_burn = HHV·Δfuel` (HHV≈1.6–1.8e7 J/kg) split air/fuel by
-   `burn_heat_fuel_fraction`. **Fix:** `exchange_fuel_air_heat` `C_air` must be
-   `air_mass·cp_air` (currently missing `·cp`); `C_fuel = fuel·cp_fuel` — **consolidate onto the
-   SI `specific_heat` key added in Phase 3** (grass 1800, tree 2300) and drop the pre-SI
-   `heat_capacity`. Oxygen is already kg/m³ advected
-   by the wind (Phase 2); couple consumption + ambient mixing. Tune `A,E_a` so cold fuel is
-   inert, ignition ≈ pyrolysis temps (grass 573 K, tree 600 K, already in cfg). Rewrite
-   `[fire]`/`[fuel_types]` combustion constants to SI. Fire heats `T` → `η` → indraft wind
-   (keep `T` in `η`). *Tests:* O₂/fuel stoichiometric budget; HHV split; no ambient burn;
-   fire-driven indraft.
+4. **Combustion + SI oxygen** ✅ *done* — `update_fire` rewritten to a smooth Arrhenius,
+   oxygen-limited rate `k = A·exp(−E_a/(R·T_fuel))` [1/s] (molar `R`), throttled by the local
+   oxygen fraction `O₂/O₂_ref` — no hard ignition threshold (cold fuel is inert because the
+   exponential underflows at ambient `T`). Per tick `Δfuel = (fuel·k·(O₂/O₂_ref)·dt)` capped at
+   the fuel present; `Q_burn = HHV·Δfuel` [J/m²] (HHV 1.6e7 grass / 1.8e7 tree) split air/fuel by
+   `burn_heat_fuel_fraction`, the air share over `m·cp_air` (was a raw add with **no** heat
+   capacity). **Oxygen coupling:** O₂ is a partial density [kg/m³] but the burn is areal [kg/m²];
+   they reconcile through a shallow **combustion mixing depth** `d_mix` (config, ~30 m — the near-
+   surface air the fire entrains, *not* the ~1 km boundary layer), so `ΔO₂ = s·Δfuel/d_mix`
+   (s≈1.4). Limiting is **two-way** — if the O₂ draw exceeds what's present, the whole reaction
+   (fuel, oxygen, heat) scales down in stoichiometric step, so a fire starved of air burns less
+   fuel. Using `d_mix` rather than the full layer keeps oxygen a real local limiter, not just a
+   rate throttle. **`exchange_fuel_air_heat` fixed:** `C_air = m·cp_air` (was missing `·cp_air`),
+   `C_fuel = fuel·cp_fuel`, decay exponent now carries `·dt`. **Consolidated** every fuel
+   heat-capacity use onto the SI `specific_heat` key and **dropped** the pre-SI `heat_capacity`,
+   `consumption_rate`, `burn_heat_scale`; `[fuel_types]` gained SI `heat_of_combustion`,
+   `stoich_oxygen`, `arrhenius_pre`, `activation_energy`; `[fire]` dropped
+   `oxygen_consumption_rate`/`oxygen_extinction_threshold`, gained `combustion_mixing_depth`.
+   New constants `UNIVERSAL_GAS_CONSTANT`, `O2_DENSITY_REF`. No on-disk change (oxygen already
+   kg/m³, advected since Phase 2) — **no `units_version` bump, no map regen**. *Tests*
+   (`tests/test_combustion.py`): cold-fuel inert, ignition + heat release, oxygen throttle/
+   extinction, stoichiometric O₂ budget, HHV split, Arrhenius monotonic in `T`;
+   `test_heat_exchange` rebaselined to `cp_air`/`cp_fuel`/`dt`; `test_radiant_heat` rebaselined
+   for the `specific_heat` repoint. *Known:* at flame temps `k·dt ≫ 1`, so a hot cell burns its
+   fuel out in one tick (explicit-Euler saturation, capped at the fuel present — finite, but
+   sharp); revisit with sub-tick consumption in Phase 7. **Fire spread still awaits Phase 5**
+   (`apply_radiant_heat` is the propagation mechanism and is still pre-SI; burnt cells have
+   `C_fuel=0` and emit nothing).
 5. **Fire radiant transfer** — rewrite `apply_radiant_heat`: emit `E = ε·σ·T_fuel⁴·dt`
    [J/m²] capped at the cell's thermal energy; `sky_escape_fraction` to space; rest spread
    by `_radiant_convolve` (inverse-square) with **kernel radius in metres** (`radius_cells =
@@ -350,10 +380,11 @@ Each phase is independently testable; we do not change everything at once.
 - **`units_version`** (`map_loader.py`, currently **3**): bump on any on-disk semantics
   change, update the comment, **regenerate all 1024 maps** (`python src/gen_maps.py
   --count 1024 --out maps --seed 0`, ~2 min); `validate_against_config` rejects mismatches.
-- **Pre-SI code still live** (marked): `update_fire`, `apply_radiant_heat`,
-  `exchange_fuel_air_heat`, and the cfg combustion constants — replaced in Phases 4–5. So
-  stepping with fire on is not yet fully physical. (`relax_to_equilibrium` is retained but
-  now only drives oxygen replenishment; temperature is the physical balance of Phase 3.)
+- **Pre-SI code still live** (marked): `apply_radiant_heat` only (fire radiant transfer /
+  propagation) — replaced in Phase 5. `update_fire` and `exchange_fuel_air_heat` are now SI
+  (Phase 4). So a single fire burns physically but does **not yet spread**. (`relax_to_equilibrium`
+  is retained but now only drives oxygen replenishment; temperature is the physical balance of
+  Phase 3.)
 - **Closed-core conservation tests**: pass `momentum={"sponge_strength":0,"drag_coeff":0}`
   to recover exact periodic conservation (the open sponge otherwise adds/removes air).
 - **Fire→wind coupling already wired**: forcing `−g′∇s`, `s=terrain+η`, `η=m·R_d·T/p_ref`;
@@ -368,8 +399,10 @@ Each phase is independently testable; we do not change everything at once.
   channeling strength; defaults give prevailing 5–15 m/s with lee gusts ~20 m/s.
 - **Phase 3** *(done)*: per-cell `S_net = εσ·temp_eq⁴` lands radiative equilibrium on the
   rest profile (`≈ 455 W/m²` at `T_REF`); `ε=0.95`.
-- **Phase 4**: tune Arrhenius `A`, `E_a` so cold fuel is inert and ignition ≈ the cfg
-  pyrolysis temps; pin per-fuel `HHV`, `s`, `cp_fuel`.
+- **Phase 4** *(done)*: Arrhenius defaults (grass `A=1e8`, `E_a=1e5`; tree `A=5e7`,
+  `E_a=1.1e5`) make cold fuel inert at `T_REF` and the rate climb steeply through the cfg
+  pyrolysis temps; per-fuel `HHV`/`s`/`cp_fuel` pinned; `d_mix=30 m`. Revisit if Phase 5
+  spread needs a gentler onset.
 
 ## Known limitations / deferred
 

@@ -101,13 +101,19 @@ sponge_strength = 10.0    # [1/s]: peak edge relaxation rate toward (u_amb, rest
 cfl_target      = 0.5     # max Courant number per substep (advective + gravity-wave speed)
 
 [fire]
-enabled                     = true   # if false, combustion/radiant heat are skipped (watch convection only)
-oxygen_consumption_rate     = 3.0    # oxygen consumed per unit of fuel burned (stoichiometric)
-burnt_threshold             = 0.01   # fuel below this level is considered ash (no longer burns)
-oxygen_extinction_threshold = 0.05   # oxygen below this level extinguishes fire
-burn_heat_fuel_fraction     = 0.2    # fraction of burn heat deposited into fuel (rest goes to air)
-spawn_fire                  = false  # if true, a random fire spawns at reset; if false, left-click to ignite
-spawn_radius                = 5      # radius (in grid cells) of the circular ignition patch
+# Smooth Arrhenius, oxygen-limited combustion (see docs/units.md). The reaction rate per fuel
+# type is k = arrhenius_pre*exp(-activation_energy/(R*T_fuel)) [1/s], throttled by the local
+# oxygen fraction; there is no hard ignition threshold (cold fuel is inert because the
+# exponential underflows at ambient T). Burned mass releases heat_of_combustion, split between
+# fuel and air by burn_heat_fuel_fraction. The oxygen field is the near-surface combustion-layer
+# density [kg/m^3]; the areal burn [kg/m^2] draws from a combustion_mixing_depth-deep slab, so a
+# vigorous fire can locally deplete its O2 (resupplied by advection + the oxygen relaxation).
+enabled                  = true   # if false, combustion/radiant heat are skipped (watch convection only)
+burnt_threshold          = 0.01   # fuel below this level [kg/m^2] is considered ash (no longer burns)
+burn_heat_fuel_fraction  = 0.2    # fraction of burn heat deposited into fuel (rest goes to air)
+combustion_mixing_depth  = 30.0   # d_mix [m]: depth of the near-surface layer the fire draws O2 from
+spawn_fire               = false  # if true, a random fire spawns at reset; if false, left-click to ignite
+spawn_radius             = 5      # radius (in grid cells) of the circular ignition patch
 
 # ---------------------------------------------------------------------------
 # Fuel types — add more subtables here to expand to additional fuel types.
@@ -115,23 +121,25 @@ spawn_radius                = 5      # radius (in grid cells) of the circular ig
 # ---------------------------------------------------------------------------
 
 [fuel_types.grass]
-heat_capacity          = 0.5    # thermal mass per unit of fuel (pre-SI; -> J/(kg*K) in Phase 4)
-specific_heat          = 1800.0 # SI specific heat [J/(kg*K)] used by the radiation balance (dry grass)
-ignition_threshold     = 573.0  # pyrolysis onset temperature [K] (~300 C)
-consumption_rate       = 0.005  # fraction of fuel consumed per tick per unit fuel temperature (pre-SI)
-burn_heat_scale        = 100.0  # heat released per unit of fuel consumed (pre-SI; -> HHV J/kg in Phase 4)
-fuel_air_transfer_rate = 0.05   # rate of heat exchange with air (pre-SI)
+specific_heat          = 1800.0 # SI specific heat [J/(kg*K)] (dry grass): radiation, conduction, combustion
+ignition_threshold     = 573.0  # pyrolysis onset temperature [K] (~300 C); used by the radiant-heat mask
+heat_of_combustion     = 1.6e7  # HHV [J/kg] released per kg of fuel burned
+stoich_oxygen          = 1.4    # s [kg O2 / kg fuel]: stoichiometric oxygen demand
+arrhenius_pre          = 1.0e8  # A [1/s]: Arrhenius pre-exponential factor
+activation_energy      = 1.0e5  # E_a [J/mol]: Arrhenius activation energy
+fuel_air_transfer_rate = 12.0   # k [W/(m^2*K)]: fuel<->air convective conductance
 noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
 altitude_falloff       = 0.5    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
 spawn_density          = 1.5    # peak grass loading [kg/m^2] (scales the [0,1] noise)
 
 [fuel_types.tree]
-heat_capacity          = 2.5    # pre-SI; -> J/(kg*K) in Phase 4
-specific_heat          = 2300.0 # SI specific heat [J/(kg*K)] used by the radiation balance (wood)
+specific_heat          = 2300.0 # SI specific heat [J/(kg*K)] (wood)
 ignition_threshold     = 600.0  # pyrolysis onset temperature [K]
-consumption_rate       = 0.001  # pre-SI
-burn_heat_scale        = 300.0  # pre-SI; -> HHV J/kg in Phase 4
-fuel_air_transfer_rate = 0.01   # pre-SI
+heat_of_combustion     = 1.8e7  # HHV [J/kg]
+stoich_oxygen          = 1.4    # s [kg O2 / kg fuel]
+arrhenius_pre          = 5.0e7  # A [1/s]
+activation_energy      = 1.1e5  # E_a [J/mol]: higher than grass -> ignites less readily
+fuel_air_transfer_rate = 8.0    # k [W/(m^2*K)]
 noise_scale            = 32.0
 altitude_falloff       = 3.0    # steep: trees thin out quickly with elevation
 spawn_density          = 2.0    # mean trees per cell per unit elevation-thinned noise (exponential mean scale)

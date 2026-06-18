@@ -32,7 +32,7 @@ def _full(sim, shape, value) -> torch.Tensor:
 
 
 def _fuel_energy(sim, fuel_temps, fuel) -> float:
-    c_fuel = sim.heat_capacities * fuel   # heat_capacities is already (N, 1, 1)
+    c_fuel = sim.fuel_specific_heat * fuel   # fuel*c_p_fuel [J/(m^2*K)], (N, 1, 1) broadcast
     return float((c_fuel * fuel_temps).sum())
 
 

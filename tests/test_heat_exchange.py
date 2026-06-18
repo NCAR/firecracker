@@ -9,12 +9,13 @@ mass-weighted equilibrium without overshoot, and the massless-ash limit.
 import numpy as np
 import torch
 
+import physics_constants as pc
 from conftest import make_config
 from simulation import Simulation
 
 
 def _sim() -> Simulation:
-    # grass gets default heat_capacity = 1.0.
+    # grass gets the default specific_heat = 2000 J/(kg*K).
     return Simulation(make_config(fuel_type_names=("grass",)))
 
 
@@ -23,8 +24,9 @@ def _full(sim, shape, value) -> torch.Tensor:
 
 
 def _thermal_energy(sim, air, fuel_temps, fuel, mass) -> float:
-    c_fuel = sim.heat_capacities * fuel   # heat_capacities is already (N, 1, 1)
-    return float((mass * air).sum() + (c_fuel * fuel_temps).sum())
+    # SI heat capacities: air column m*c_p_air [J/(m^2*K)], fuel fuel*c_p_fuel.
+    c_fuel = sim.fuel_specific_heat * fuel   # (N, 1, 1) broadcast over (N, H, W)
+    return float((mass * pc.CP_AIR * air).sum() + (c_fuel * fuel_temps).sum())
 
 
 def test_heat_exchange_conserves_energy():
@@ -50,8 +52,8 @@ def test_heat_exchange_relaxes_without_overshoot():
     fuel_temps = torch.zeros((1, *shape), dtype=sim.dtype, device=sim.device)  # cold fuel
     mass = _full(sim, shape, 1.0)
 
-    # Mass-weighted equilibrium the pair relaxes toward.
-    c_air, c_fuel = mass, sim.heat_capacities[0] * fuel[0]
+    # Mass-weighted equilibrium the pair relaxes toward (SI heat capacities).
+    c_air, c_fuel = mass * pc.CP_AIR, sim.fuel_specific_heat[0] * fuel[0]
     t_eq = (c_air * air + c_fuel * fuel_temps[0]) / (c_air + c_fuel)
 
     new_air, new_ft = sim.exchange_fuel_air_heat(air, fuel_temps, fuel, mass)
