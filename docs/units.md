@@ -357,11 +357,60 @@ Each phase is independently testable; we do not change everything at once.
    sharp); revisit with sub-tick consumption in Phase 7. **Fire spread still awaits Phase 5**
    (`apply_radiant_heat` is the propagation mechanism and is still pre-SI; burnt cells have
    `C_fuel=0` and emit nothing).
-5. **Fire radiant transfer** — rewrite `apply_radiant_heat`: emit `E = ε·σ·T_fuel⁴·dt`
-   [J/m²] capped at the cell's thermal energy; `sky_escape_fraction` to space; rest spread
-   by `_radiant_convolve` (inverse-square) with **kernel radius in metres** (`radius_cells =
-   radius_m/dx`). `[radiant_heat]` → real `ε,σ` (drop pre-SI `emission_scale=1e-6`),
-   exponent 4 fixed. Re-baseline `tests/test_radiant_heat.py` magnitudes for SI `T`.
+5. **Fire radiant transfer** ✅ *done* — `apply_radiant_heat` rewritten to a grey-body
+   **redistribution** (the *preheating* leg of spread, not an ignition driver — radiation warms
+   fuel toward pyrolysis but rarely ignites it alone, as in real fires). It does **not** emit or
+   cool: the fuel's longwave `εσT_f⁴` is already radiated (and removed) by `apply_radiation`
+   (Phase 3), which owns the self-limiting `T⁴` sink. This stage redistributes only the
+   **super-ambient** part `a_fuel·εσ(T_f⁴ − temp_eq⁴)·dt` [J/m²] onto nearby fuel by the
+   inverse-square `_radiant_convolve`, so a flame's heat warms its neighbours. Subtracting
+   `temp_eq⁴` keeps a quiescent world from radiating its own equilibrium glow; the `a_fuel`
+   area-weighting (shared with Phase 3 via the new `_cover_fractions` helper) caps the
+   redistributed energy at what the emitter actually shed, so it can never amplify. Phase 3
+   already booked that emission as leaving to space, so depositing the absorbed neighbour share
+   back is energy-consistent (sky escape + off-grid loss truly leave). **Kernel radius in metres**
+   (`kernel_radius_m=100`, → cells by `cell_size_m`; the inverse-square weight is ~1% by 10 cells,
+   so 100 m is the sweet spot). `[radiant_heat]` dropped the pre-SI `emission_scale`/
+   `emission_exponent` and the ignition-threshold gate; reuses `[radiation].emissivity` and the
+   real `σ`. No on-disk change — **no `units_version` bump, no map regen**. *Tests*
+   (`tests/test_radiant_heat.py`): quiescent world does not spread, sub-ambient fuel is inert, a
+   lone hot cell warms neighbours without self-heating, no deposit into fuel-free cells, delivered
+   energy bounded by emission. **Fire does not yet *spread*** — a single cell's radiative
+   preheating is (correctly) too weak to ignite a neighbour alone, and the Phase 4 one-tick
+   burnout leaves an igniting cell with no fuel to emit. Sustained flaming + convective ignition
+   is **Phase 5.5**.
+5.5. **Sustained burn + plume convection** *(the "fire spreads" deliverable — surfaced by
+   Phase 5)* — Phase 5 confirmed radiation alone can't propagate fire, by design: it preheats.
+   Ignition in real fires comes from convection (hot plume gases) and direct flame contact, and
+   our model can't currently sustain a flame at all — fast burn (`A=1e8`) consumes all fuel in one
+   tick (nothing left to emit), slow burn self-extinguishes below the pyrolysis knee. Energy is
+   ample (one grass cell releases ~30× a neighbour's ignition energy); the blockers are
+   *sustainability* and *delivery*. Three legs:
+   - **(a) Sustained flaming (linchpin):** rate-limit combustion so a cell stays hot *and* fuelled
+     over a residence time (~seconds), not one tick — sub-tick/exponential consumption — and retain
+     enough combustion heat in the flame to hold it above the knee (revisit `burn_heat_fuel_fraction`
+     or model a flame temperature). Also fixes the Phase 4 explicit-Euler burnout (was deferred to
+     Phase 7).
+   - **(b) Shallow plume layer:** the combustion air-share heat currently dumps into the full
+     boundary-layer column (`m·c_p ≈ 1.2e6`) → only ~16 K per burn, a negligible convective signal.
+     Route it through a shallow near-surface plume depth (like oxygen's `d_mix`) so the air carries
+     a strong thermal signal that wind advects downwind. Couples to the existing `η`-buoyancy →
+     stronger indraft.
+   - **(c)** Radiation (Phase 5) + convection (b) then jointly preheat and ignite the fuel ahead;
+     calibrate emission/ignition and demonstrate a propagating **front** (and lee/downwind bias
+     under ambient wind). Add a spread test over full `step_fields` ticks.
+   - **(d) Upslope spread bias (Rothermel slope effect):** fire spreads faster uphill, because the
+     flame and plume tilt toward the upslope fuel, shortening the flame-to-fuel distance and
+     intensifying preheating. Much of this should **emerge** from (b): a buoyant plume over a slope
+     flows uphill through the existing free-surface forcing (`−g′∇s`, `s = terrain + η`; combustion
+     heat raises `η` → upslope indraft), so the convective preheat already biases uphill. Add the
+     **radiative** half explicitly by tilting the `_radiant_convolve` kernel toward the upslope
+     (and downwind) direction — a slope/wind-skewed kernel instead of the isotropic inverse-square
+     — so radiant preheating also favors the fuel ahead/above. Calibrate the spread-rate increase
+     against Rothermel's slope factor (rate of spread rising ~`tan²(slope)`), and add a test that
+     an ignition on a ramp advances faster upslope than downslope.
+   - *Optional:* a **fuel moisture** field — radiation's biggest real preheating job is drying;
+     moisture would gate ignition and make the radiation→convection handoff faithful.
 6. **Observations / rendering / config / main** — `OBS_CHANNELS` now span physical ranges;
    add a documented per-channel normalisation (mean/scale) for the world model (in
    `build_observation` or trainer boundary). Revisit rendering color windows for real flame
@@ -380,9 +429,9 @@ Each phase is independently testable; we do not change everything at once.
 - **`units_version`** (`map_loader.py`, currently **3**): bump on any on-disk semantics
   change, update the comment, **regenerate all 1024 maps** (`python src/gen_maps.py
   --count 1024 --out maps --seed 0`, ~2 min); `validate_against_config` rejects mismatches.
-- **Pre-SI code still live** (marked): `apply_radiant_heat` only (fire radiant transfer /
-  propagation) — replaced in Phase 5. `update_fire` and `exchange_fuel_air_heat` are now SI
-  (Phase 4). So a single fire burns physically but does **not yet spread**. (`relax_to_equilibrium`
+- **No pre-SI physics code remains** — every stage of `step_fields` is now SI (Phases 0–5).
+  A single fire burns physically and radiantly **preheats** its neighbours, but does **not yet
+  spread** (ignition needs sustained flaming + convection — Phase 5.5). (`relax_to_equilibrium`
   is retained but now only drives oxygen replenishment; temperature is the physical balance of
   Phase 3.)
 - **Closed-core conservation tests**: pass `momentum={"sponge_strength":0,"drag_coeff":0}`
@@ -401,8 +450,12 @@ Each phase is independently testable; we do not change everything at once.
   rest profile (`≈ 455 W/m²` at `T_REF`); `ε=0.95`.
 - **Phase 4** *(done)*: Arrhenius defaults (grass `A=1e8`, `E_a=1e5`; tree `A=5e7`,
   `E_a=1.1e5`) make cold fuel inert at `T_REF` and the rate climb steeply through the cfg
-  pyrolysis temps; per-fuel `HHV`/`s`/`cp_fuel` pinned; `d_mix=30 m`. Revisit if Phase 5
-  spread needs a gentler onset.
+  pyrolysis temps; per-fuel `HHV`/`s`/`cp_fuel` pinned; `d_mix=30 m`. **Revisit in Phase 5.5**:
+  `A=1e8` gives sub-ms residence (one-tick burnout) — the burn rate must be limited for sustained
+  flaming and spread.
+- **Phase 5** *(done)*: `kernel_radius_m=100` (≈10 cells; inverse-square weight ~1% by there),
+  `sky_escape_fraction=0.2`, reusing `ε=0.95` from `[radiation]`. Tuned as a *preheating* leg, not
+  an ignition driver — spread calibration is Phase 5.5.
 
 ## Known limitations / deferred
 
