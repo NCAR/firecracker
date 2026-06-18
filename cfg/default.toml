@@ -113,13 +113,24 @@ cfl_target      = 0.5     # max Courant number per substep (advective + gravity-
 # combustion_mixing_depth-deep slab (a whole-cell inventory backstop) so a vigorous fire can
 # locally deplete its O2 (resupplied by advection + the oxygen relaxation). The air share of the
 # heat is injected into a shallow plume_mixing_depth slab (not the full column), so a burn raises a
-# strong, advectable air-temperature signal that lifts eta and drives the convective indraft.
+# strong, advectable air-temperature signal that lifts eta and drives the convective indraft. A
+# fraction of that air share (convective_fraction) is convected onto nearby fuel to ignite it -- the
+# mechanism that propagates the front. Radiation (see [radiant_heat]) preheats the fuel ahead but is
+# too weak to ignite it at realistic flame temps, so convection (hot plume gas / flame contact)
+# carries ignition and the spread is convection-dominant (realistic for grass). It is deposited only
+# into sub-flaming fuel (below flame_gate_temperature, so flaming fuel stays combustion-controlled and
+# the front does not run away), over a short convective_radius_m reach skewed downwind by
+# convective_wind_bias (giving the lee bias; the same kernel carries the upslope bias in leg d).
 enabled                  = true   # if false, combustion/radiant heat are skipped (watch convection only)
 burnt_threshold          = 0.01   # fuel below this level [kg/m^2] is considered ash (no longer burns)
-burn_heat_fuel_fraction  = 0.2    # fraction of burn heat deposited into fuel (rest goes to air)
+burn_heat_fuel_fraction  = 0.05   # fraction of burn heat deposited into fuel (sets flame temp; rest -> air)
 combustion_mixing_depth  = 30.0   # d_mix [m]: depth of the near-surface layer the fire draws O2 from
 surface_mass_transfer    = 0.02   # h [kg/(m^2*s)]: O2 film-transport flux to a fuel surface (the hot-burn cap)
-plume_mixing_depth       = 30.0   # d_plume [m]: shallow plume the air-share burn heat is injected into
+plume_mixing_depth       = 100.0  # d_plume [m]: shallow plume the air-share burn heat is injected into
+convective_fraction      = 0.12   # share of the air-share heat convected to nearby fuel (spread driver)
+flame_gate_temperature   = 700.0  # K: convection ignites only fuel below this (flaming fuel is combustion-set)
+convective_radius_m      = 10.0   # reach [m] of the convective ignition onto neighbouring fuel
+convective_wind_bias     = 1.0    # downwind skew of the convective ignition (dipole; <=1 keeps weights >=0)
 spawn_fire               = false  # if true, a random fire spawns at reset; if false, left-click to ignite
 spawn_radius             = 5      # radius (in grid cells) of the circular ignition patch
 
