@@ -116,11 +116,19 @@ class Simulation:
         self.cfl_target:      float = float(momentum.get("cfl_target",      0.5))
         self._sponge_cache: dict[tuple[int, int], torch.Tensor] = {}
 
+        # Combustion (Phase 4). The reaction rate is a smooth Arrhenius law limited by oxygen,
+        # so there is no hard ignition threshold -- cold fuel is inert because the exponential
+        # is vanishingly small at ambient temperature. The oxygen field is the near-surface
+        # combustion-layer O2 density [kg/m^3]; combustion_mixing_depth is that layer's depth, so
+        # the areal burn s*Dfuel [kg/m^2] draws from a d_mix-deep slab and a vigorous fire can
+        # locally deplete its own oxygen. Resupply is modelled separately: advection (the wind
+        # feeding fresh air, step_dynamics) horizontally and the oxygen relaxation (fresh air
+        # mixing down from aloft) vertically. This is the ventilation-limited regime -- sparse
+        # fuel breathes freely, dense fuel chokes and leans on wind/mixing to keep burning.
         self.fire_enabled:                bool  = bool(fire.get("enabled", True))
-        self.oxygen_consumption_rate:     float = float(fire.get("oxygen_consumption_rate",     0.01))
-        self.fuel_burnt_threshold:        float = float(fire.get("burnt_threshold",             0.01))
-        self.oxygen_extinction_threshold: float = float(fire.get("oxygen_extinction_threshold", 0.05))
-        self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",     0.2))
+        self.fuel_burnt_threshold:        float = float(fire.get("burnt_threshold",          0.01))
+        self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",  0.2))
+        self.combustion_mixing_depth:     float = float(fire.get("combustion_mixing_depth",  30.0))
 
         # ---------------------------------------------------------------------------
         # Fuel types — parsed in config order; add subtables to expand.
@@ -139,15 +147,18 @@ class Simulation:
             values = [_ft(n, key, default) for n in self.fuel_type_names]
             return torch.tensor(values, dtype=self.dtype, device=self.device).view(-1, 1, 1)
 
-        self.heat_capacities     = _ft_tensor("heat_capacity",          1.0)
-        # SI specific heat [J/(kg*K)] used by the surface radiation balance (Phase 3). Kept
-        # separate from the pre-SI "heat_capacity" above, which the legacy fire code still uses
-        # until Phase 4 unifies them (grass ~1800, wood ~2300).
+        # SI specific heat [J/(kg*K)]: the single thermal-mass constant used by the radiation
+        # balance, the fuel<->air conduction, and combustion (grass ~1800, wood ~2300).
         self.fuel_specific_heat  = _ft_tensor("specific_heat",          2000.0)
-        self.ignition_thresholds = _ft_tensor("ignition_threshold",     2.0)
-        self.consumption_rates   = _ft_tensor("consumption_rate",       0.001)
-        self.burn_heat_scales    = _ft_tensor("burn_heat_scale",        500.0)
-        self.fuel_transfer_rates = _ft_tensor("fuel_air_transfer_rate", 0.01)
+        self.ignition_thresholds = _ft_tensor("ignition_threshold",     573.0)
+        # Combustion constants (Phase 4). Arrhenius rate k = A*exp(-E_a/(R*T_fuel)) [1/s];
+        # HHV is the heat of combustion [J/kg]; stoich_oxygen is the O2 demand [kg O2/kg fuel].
+        self.heat_of_combustion  = _ft_tensor("heat_of_combustion",     1.6e7)
+        self.stoich_oxygen       = _ft_tensor("stoich_oxygen",          1.4)
+        self.arrhenius_pre       = _ft_tensor("arrhenius_pre",          1.0e8)
+        self.activation_energy   = _ft_tensor("activation_energy",      1.0e5)
+        # Fuel<->air convective conductance k [W/(m^2*K)] for exchange_fuel_air_heat.
+        self.fuel_transfer_rates = _ft_tensor("fuel_air_transfer_rate", 12.0)
 
         radiant = (cfg or {}).get("radiant_heat", {})
         self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",      20))
@@ -450,14 +461,14 @@ class Simulation:
         fuel: torch.Tensor,               # (N, H, W)
         air_mass: torch.Tensor,           # (H, W)
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.heat_capacities      # (N, 1, 1)
-        k = self.fuel_transfer_rates  # (N, 1, 1)
+        cp_fuel = self.fuel_specific_heat  # (N, 1, 1)  [J/(kg*K)]
+        k       = self.fuel_transfer_rates # (N, 1, 1)  [W/(m^2*K)]
 
-        C_fuel = h * fuel                                      # (N, H, W) fuel thermal mass
-        # Air thermal mass is the column mass (surface pressure): a dense/high-pressure
-        # column changes temperature less for the same heat, a thin column more.
+        C_fuel = cp_fuel * fuel                                # (N, H, W) fuel thermal mass [J/(m^2*K)]
+        # Air thermal mass is the column heat capacity m*c_p_air [J/(m^2*K)]: a dense/high-
+        # pressure column changes temperature less for the same heat, a thin column more.
         # unsqueeze(-3) inserts the fuel-type axis whether or not a batch dim is present.
-        C_air  = air_mass.clamp(min=1e-6).unsqueeze(-3)       # (1, H, W) / (B, 1, H, W)
+        C_air  = (air_mass.clamp(min=1e-6) * pc.CP_AIR).unsqueeze(-3)  # (1, H, W) / (B, 1, H, W)
         total  = C_air + C_fuel                                # >= C_air > 0, always safe
 
         # Mass-weighted equilibrium temperature of each air/fuel pair (the conserved
@@ -473,7 +484,8 @@ class Simulation:
         # exponent -> -inf and decay -> 0: the fuel equilibrates instantly to the air and
         # returns ~no energy to it. The transfer rate k is always positive, so the only
         # division by zero here is this benign C_fuel -> 0 limit (exp(-inf) = 0, no NaN).
-        decay = torch.exp(-k * total / (C_air * C_fuel))
+        # k/C_red has units 1/s, so the gap decays by exp(-k*dt/C_red) over one tick.
+        decay = torch.exp(-k * self.dt * total / (C_air * C_fuel))
 
         dT_fuel = (T_eq - fuel_temperatures) * (1.0 - decay)  # (N, H, W)
 
@@ -485,61 +497,73 @@ class Simulation:
 
     def update_fire(
         self,
-        air_temperatures: torch.Tensor,   # (H, W)
-        fuel_temperatures: torch.Tensor,  # (N, H, W)
-        fuel: torch.Tensor,               # (N, H, W)
-        oxygen: torch.Tensor,             # (H, W)
+        air_temperatures: torch.Tensor,   # (H, W)        air column temperature T_a [K]
+        fuel_temperatures: torch.Tensor,  # (N, H, W)     per-type fuel temperature T_f [K]
+        fuel: torch.Tensor,               # (N, H, W)     per-type biomass [kg/m^2]
+        oxygen: torch.Tensor,             # (H, W)        O2 partial density [kg/m^3]
+        air_mass: torch.Tensor,           # (H, W)        boundary-layer areal mass m [kg/m^2]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        ign = self.ignition_thresholds  # (N, 1, 1)
-        cr  = self.consumption_rates    # (N, 1, 1)
-        bhs = self.burn_heat_scales     # (N, 1, 1)
-        h   = self.heat_capacities      # (N, 1, 1)
+        """Smooth Arrhenius, oxygen-limited combustion over one tick.
 
-        burning = (
-            (fuel_temperatures >= ign) &
-            (fuel > self.fuel_burnt_threshold) &
-            (oxygen.unsqueeze(-3) > self.oxygen_extinction_threshold)
-        )  # (N, H, W)
+        The reaction rate per type is k = A*exp(-E_a/(R*T_fuel)) [1/s], throttled by the local
+        oxygen availability (O2 / O2_ref): cold fuel is inert because the exponential is
+        vanishingly small at ambient temperature, with no hard ignition threshold. The burned
+        mass releases its heat of combustion HHV, split between fuel and air by
+        burn_heat_fuel_fraction. Oxygen is a partial density [kg/m^3] while the burn is areal
+        [kg/m^2], so they couple through the shallow combustion mixing depth d_mix (the near-
+        surface air the fire entrains), which makes oxygen a genuine local limiter. Forward
+        Euler; all rates use pre-step temperatures.
+        """
+        R, cp_air = pc.UNIVERSAL_GAS_CONSTANT, pc.CP_AIR
+        dt, d_mix = self.dt, self.combustion_mixing_depth
+        A, E_a, cp_fuel = self.arrhenius_pre, self.activation_energy, self.fuel_specific_heat
+        hhv, s = self.heat_of_combustion, self.stoich_oxygen
+        present = fuel > self.fuel_burnt_threshold
 
-        fuel_consumed = torch.where(
-            burning,
-            fuel * (fuel_temperatures * cr).clamp(max=1.0),
-            torch.zeros_like(fuel),
-        )  # (N, H, W)
+        # Arrhenius reaction rate [1/s], oxygen-limited by the fractional availability. The
+        # exponential underflows to ~0 at ambient T, so cold fuel is inert without a threshold.
+        o2_factor = (oxygen.unsqueeze(-3) / pc.O2_DENSITY_REF).clamp(min=0.0)
+        rate = A * torch.exp(-E_a / (R * fuel_temperatures.clamp(min=1.0))) * o2_factor  # (N, H, W)
 
-        # Oxygen consumed is stoichiometric: proportional to fuel actually burned this
-        # tick (summed over types), capped at available oxygen. Tying it to fuel_consumed
-        # rather than ambient oxygen avoids a hot cell suffocating itself in one tick.
-        oxygen_consumed = torch.minimum(
-            (fuel_consumed * self.oxygen_consumption_rate).sum(dim=-3),
-            oxygen,
-        )  # (H, W)
+        # Fuel the rate wants to burn this tick, capped at the fuel present (never negative).
+        fuel_demand = torch.where(present, (fuel * rate * dt).clamp(max=fuel), torch.zeros_like(fuel))
+
+        # Oxygen that burn would need, as a near-surface density draw (areal demand s*Dfuel over
+        # the d_mix-deep combustion layer). Both reactants are required, so oxygen limits fuel as
+        # well as the reverse: if the draw exceeds the O2 present, scale the whole reaction down
+        # so fuel and oxygen are consumed in stoichiometric step (a fire starved of air burns less
+        # fuel and releases less heat). This keeps O2 a genuine limiter, not just a rate throttle.
+        o2_demand = (s * fuel_demand).sum(dim=-3) / d_mix          # (H, W)
+        o2_limit  = torch.where(
+            o2_demand > 0.0, (oxygen / o2_demand).clamp(max=1.0), torch.ones_like(o2_demand)
+        )  # (H, W) in [0, 1]
+        fuel_consumed   = fuel_demand * o2_limit.unsqueeze(-3)     # (N, H, W)
+        oxygen_consumed = o2_demand * o2_limit                     # (H, W) == min(o2_demand, oxygen)
 
         fuel   = fuel - fuel_consumed
-        # Combustion is a real oxygen sink. oxygen_consumed <= oxygen and incoming
-        # oxygen is already <= 1 (saturated advection), so no clip is needed here —
-        # clipping would silently destroy/create oxygen and break conservation.
         oxygen = oxygen - oxygen_consumed
 
-        # Heat released per type, split between air and fuel.
-        burn_heat_per_type = fuel_consumed * bhs            # (N, H, W)
-        total_burn_heat    = burn_heat_per_type.sum(dim=-3)  # (H, W)
+        # Heat released per type [J/m^2], split between air and fuel.
+        burn_heat_per_type = hhv * fuel_consumed              # (N, H, W)
+        total_burn_heat    = burn_heat_per_type.sum(dim=-3)   # (H, W)
 
+        # Air warms by its share over the column heat capacity m*c_p_air [J/(m^2*K)].
+        C_air = (air_mass.clamp(min=1e-6) * cp_air)
         air_temperatures = (
-            air_temperatures + total_burn_heat * (1.0 - self.burn_heat_fuel_fraction)
+            air_temperatures + total_burn_heat * (1.0 - self.burn_heat_fuel_fraction) / C_air
         ).clamp(min=0.0)
 
-        # Each type's fuel temperature rises by its share of burn heat divided by thermal mass.
-        C_fuel    = h * fuel
-        safe_C    = torch.where(fuel > self.fuel_burnt_threshold, C_fuel, torch.ones_like(C_fuel))
-        dT_fuel   = torch.where(
+        # Each type's fuel warms by its share over its thermal mass fuel*c_p_fuel.
+        C_fuel  = cp_fuel * fuel
+        safe_C  = torch.where(fuel > self.fuel_burnt_threshold, C_fuel, torch.ones_like(C_fuel))
+        dT_fuel = torch.where(
             fuel > self.fuel_burnt_threshold,
             burn_heat_per_type * self.burn_heat_fuel_fraction / safe_C,
             torch.zeros_like(C_fuel),
         )
         fuel_temperatures = (fuel_temperatures + dT_fuel).clamp(min=0.0)
 
-        return air_temperatures, fuel_temperatures, fuel, oxygen
+        return air_temperatures, fuel_temperatures, fuel, oxygen.clamp(min=0.0)
 
     def apply_radiant_heat(
         self,
@@ -552,11 +576,11 @@ class Simulation:
         burning = (
             (fuel_temperatures >= ign) &
             (fuel > self.fuel_burnt_threshold) &
-            (oxygen.unsqueeze(-3) > self.oxygen_extinction_threshold)
+            (oxygen.unsqueeze(-3) > 0.0)
         )  # (N, H, W)
 
-        h      = self.heat_capacities
-        C_fuel = h * fuel                                         # (N, H, W) thermal mass
+        cp_fuel = self.fuel_specific_heat
+        C_fuel  = cp_fuel * fuel                                  # (N, H, W) thermal mass [J/(m^2*K)]
         safe_C = torch.where(fuel > self.fuel_burnt_threshold, C_fuel, torch.ones_like(C_fuel))
 
         # Energy each burning cell radiates this tick (Stefan-Boltzmann-like, T^exponent).
@@ -635,7 +659,7 @@ class Simulation:
 
         if self.fire_enabled:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
-                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen
+                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass
             )
             s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
                 s.fuel_temperatures, s.fuel, s.oxygen
