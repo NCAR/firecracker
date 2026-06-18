@@ -101,17 +101,22 @@ sponge_strength = 10.0    # [1/s]: peak edge relaxation rate toward (u_amb, rest
 cfl_target      = 0.5     # max Courant number per substep (advective + gravity-wave speed)
 
 [fire]
-# Smooth Arrhenius, oxygen-limited combustion (see docs/units.md). The reaction rate per fuel
-# type is k = arrhenius_pre*exp(-activation_energy/(R*T_fuel)) [1/s], throttled by the local
-# oxygen fraction; there is no hard ignition threshold (cold fuel is inert because the
-# exponential underflows at ambient T). Burned mass releases heat_of_combustion, split between
-# fuel and air by burn_heat_fuel_fraction. The oxygen field is the near-surface combustion-layer
-# density [kg/m^3]; the areal burn [kg/m^2] draws from a combustion_mixing_depth-deep slab, so a
-# vigorous fire can locally deplete its O2 (resupplied by advection + the oxygen relaxation).
+# Surface-area-controlled, oxygen-limited combustion (see docs/units.md). Fuel reacts at its
+# surface, so the burn rate is the reactive surface area (a_s = sigma/particle_density, from each
+# fuel type) times a surface mass flux psi [kg/(m^2*s)] that puts chemistry and O2 transport in
+# series: psi_kin = arrhenius_pre*exp(-activation_energy/(R*T_fuel)) (kinetic, the ignition gate --
+# cold fuel inert as the exponential underflows) and psi_dif = surface_mass_transfer*(O2/O2_ref)
+# (O2 film diffusion, the flame-hot cap). The flaming residence time tau ~ 1/(a_s*psi) emerges, so
+# high-SAV grass burns out in seconds and a low-SAV log over minutes. Burned mass releases
+# heat_of_combustion, split between fuel and air by burn_heat_fuel_fraction. The oxygen field is
+# the near-surface combustion-layer density [kg/m^3]; the areal burn [kg/m^2] also draws from a
+# combustion_mixing_depth-deep slab (a whole-cell inventory backstop) so a vigorous fire can
+# locally deplete its O2 (resupplied by advection + the oxygen relaxation).
 enabled                  = true   # if false, combustion/radiant heat are skipped (watch convection only)
 burnt_threshold          = 0.01   # fuel below this level [kg/m^2] is considered ash (no longer burns)
 burn_heat_fuel_fraction  = 0.2    # fraction of burn heat deposited into fuel (rest goes to air)
 combustion_mixing_depth  = 30.0   # d_mix [m]: depth of the near-surface layer the fire draws O2 from
+surface_mass_transfer    = 0.02   # h [kg/(m^2*s)]: O2 film-transport flux to a fuel surface (the hot-burn cap)
 spawn_fire               = false  # if true, a random fire spawns at reset; if false, left-click to ignite
 spawn_radius             = 5      # radius (in grid cells) of the circular ignition patch
 
@@ -121,25 +126,29 @@ spawn_radius             = 5      # radius (in grid cells) of the circular ignit
 # ---------------------------------------------------------------------------
 
 [fuel_types.grass]
-specific_heat          = 1800.0 # SI specific heat [J/(kg*K)] (dry grass): radiation, conduction, combustion
-ignition_threshold     = 573.0  # pyrolysis onset temperature [K] (~300 C); used by the radiant-heat mask
-heat_of_combustion     = 1.6e7  # HHV [J/kg] released per kg of fuel burned
-stoich_oxygen          = 1.4    # s [kg O2 / kg fuel]: stoichiometric oxygen demand
-arrhenius_pre          = 1.0e8  # A [1/s]: Arrhenius pre-exponential factor
-activation_energy      = 1.0e5  # E_a [J/mol]: Arrhenius activation energy
-fuel_air_transfer_rate = 12.0   # k [W/(m^2*K)]: fuel<->air convective conductance
+specific_heat          = 1800.0  # SI specific heat [J/(kg*K)] (dry grass): radiation, conduction, combustion
+ignition_threshold     = 573.0   # pyrolysis onset temperature [K] (~300 C); used by the radiant-heat mask
+heat_of_combustion     = 1.6e7   # HHV [J/kg] released per kg of fuel burned
+stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]: stoichiometric oxygen demand
+arrhenius_pre          = 1.0e8   # B [kg/(m^2*s)]: surface kinetic-flux pre-exponential
+activation_energy      = 1.0e5   # E_a [J/mol]: Arrhenius activation energy
+surface_area_to_volume = 12000.0 # sigma [1/m]: surface-area-to-volume ratio (fine grass -> fast burn)
+particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
+fuel_air_transfer_rate = 12.0    # k [W/(m^2*K)]: fuel<->air convective conductance
 noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
 altitude_falloff       = 0.5    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
 spawn_density          = 1.5    # peak grass loading [kg/m^2] (scales the [0,1] noise)
 
 [fuel_types.tree]
-specific_heat          = 2300.0 # SI specific heat [J/(kg*K)] (wood)
-ignition_threshold     = 600.0  # pyrolysis onset temperature [K]
-heat_of_combustion     = 1.8e7  # HHV [J/kg]
-stoich_oxygen          = 1.4    # s [kg O2 / kg fuel]
-arrhenius_pre          = 5.0e7  # A [1/s]
-activation_energy      = 1.1e5  # E_a [J/mol]: higher than grass -> ignites less readily
-fuel_air_transfer_rate = 8.0    # k [W/(m^2*K)]
+specific_heat          = 2300.0  # SI specific heat [J/(kg*K)] (wood)
+ignition_threshold     = 600.0   # pyrolysis onset temperature [K]
+heat_of_combustion     = 1.8e7   # HHV [J/kg]
+stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]
+arrhenius_pre          = 5.0e7   # B [kg/(m^2*s)]: surface kinetic-flux pre-exponential
+activation_energy      = 1.1e5   # E_a [J/mol]: higher than grass -> ignites less readily
+surface_area_to_volume = 40.0    # sigma [1/m]: coarse wood (~10 cm) -> low surface area -> slow burn
+particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
+fuel_air_transfer_rate = 8.0     # k [W/(m^2*K)]
 noise_scale            = 32.0
 altitude_falloff       = 3.0    # steep: trees thin out quickly with elevation
 spawn_density          = 2.0    # mean trees per cell per unit elevation-thinned noise (exponential mean scale)

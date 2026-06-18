@@ -129,6 +129,10 @@ class Simulation:
         self.fuel_burnt_threshold:        float = float(fire.get("burnt_threshold",          0.01))
         self.burn_heat_fuel_fraction:     float = float(fire.get("burn_heat_fuel_fraction",  0.2))
         self.combustion_mixing_depth:     float = float(fire.get("combustion_mixing_depth",  30.0))
+        # O2 film-transport coefficient h [kg/(m^2*s)] (Phase 5.5): the diffusive oxygen mass flux
+        # reaching a fuel surface, which caps the burn rate once the fuel is flame-hot (the kinetics
+        # are no longer limiting). Sets the transport-limited surface flux psi_dif = h*(O2/O2_ref).
+        self.surface_mass_transfer:       float = float(fire.get("surface_mass_transfer",    0.02))
 
         # ---------------------------------------------------------------------------
         # Fuel types — parsed in config order; add subtables to expand.
@@ -151,12 +155,21 @@ class Simulation:
         # balance, the fuel<->air conduction, and combustion (grass ~1800, wood ~2300).
         self.fuel_specific_heat  = _ft_tensor("specific_heat",          2000.0)
         self.ignition_thresholds = _ft_tensor("ignition_threshold",     573.0)
-        # Combustion constants (Phase 4). Arrhenius rate k = A*exp(-E_a/(R*T_fuel)) [1/s];
-        # HHV is the heat of combustion [J/kg]; stoich_oxygen is the O2 demand [kg O2/kg fuel].
+        # Combustion constants. HHV is the heat of combustion [J/kg]; stoich_oxygen is the O2
+        # demand [kg O2/kg fuel].
         self.heat_of_combustion  = _ft_tensor("heat_of_combustion",     1.6e7)
         self.stoich_oxygen       = _ft_tensor("stoich_oxygen",          1.4)
+        # Surface-area combustion (Phase 5.5). Fuel reacts at its surface, not in bulk, so the burn
+        # rate scales with the reactive surface area a_s = sigma/rho_p [m^2/kg]: sigma is the
+        # surface-area-to-volume ratio (cured grass ~12000/m, a 10 cm log ~40/m) and rho_p the solid
+        # particle density (~500 kg/m^3 -- wood and grass are the same material). High-SAV grass
+        # flashes, low-SAV logs smoulder, from one geometric property. arrhenius_pre is now the
+        # surface pre-exponential B [kg/(m^2*s)] of the kinetic flux psi_kin = B*exp(-E_a/(R*T_fuel)).
         self.arrhenius_pre       = _ft_tensor("arrhenius_pre",          1.0e8)
         self.activation_energy   = _ft_tensor("activation_energy",      1.0e5)
+        sigma_sav                = _ft_tensor("surface_area_to_volume", 12000.0)  # [1/m]
+        particle_density         = _ft_tensor("particle_density",       500.0)    # [kg/m^3]
+        self.fuel_specific_surface = sigma_sav / particle_density                 # a_s [m^2/kg]
         # Fuel<->air convective conductance k [W/(m^2*K)] for exchange_fuel_air_heat.
         self.fuel_transfer_rates = _ft_tensor("fuel_air_transfer_rate", 12.0)
 
@@ -516,30 +529,42 @@ class Simulation:
         oxygen: torch.Tensor,             # (H, W)        O2 partial density [kg/m^3]
         air_mass: torch.Tensor,           # (H, W)        boundary-layer areal mass m [kg/m^2]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Smooth Arrhenius, oxygen-limited combustion over one tick.
+        """Surface-area-controlled, oxygen-limited combustion over one tick.
 
-        The reaction rate per type is k = A*exp(-E_a/(R*T_fuel)) [1/s], throttled by the local
-        oxygen availability (O2 / O2_ref): cold fuel is inert because the exponential is
-        vanishingly small at ambient temperature, with no hard ignition threshold. The burned
-        mass releases its heat of combustion HHV, split between fuel and air by
-        burn_heat_fuel_fraction. Oxygen is a partial density [kg/m^3] while the burn is areal
-        [kg/m^2], so they couple through the shallow combustion mixing depth d_mix (the near-
-        surface air the fire entrains), which makes oxygen a genuine local limiter. Forward
-        Euler; all rates use pre-step temperatures.
+        Fuel reacts at its surface, not in bulk, so the burn rate is the reactive surface area
+        a_s*fuel times a surface mass flux psi [kg/(m^2*s)]. psi puts chemistry in series with
+        oxygen transport: a kinetic (Arrhenius) flux psi_kin = B*exp(-E_a/(R*T_fuel)) and an O2
+        film-diffusion flux psi_dif = h*(O2/O2_ref), combined as resistances (1/psi = 1/psi_kin +
+        1/psi_dif) so the slower one wins -- kinetic when cold (the ignition gate: cold fuel is
+        inert because the exponential underflows, no hard threshold), the O2 supply when flame-hot
+        (the transport cap). The flaming residence time tau ~ 1/(a_s*psi) thus emerges from the
+        physics: high-SAV grass burns out in seconds, a low-SAV log over minutes. The burned mass
+        releases its heat of combustion HHV, split between fuel and air by burn_heat_fuel_fraction.
+        Oxygen is a partial density [kg/m^3] while the burn is areal [kg/m^2], so they also couple
+        through the shallow combustion mixing depth d_mix (the near-surface air the fire entrains),
+        giving a whole-cell inventory backstop on top of the per-surface film transport. All rates
+        use pre-step temperatures.
         """
         R, cp_air = pc.UNIVERSAL_GAS_CONSTANT, pc.CP_AIR
         dt, d_mix = self.dt, self.combustion_mixing_depth
-        A, E_a, cp_fuel = self.arrhenius_pre, self.activation_energy, self.fuel_specific_heat
+        B, E_a, cp_fuel = self.arrhenius_pre, self.activation_energy, self.fuel_specific_heat
+        a_s, h = self.fuel_specific_surface, self.surface_mass_transfer
         hhv, s = self.heat_of_combustion, self.stoich_oxygen
         present = fuel > self.fuel_burnt_threshold
 
-        # Arrhenius reaction rate [1/s], oxygen-limited by the fractional availability. The
-        # exponential underflows to ~0 at ambient T, so cold fuel is inert without a threshold.
-        o2_factor = (oxygen.unsqueeze(-3) / pc.O2_DENSITY_REF).clamp(min=0.0)
-        rate = A * torch.exp(-E_a / (R * fuel_temperatures.clamp(min=1.0))) * o2_factor  # (N, H, W)
+        # Surface mass flux psi [kg/(m^2_surface*s)]: kinetic chemistry in series with O2 film
+        # diffusion. The kinetic flux underflows to ~0 at ambient T (cold fuel inert); the diffusive
+        # flux caps it once flame-hot, so the rate is physically bounded with no ad-hoc residence cap.
+        o2_factor = (oxygen.unsqueeze(-3) / pc.O2_DENSITY_REF).clamp(min=0.0)   # (N, H, W) broadcast
+        psi_kin = B * torch.exp(-E_a / (R * fuel_temperatures.clamp(min=1.0)))  # (N, H, W) kinetic
+        psi_dif = h * o2_factor                                                 # O2 film transport
+        psi = psi_kin * psi_dif / (psi_kin + psi_dif).clamp(min=1e-30)          # series resistances
 
-        # Fuel the rate wants to burn this tick, capped at the fuel present (never negative).
-        fuel_demand = torch.where(present, (fuel * rate * dt).clamp(max=fuel), torch.zeros_like(fuel))
+        # Areal consumption = reactive surface (a_s*fuel) burning at psi, integrated exactly over
+        # the tick: kappa = a_s*psi [1/s], Dfuel = fuel*(1 - exp(-kappa*dt)) is bounded by the fuel
+        # present (no clamp needed). tau ~ 1/kappa is the emergent flaming residence time.
+        kappa = a_s * psi                                                       # (N, H, W) [1/s]
+        fuel_demand = torch.where(present, fuel * -torch.expm1(-kappa * dt), torch.zeros_like(fuel))
 
         # Oxygen that burn would need, as a near-surface density draw (areal demand s*Dfuel over
         # the d_mix-deep combustion layer). Both reactants are required, so oxygen limits fuel as

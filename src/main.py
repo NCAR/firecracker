@@ -54,6 +54,7 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print(f"    burnt_threshold             : {sim.fuel_burnt_threshold}")
     print(f"    burn_heat_fuel_fraction     : {sim.burn_heat_fuel_fraction}")
     print(f"    combustion_mixing_depth     : {sim.combustion_mixing_depth}")
+    print(f"    surface_mass_transfer       : {sim.surface_mass_transfer}")
     print("  [fuel_types]")
     for i, name in enumerate(sim.fuel_type_names):
         print(f"    [{name}]")
@@ -61,8 +62,9 @@ def print_config_info(env: FirecrackerEnv) -> None:
         print(f"      ignition_threshold     : {sim.ignition_thresholds[i].item()}")
         print(f"      heat_of_combustion     : {sim.heat_of_combustion[i].item()}")
         print(f"      stoich_oxygen          : {sim.stoich_oxygen[i].item()}")
-        print(f"      arrhenius_pre          : {sim.arrhenius_pre[i].item()}")
+        print(f"      arrhenius_pre (B)      : {sim.arrhenius_pre[i].item()}")
         print(f"      activation_energy      : {sim.activation_energy[i].item()}")
+        print(f"      specific_surface (a_s) : {sim.fuel_specific_surface[i].item()}")
         print(f"      fuel_air_transfer_rate : {sim.fuel_transfer_rates[i].item()}")
     print("  [radiant_heat]")
     print(f"    kernel_radius (cells)  : {sim.radiant_kernel_radius}")

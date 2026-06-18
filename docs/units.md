@@ -385,20 +385,45 @@ Each phase is independently testable; we do not change everything at once.
    our model can't currently sustain a flame at all — fast burn (`A=1e8`) consumes all fuel in one
    tick (nothing left to emit), slow burn self-extinguishes below the pyrolysis knee. Energy is
    ample (one grass cell releases ~30× a neighbour's ignition energy); the blockers are
-   *sustainability* and *delivery*. Three legs:
-   - **(a) Sustained flaming (linchpin):** rate-limit combustion so a cell stays hot *and* fuelled
-     over a residence time (~seconds), not one tick — sub-tick/exponential consumption — and retain
-     enough combustion heat in the flame to hold it above the knee (revisit `burn_heat_fuel_fraction`
-     or model a flame temperature). Also fixes the Phase 4 explicit-Euler burnout (was deferred to
-     Phase 7).
+   *sustainability* and *delivery*. Four legs:
+   - **(a) Sustained flaming via surface-area combustion (linchpin)** ✅ *done* (`ac250db`) — the
+     one-tick burnout is an
+     artefact of treating combustion as a *bulk* Arrhenius rate of the fuel's mean temperature. Real
+     fuel reacts only at its *surface*, so the burn is surface-area-controlled — which is also why
+     grass (high surface-area-to-volume) flashes while a log (low SAV) smolders: same material and
+     `HHV`, only the geometry differs. Model it as a heterogeneous surface flux. Per fuel type add a
+     surface-area-to-volume ratio `σ [1/m]` (cured grass ~12000, a 10 cm log ~40) and a particle
+     density `ρ_p` (~500 kg/m³), giving a specific reactive surface `a_s = σ/ρ_p [m²/kg]` (grass ~24,
+     log ~0.08 — a ~300× span). The surface mass flux `ψ [kg/(m²·s)]` puts chemistry and oxygen
+     transport in series: `ψ_kin = B·exp(−E_a/(R·T_f))` (kinetic — the ignition gate, cold fuel
+     inert), `ψ_dif = h·(O₂/O₂_ref)` (O₂ film diffusion to the surface), `ψ = (1/ψ_kin + 1/ψ_dif)⁻¹`.
+     Areal consumption `Δfuel = fuel·(1 − exp(−a_s·ψ·dt))` (exact-exponential, bounded by the fuel
+     present — retires the `clamp(max=fuel)` hack). Cold → kinetic-limited (inert); flame-hot →
+     transport-limited at `ψ_dif`, the physical speed cap ("the outside burns before the inside can
+     heat up"). The flaming residence time then *emerges*, `τ ≈ 1/(a_s·ψ)`: grass ~seconds, a log
+     ~minutes. The existing two-way stoichiometric O₂ *inventory* limiter stays as the whole-cell
+     "ran out of air" backstop (a coarser scale than the per-particle film transport). A steady
+     surface burn over `τ` releases `HHV·Δfuel` gradually, so the flame holds above the pyrolysis
+     knee far more readily than a one-tick dump (co-calibrate with `burn_heat_fuel_fraction`). No new
+     state field; reinterprets `[fuel_types].arrhenius_pre` as the surface pre-exponential `B`, adds
+     `σ`/`ρ_p` per fuel and `[fire].surface_mass_transfer` (`h`). Also fixes the Phase 4
+     explicit-Euler burnout (was deferred to Phase 7). *Optional later:* a shrinking-core state so
+     `a_s` evolves as particles burn down, and wind-enhanced `h` (Sherwood ∝ Re); `σ` also feeds
+     Rothermel in (d). The two-state flame-temperature model is the fallback if `B`/`h`/`σ`
+     calibration proves stubborn. *Result:* in the full loop a lit grass cell holds ~1000–2400 K
+     (well above the 573 K knee) and burns down over ~10 s, then self-extinguishes — finite, no
+     runaway (the Phase 3 `T⁴` sink bounds it). The ~2400 K peak is hot for grass (real ~1100–1500 K)
+     but stable, so flame-temperature calibration moves to (c) rather than being tuned in isolation.
    - **(b) Shallow plume layer:** the combustion air-share heat currently dumps into the full
      boundary-layer column (`m·c_p ≈ 1.2e6`) → only ~16 K per burn, a negligible convective signal.
      Route it through a shallow near-surface plume depth (like oxygen's `d_mix`) so the air carries
      a strong thermal signal that wind advects downwind. Couples to the existing `η`-buoyancy →
      stronger indraft.
    - **(c)** Radiation (Phase 5) + convection (b) then jointly preheat and ignite the fuel ahead;
-     calibrate emission/ignition and demonstrate a propagating **front** (and lee/downwind bias
-     under ambient wind). Add a spread test over full `step_fields` ticks.
+     calibrate emission/ignition — and the flame temperature itself (rein the ~2400 K leg-(a) peak
+     toward a realistic ~1100–1500 K via `burn_heat_fuel_fraction` and the plume depth, since the
+     `T⁴` radiative reach scales steeply with it) — and demonstrate a propagating **front** (and
+     lee/downwind bias under ambient wind). Add a spread test over full `step_fields` ticks.
    - **(d) Upslope spread bias (Rothermel slope effect):** fire spreads faster uphill, because the
      flame and plume tilt toward the upslope fuel, shortening the flame-to-fuel distance and
      intensifying preheating. Much of this should **emerge** from (b): a buoyant plume over a slope
@@ -450,9 +475,10 @@ Each phase is independently testable; we do not change everything at once.
   rest profile (`≈ 455 W/m²` at `T_REF`); `ε=0.95`.
 - **Phase 4** *(done)*: Arrhenius defaults (grass `A=1e8`, `E_a=1e5`; tree `A=5e7`,
   `E_a=1.1e5`) make cold fuel inert at `T_REF` and the rate climb steeply through the cfg
-  pyrolysis temps; per-fuel `HHV`/`s`/`cp_fuel` pinned; `d_mix=30 m`. **Revisit in Phase 5.5**:
-  `A=1e8` gives sub-ms residence (one-tick burnout) — the burn rate must be limited for sustained
-  flaming and spread.
+  pyrolysis temps; per-fuel `HHV`/`s`/`cp_fuel` pinned; `d_mix=30 m`. **Recast in Phase 5.5**:
+  `A=1e8` as a *bulk* rate gives sub-ms residence (one-tick burnout); 5.5 makes combustion a
+  surface-area-controlled flux (SAV `σ` + O₂ film transport `h`), reinterpreting `arrhenius_pre` as
+  the surface pre-exponential `B`, so the burn rate is physically limited for sustained flaming.
 - **Phase 5** *(done)*: `kernel_radius_m=100` (≈10 cells; inverse-square weight ~1% by there),
   `sky_escape_fraction=0.2`, reusing `ε=0.95` from `[radiation]`. Tuned as a *preheating* leg, not
   an ignition driver — spread calibration is Phase 5.5.
