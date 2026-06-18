@@ -147,13 +147,13 @@ fuel_per_tree          = 5.0    # fuel loading contributed by each tree [kg/m^2]
 max_trees_per_cell     = 4      # hard cap on the per-cell tree count
 
 [radiant_heat]
-# Radiation is conservative: a cell loses exactly the energy it emits (a T^exponent
-# sink, like Stefan-Boltzmann), a fraction escapes to space, and the rest is spread to
-# neighbours by the inverse-square kernel. The T^4 loss self-limits flame temperature.
-kernel_radius      = 10      # max range of radiation in grid cells
-emission_scale     = 1e-6    # multiplier on T^exponent emitted energy per tick
-emission_exponent  = 4.0     # blackbody T^4; emission rises steeply with temperature
-sky_escape_fraction = 0.2    # fraction of emitted energy lost upward to space (0..1)
+# Flame radiant transfer: the fire-spread mechanism. The fuel's grey-body longwave
+# eps*sigma*T^4 is emitted (and the emitter cooled) by [radiation]; this stage only
+# *redistributes* the super-ambient part eps*sigma*(T^4 - temp_eq^4) onto nearby fuel by
+# the inverse-square kernel, so a flame's heat ignites its neighbours. Uses [radiation].emissivity
+# and the real Stefan-Boltzmann sigma; the T^4 sink (in [radiation]) self-limits flame temperature.
+kernel_radius_m     = 100.0  # radiative reach of a flame [m] (converted to cells by cell_size_m)
+sky_escape_fraction = 0.2    # fraction of the redistributed emission lost upward to space (0..1)
 
 [maps]
 # Maps are fully-baked initial states loaded from disk. Generate them with

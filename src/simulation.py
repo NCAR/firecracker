@@ -161,11 +161,12 @@ class Simulation:
         self.fuel_transfer_rates = _ft_tensor("fuel_air_transfer_rate", 12.0)
 
         radiant = (cfg or {}).get("radiant_heat", {})
-        self.radiant_kernel_radius:     int   = int(radiant.get("kernel_radius",      20))
-        self.radiant_emission_scale:    float = float(radiant.get("emission_scale",   0.05))
-        self.radiant_emission_exponent: float = float(radiant.get("emission_exponent", 4.0))
-        # Fraction of each cell's emitted energy that escapes upward to space (lost from
-        # the grid). The rest is redistributed to neighbours by the inverse-square kernel.
+        # Flame radiative reach: the inverse-square kernel spans this radius, set in meters and
+        # converted to cells by the grid spacing (so the physical range is resolution-independent).
+        radius_m = float(radiant.get("kernel_radius_m", 100.0))
+        self.radiant_kernel_radius:     int   = max(1, round(radius_m / self.cell_size_m))
+        # Fraction of each cell's super-ambient flame emission that escapes upward to space (lost
+        # from the grid). The rest is redistributed to neighbours by the inverse-square kernel.
         self.sky_escape_fraction:       float = float(radiant.get("sky_escape_fraction", 0.2))
 
         self._radiant_kernel = self._build_radiant_kernel(self.radiant_kernel_radius)
@@ -359,6 +360,22 @@ class Simulation:
         s.mass, s.air_temperatures, s.x_wind_vel, s.y_wind_vel = m, T, u, v
         return s
 
+    def _cover_fractions(self, fuel: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Beer-Lambert vegetation cover and per-body area shares from the fuel load.
+
+        Returns (a_ground, a_fuel): the bare-ground area fraction (..., H, W) and the per-type
+        fuel area fractions (..., N, H, W), which sum over types to the cover fraction
+        cover = 1 - exp(-fuel_total/kappa). Shared by the surface radiative balance
+        (apply_radiation) and the flame radiant transfer (apply_radiant_heat) so both partition
+        the surface the same way.
+        """
+        fuel_total = fuel.sum(dim=-3)                              # (..., H, W)
+        cover = 1.0 - torch.exp(-fuel_total / self.cover_fuel_scale)   # (..., H, W) in [0, 1)
+        a_ground = 1.0 - cover                                     # bare-ground area fraction
+        safe_total = fuel_total.clamp(min=1e-12).unsqueeze(-3)
+        a_fuel = cover.unsqueeze(-3) * fuel / safe_total           # (..., N, H, W), sums to cover
+        return a_ground, a_fuel
+
     def apply_radiation(
         self,
         air_temperatures: torch.Tensor,    # air column temperature T_a [K]      (..., H, W)
@@ -386,16 +403,12 @@ class Simulation:
         """
         eps, sigma, cp_air = self.emissivity, pc.STEFAN_BOLTZMANN, pc.CP_AIR
         dt = self.dt
-        C_g, k_ga, kappa = self.ground_heat_capacity, self.ground_air_exchange, self.cover_fuel_scale
+        C_g, k_ga = self.ground_heat_capacity, self.ground_air_exchange
 
         s_net = eps * sigma * temp_eq ** 4                         # (..., H, W) per-cell anchor
 
         # Cover fraction (Beer-Lambert canopy interception) and per-body area shares.
-        fuel_total = fuel.sum(dim=-3)                              # (..., H, W)
-        cover = 1.0 - torch.exp(-fuel_total / kappa)               # (..., H, W) in [0, 1)
-        a_ground = 1.0 - cover                                     # bare-ground area fraction
-        safe_total = fuel_total.clamp(min=1e-12).unsqueeze(-3)
-        a_fuel = cover.unsqueeze(-3) * fuel / safe_total           # (..., N, H, W), sums to cover
+        a_ground, a_fuel = self._cover_fractions(fuel)
 
         # Ground: absorbs a_ground*S_net, emits a_ground*sigma*T^4, sheds sensible heat to air.
         q_ground = (
@@ -567,54 +580,48 @@ class Simulation:
 
     def apply_radiant_heat(
         self,
-        fuel_temperatures: torch.Tensor,  # (N, H, W)
-        fuel: torch.Tensor,               # (N, H, W)
-        oxygen: torch.Tensor,             # (H, W)
+        fuel_temperatures: torch.Tensor,  # per-type fuel temperature T_f [K]   (..., N, H, W)
+        fuel: torch.Tensor,               # per-type biomass [kg/m^2]           (..., N, H, W)
+        temp_eq: torch.Tensor,            # rest temperature profile [K]        (..., H, W)
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        ign = self.ignition_thresholds
+        """Spread a flame's radiant heat to its neighbours (the fire-propagation mechanism).
 
-        burning = (
-            (fuel_temperatures >= ign) &
-            (fuel > self.fuel_burnt_threshold) &
-            (oxygen.unsqueeze(-3) > 0.0)
-        )  # (N, H, W)
+        This does NOT emit or cool: the fuel's grey-body longwave eps*sigma*T_f^4 is already
+        radiated (and removed from the fuel) by apply_radiation, which owns the self-limiting T^4
+        sink. Here we only *redistribute* the super-ambient part of that emission -- the heat a
+        flame throws off above the resting glow, eps*sigma*(T_f^4 - temp_eq^4) -- onto nearby fuel
+        by the inverse-square kernel. apply_radiation already accounted this energy as leaving to
+        space, so depositing the absorbed neighbour share back is energy-consistent (the rest --
+        sky escape + off-grid -- truly leaves); subtracting temp_eq^4 keeps a quiescent world from
+        radiating its own equilibrium glow, so only flame heat above ambient propagates. Rank-
+        agnostic (single world or (..., N, H, W)).
+        """
+        eps, sigma, dt = self.emissivity, pc.STEFAN_BOLTZMANN, self.dt
+        present = fuel > self.fuel_burnt_threshold
 
-        cp_fuel = self.fuel_specific_heat
-        C_fuel  = cp_fuel * fuel                                  # (N, H, W) thermal mass [J/(m^2*K)]
-        safe_C = torch.where(fuel > self.fuel_burnt_threshold, C_fuel, torch.ones_like(C_fuel))
+        # Super-ambient flame emission, area-weighted exactly as apply_radiation weights the
+        # longwave loss, so we can never redistribute more energy than the emitter actually shed.
+        _, a_fuel = self._cover_fractions(fuel)
+        excess = (
+            a_fuel * eps * sigma
+            * (fuel_temperatures ** 4 - temp_eq.unsqueeze(-3) ** 4).clamp(min=0.0)
+            * dt
+        )  # (..., N, H, W) [J/m^2]
+        excess = torch.where(present, excess, torch.zeros_like(excess))
 
-        # Energy each burning cell radiates this tick (Stefan-Boltzmann-like, T^exponent).
-        # Capped at the cell's available thermal energy so the explicit emitter cooling
-        # below can never drive temperature negative, even at large emission_scale.
-        emission = torch.where(
-            burning,
-            self.radiant_emission_scale * fuel_temperatures ** self.radiant_emission_exponent,
-            torch.zeros_like(fuel_temperatures),
-        )
-        emission = torch.minimum(emission, (C_fuel * fuel_temperatures).clamp(min=0.0))  # (N, H, W)
+        # A fraction escapes upward to space; the rest is spread to neighbours by the
+        # inverse-square kernel (the 'same'-mode convolution also drops energy off the grid edges).
+        to_neighbours = (1.0 - self.sky_escape_fraction) * excess.sum(dim=-3)   # (..., H, W)
+        radiant_flux = self._radiant_convolve(to_neighbours).clamp(min=0.0)     # (..., H, W) absorbed
 
-        # The emitter loses exactly what it radiates (conservation): radiation is a sink,
-        # not a free source. This T^exponent loss self-limits flame temperature.
-        fuel_temperatures = (
-            fuel_temperatures
-            - torch.where(fuel > self.fuel_burnt_threshold, emission / safe_C, torch.zeros_like(emission))
-        ).clamp(min=0.0)
-
-        # A fraction escapes upward to space (lost from the grid); the rest is spread to
-        # neighbours by the inverse-square kernel. The 'same'-mode convolution also drops
-        # energy that would land off the grid edges, an additional (boundary) loss.
-        total_emission = emission.sum(dim=-3)                    # (H, W) energy leaving each cell
-        to_neighbours  = (1.0 - self.sky_escape_fraction) * total_emission
-        radiant_flux = self._radiant_convolve(to_neighbours).clamp(min=0.0)  # (H, W) absorbed per cell
-
-        # Distribute absorbed flux to each type proportional to its fuel mass fraction,
-        # then divide by thermal mass to get the temperature rise.
-        total_fuel = fuel.sum(dim=-3)                            # (H, W)
-        safe_total = torch.where(total_fuel > 0, total_fuel, torch.ones_like(total_fuel))
-        fuel_frac  = fuel / safe_total.unsqueeze(-3)             # (N, H, W)
-
+        # Deposit the absorbed flux into each present type proportional to its mass fraction,
+        # divided by thermal mass C_fuel = fuel*c_p,fuel to get the temperature rise.
+        C_fuel = self.fuel_specific_heat * fuel                  # (..., N, H, W) [J/(m^2*K)]
+        safe_C = torch.where(present, C_fuel, torch.ones_like(C_fuel))
+        total_fuel = fuel.sum(dim=-3)                            # (..., H, W)
+        fuel_frac = fuel / total_fuel.clamp(min=1e-12).unsqueeze(-3)
         dT_fuel = torch.where(
-            fuel > self.fuel_burnt_threshold,
+            present,
             radiant_flux.unsqueeze(-3) * fuel_frac / safe_C,
             torch.zeros_like(C_fuel),
         )
@@ -662,7 +669,7 @@ class Simulation:
                 s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass
             )
             s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
-                s.fuel_temperatures, s.fuel, s.oxygen
+                s.fuel_temperatures, s.fuel, s.temp_eq
             )
 
         return s
