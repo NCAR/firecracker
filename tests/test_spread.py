@@ -154,6 +154,37 @@ def test_wind_slope_alignment_changes_spread():
     assert torch.isfinite(s_a.fuel_temperatures).all()
 
 
+def test_radiant_preheat_needs_convection_but_accelerates_it():
+    """Radiant preheat alone can't sustain a front, but it speeds one the convection carries.
+
+    Three runs, flat and windless from one hot cell, with the Phase-3 surface balance on
+    throughout (radiation=True) -- only the propagation legs differ. The radiant_heat stage
+    redistributes a flame's super-ambient emission onto neighbours (preheat); convection deposits
+    plume heat onto nearby fuel (the ignition driver). Preheat on its own (no convection) cannot
+    raise a neighbour to ignition, so the fire dies at the source; convection alone spreads; the two
+    together burn markedly more than convection alone -- preheat brings fuel closer to ignition so
+    convection lights it sooner. (radiation_enabled is left on in every run: it owns the eps*sigma*T^4
+    flame-cooling sink, so toggling it would conflate cooling with preheat -- only radiant_heat.enabled
+    isolates the preheat leg.)
+    """
+    def burnt(convective_fraction=None, radiant_heat=True):
+        sim = _sim()
+        if convective_fraction is not None:
+            sim.convective_fraction = convective_fraction
+        sim.radiant_heat_enabled = radiant_heat
+        s = _state(sim)
+        _run(sim, s)
+        return int((s.fuel[0].cpu().numpy() < 0.5).sum())
+
+    burnt_preheat = burnt(convective_fraction=0.0)   # preheat only, no convective ignition
+    burnt_conv    = burnt(radiant_heat=False)         # convection only, no flame preheat
+    burnt_both    = burnt()                            # both legs (the default)
+
+    assert burnt_preheat <= 3                # preheat alone cannot sustain a front (it dies)
+    assert burnt_conv > 30                   # convection alone spreads a real fire
+    assert burnt_both > burnt_conv * 1.15    # adding preheat clearly accelerates the spread
+
+
 def test_flame_temperature_is_physical():
     """The propagating front holds a realistic flame temperature -- bounded, no runaway."""
     sim = _sim()

@@ -8,10 +8,11 @@ the foehn / downslope-wind pattern. Once settled it is steady until perturbed.
 """
 
 import numpy as np
+import pytest
 import torch
 
 from conftest import to_numpy
-from scenarios import si_flat, si_ridge
+from scenarios import si_channel, si_flat, si_ridge
 
 
 def _speed(env) -> np.ndarray:
@@ -44,6 +45,32 @@ def test_ridge_blocks_windward_and_accelerates_lee(make_env):
     lee = sp[row, c + 8]         # downwind slope
     assert lee > windward + 1.0          # clear orographic asymmetry
     assert lee > 15.0                    # lee/downslope acceleration above ambient
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Gap/Venturi winds are not captured: the level-lid shallow-water core gives a deep (slow) "
+    "layer in the low channel, so wind funnelled through it does not speed up above ambient. "
+    "True fast-channel winds need blocking-terrain (wetting-drying) physics -- see "
+    "docs/units.md Known limitations. strict=True so this flips to a failure if the model "
+    "ever gains gap physics."
+))
+def test_narrow_channel_does_not_speed_up_wind(make_env):
+    """A narrow channel aligned with the wind should accelerate it (real Venturi) -- but doesn't.
+
+    Two high walls flank a low channel running along the x-wind. A real atmosphere funnels the
+    wind through the gap and speeds it up; the level-lid core makes the low channel a deep, slow
+    layer instead, so the channel wind stays at/below ambient. We assert the real-Venturi
+    expectation (channel faster than ambient), which fails -- documenting the limitation.
+    """
+    ambient = (15.0, 0.0)
+    env = make_env(*si_channel(grid=48, ambient=ambient, peak_m=800.0))
+    for _ in range(800):
+        env.step(0)
+
+    sp = _speed(env)
+    c = sp.shape[0] // 2
+    channel = sp[c, 12:-12].mean()      # along the channel centreline, away from the sponge
+    assert channel > np.hypot(*ambient)  # real Venturi speedup -- the model fails this
 
 
 def test_wind_is_steady_until_perturbed(make_env):

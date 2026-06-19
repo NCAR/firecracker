@@ -179,6 +179,7 @@ max_trees_per_cell     = 4      # hard cap on the per-cell tree count
 # *redistributes* the super-ambient part eps*sigma*(T^4 - temp_eq^4) onto nearby fuel by
 # the inverse-square kernel, so a flame's heat ignites its neighbours. Uses [radiation].emissivity
 # and the real Stefan-Boltzmann sigma; the T^4 sink (in [radiation]) self-limits flame temperature.
+enabled             = true   # redistribute flame radiant heat to neighbours (off = convection-only spread)
 kernel_radius_m     = 100.0  # radiative reach of a flame [m] (converted to cells by cell_size_m)
 sky_escape_fraction = 0.2    # fraction of the redistributed emission lost upward to space (0..1)
 
