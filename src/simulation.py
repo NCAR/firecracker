@@ -202,6 +202,10 @@ class Simulation:
         self.fuel_transfer_rates = _ft_tensor("fuel_air_transfer_rate", 12.0)
 
         radiant = (cfg or {}).get("radiant_heat", {})
+        # Flame radiant transfer toggle: the convective-vs-radiant spread split. Off isolates
+        # convective ignition (no flame preheat of neighbours) -- preheat alone cannot sustain a
+        # front, but combined with convection it speeds spread (see tests/test_spread.py).
+        self.radiant_heat_enabled:      bool  = bool(radiant.get("enabled", True))
         # Flame radiative reach: the inverse-square kernel spans this radius, set in meters and
         # converted to cells by the grid spacing (so the physical range is resolution-independent).
         radius_m = float(radiant.get("kernel_radius_m", 100.0))
@@ -832,9 +836,10 @@ class Simulation:
                 s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
                 s.x_wind_vel, s.y_wind_vel, s.terrain,
             )
-            s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
-                s.fuel_temperatures, s.fuel, s.temp_eq
-            )
+            if self.radiant_heat_enabled:
+                s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
+                    s.fuel_temperatures, s.fuel, s.temp_eq
+                )
 
         return s
 

@@ -242,6 +242,25 @@ def si_ridge(grid: int = DEFAULT_GRID, ambient: tuple[float, float] = (15.0, 0.0
                                         oxygen=oxygen, ambient_wind=ambient)
 
 
+def si_channel(grid: int = DEFAULT_GRID, ambient: tuple[float, float] = (15.0, 0.0),
+               peak_m: float = 800.0):
+    """SI world with two high walls flanking a narrow low channel aligned with the x-wind.
+
+    Terrain varies in y only (two Gaussian walls at y = c +/- grid/6, channel at the centre row),
+    so the channel runs along the wind -- the classic gap/Venturi geometry. A real atmosphere
+    funnels and accelerates wind through such a channel; the level-lid shallow-water core does not
+    (see test_narrow_channel_does_not_speed_up_wind).
+    """
+    rows = np.arange(grid)[:, None] * np.ones((1, grid))
+    c, off, sig = grid / 2.0, grid / 6.0, grid / 18.0
+    wall = peak_m * (np.exp(-((rows - (c - off)) ** 2) / (2.0 * sig ** 2))
+                     + np.exp(-((rows - (c + off)) ** 2) / (2.0 * sig ** 2)))
+    terrain = wall.astype(np.float32)
+    air, mass, oxygen = _si_state(terrain)
+    return make_config(grid), build_map(grid, terrain=terrain, air=air, mass=mass,
+                                        oxygen=oxygen, ambient_wind=ambient)
+
+
 # name -> (builder, view modes to render, timesteps to capture, description)
 VISUALS = {
     "uniform": (

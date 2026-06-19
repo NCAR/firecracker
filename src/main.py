@@ -73,6 +73,7 @@ def print_config_info(env: FirecrackerEnv) -> None:
         print(f"      specific_surface (a_s) : {sim.fuel_specific_surface[i].item()}")
         print(f"      fuel_air_transfer_rate : {sim.fuel_transfer_rates[i].item()}")
     print("  [radiant_heat]")
+    print(f"    enabled                : {sim.radiant_heat_enabled}")
     print(f"    kernel_radius (cells)  : {sim.radiant_kernel_radius}")
     print(f"    sky_escape_fraction    : {sim.sky_escape_fraction}")
     print(INFO_SEPARATOR)

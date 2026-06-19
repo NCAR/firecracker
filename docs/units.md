@@ -392,7 +392,13 @@ Each phase is independently testable; we do not change everything at once.
    (`kernel_radius_m=100`, → cells by `cell_size_m`; the inverse-square weight is ~1% by 10 cells,
    so 100 m is the sweet spot). `[radiant_heat]` dropped the pre-SI `emission_scale`/
    `emission_exponent` and the ignition-threshold gate; reuses `[radiation].emissivity` and the
-   real `σ`. No on-disk change — **no `units_version` bump, no map regen**. *Tests*
+   real `σ`. An `enabled` flag (`[radiant_heat].enabled`, default `true`, parsed as
+   `radiant_heat_enabled`, gates the `apply_radiant_heat` call in `step_fields`) toggles this
+   preheating leg independently of the Phase-3 `T⁴` sink — turning it off isolates convection-only
+   spread, which `test_radiant_preheat_needs_convection_but_accelerates_it` uses to show preheat
+   alone can't sustain a front but accelerates one convection carries (1 / 67 / 89 burnt cells for
+   preheat-only / convection-only / both). No on-disk change — **no `units_version` bump, no map
+   regen**. *Tests*
    (`tests/test_radiant_heat.py`): quiescent world does not spread, sub-ambient fuel is inert, a
    lone hot cell warms neighbours without self-heating, no deposit into fuel-free cells, delivered
    energy bounded by emission. At this stage fire did **not yet spread** — a single cell's radiative
@@ -556,7 +562,10 @@ Each phase is independently testable; we do not change everything at once.
 - **Valley/gap (Venturi) winds NOT captured**: the level-lid shallow layer gives fast
   ridges / **slow valleys** + strong foehn lee winds; lowering `layer_depth_ref` makes
   valleys *slower*, not faster. True fast-valley/gap winds need blocking-terrain (wetting–
-  drying) physics — optional future enhancement, not in the phase plan.
+  drying) physics — optional future enhancement, not in the phase plan. Pinned by the strict
+  xfail `test_narrow_channel_does_not_speed_up_wind` (a channel aligned with the wind asserts the
+  real-Venturi speedup, which fails; the xfail flips to a failure if the model ever gains gap
+  physics).
 - **Lee separation/turbulence** regime not modelled (hydraulic/foehn regime instead).
 - `column_mass_profile` (full barometric column) kept in `gen_maps` for reference but unused
   by dynamics; `equilibrium_mass` kept only for the legacy `fixtures/`/visualizer scenarios.
