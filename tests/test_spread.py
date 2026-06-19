@@ -1,14 +1,17 @@
 """
-Fire spread across full step_fields ticks (Phase 5.5c) -- the "fire propagates" deliverable.
+Fire spread across full step_fields ticks (Phase 5.5c/d) -- the "fire propagates" deliverable.
 
 With sustained flaming (leg a) and the shallow plume (leg b) in place, update_fire convects a
 fraction of the plume's air-share heat onto nearby fuel (convective_fraction) to ignite it -- the
 mechanism that moves the front. Radiation preheats the fuel ahead but is too weak to ignite it at a
-realistic flame temperature, so spread is convection-dominant (realistic for grass). These tests
-drive the whole per-tick loop and pin:
-a one-shot hot cell self-propagates into a spreading front (symmetric with no wind), the spread is
-biased downwind under an ambient wind (lee bias), the flame temperature stays in a physical band
-(no runaway), and a world with no ignition source never spontaneously lights.
+realistic flame temperature, so spread is convection-dominant (realistic for grass). The convective
+deposit is skewed by a von Mises angular kernel whose bias blends the wind (lee bias) with the
+upslope terrain gradient (Rothermel slope effect). These tests drive the whole per-tick loop and
+pin: a one-shot hot cell self-propagates into a spreading front (symmetric with no wind), the spread
+is biased downwind under an ambient wind (lee bias) and upslope on a ramp (slope effect), wind
+aligned with the slope speeds/focuses the head while wind opposing it slows the head (the kernel
+does not saturate), the flame stays in a physical temperature band (no runaway), and an unlit world
+never spontaneously ignites.
 """
 
 import numpy as np
@@ -23,10 +26,10 @@ GRID = 64
 TICKS = 150
 
 
-def _state(sim: Simulation, ambient=(0.0, 0.0), ignite=True) -> SimState:
-    """A flat SI world, fuel everywhere, optionally one hot ignition cell at the centre."""
+def _state(sim: Simulation, ambient=(0.0, 0.0), ignite=True, terrain=None) -> SimState:
+    """An SI world (flat unless `terrain` given), fuel everywhere, optionally one hot ignition cell."""
     gen = MapGenerator(make_config(GRID))
-    terrain = np.zeros((GRID, GRID), dtype=np.float64)
+    terrain = np.zeros((GRID, GRID), dtype=np.float64) if terrain is None else np.asarray(terrain, dtype=np.float64)
     air = gen.air_temperature_profile(terrain)
     mass = gen.boundary_layer_mass(terrain)
     oxygen = gen.oxygen_profile(terrain, air)
@@ -103,6 +106,52 @@ def test_spread_is_biased_downwind():
     assert right > left + 3       # clearly further downwind than upwind
     assert right > down           # and biased along-wind versus cross-wind
     assert torch.isfinite(s.fuel_temperatures).all()
+
+
+def test_spread_is_biased_upslope():
+    """On a slope (no wind) the front reaches further uphill than downhill (Rothermel slope effect).
+
+    Terrain ramps uphill toward +x, so the convective-ignition kernel skews uphill (right) and the
+    fire spreads further upslope than downslope, while staying roughly symmetric across the slope.
+    """
+    sim = _sim()
+    # Ramp rising toward +x: ~380 m over the grid -> slope tan ~0.6 (~31 deg, uphill = +x = right).
+    ramp = np.tile(np.linspace(0.0, 380.0, GRID, dtype=np.float64), (GRID, 1))
+    s = _state(sim, terrain=ramp)
+    _run(sim, s)
+
+    left, right, up, down = _extents(s)
+    assert right > left + 3       # clearly further upslope (right) than downslope (left)
+    assert right > up             # and biased along-slope versus cross-slope
+    assert abs(up - down) <= 2    # roughly symmetric across the slope (no cross-slope bias)
+    assert torch.isfinite(s.fuel_temperatures).all()
+
+
+def test_wind_slope_alignment_changes_spread():
+    """Wind aligned with the upslope speeds the head fire; wind opposing it slows the head.
+
+    The von Mises deposit reads the combined wind+slope bias as a forward concentration (it does not
+    saturate), so the head-fire reach responds monotonically to alignment: a wind blowing up the
+    slope drives the longest, tightest head (flanks pinched), the slope alone is intermediate, and a
+    wind blowing down the slope cancels much of the slope bias and shortens the upslope head -- the
+    wind/slope synergy real fires show (and what the old unit-capped dipole could not express).
+    """
+    ramp = np.tile(np.linspace(0.0, 380.0, GRID, dtype=np.float64), (GRID, 1))   # uphill toward +x
+
+    def head(ambient):
+        sim = _sim()
+        s = _state(sim, ambient=ambient, terrain=ramp)
+        _run(sim, s)
+        _, right, up, down = _extents(s)
+        return right, up, down, s
+
+    right_slope, up_s, down_s, _   = head((0.0, 0.0))     # slope only, no wind
+    right_align, up_a, down_a, s_a = head((8.0, 0.0))     # wind up the slope (aligned, +x)
+    right_opp,   _,    _,    _      = head((-8.0, 0.0))    # wind down the slope (opposed)
+
+    assert right_align > right_slope > right_opp      # head reach rises with wind/slope alignment
+    assert (up_a + down_a) < (up_s + down_s)          # aligned head is tighter (flanks pinched)
+    assert torch.isfinite(s_a.fuel_temperatures).all()
 
 
 def test_flame_temperature_is_physical():

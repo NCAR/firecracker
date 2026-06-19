@@ -226,9 +226,14 @@ at realistic flame temperatures, so convection (hot plume gas / flame contact) c
 and the spread is convection-dominant, as it is for grass fires. That convective deposit is sourced
 from the fresh burn heat (wind cannot sweep it away), gated to
 sub-flaming fuel (below `flame_gate_temperature`, so flaming fuel stays combustion-controlled and the
-front does not run away), and skewed downwind by a per-cell energy-conserving dipole
-(`deposit = conv(S,K0) − β[conv(S·n̂ₓ,gₓ)+conv(S·n̂_y,g_y)]`, giving the lee bias). Whatever the fuel
-does not absorb stays in the plume air, so energy is conserved (off-grid edge loss aside).
+front does not run away), and skewed by a per-cell energy-conserving **von Mises angular kernel**
+(`deposit(δ) ∝ K0(δ)·exp(b·δ̂)`, normalised per source) along a bias vector `b` that blends the unit
+wind (lee bias) with the upslope terrain gradient (`b = b_wind·ŵ + b_slope·∇z·|∇z|`; the slope term
+scales as `tan²(slope)` for the Rothermel upslope effect, Phase 5.5d). `|b|` is the forward
+concentration: the kernel is non-negative for any `|b|` (no clamp), so wind and slope aligning keeps
+focusing the deposit into a tighter, faster head instead of saturating (`|b|` is capped only as a
+numerical guard against `exp` overflow at the spurious terrain-wrap gradient). Whatever the fuel does
+not absorb stays in the plume air, so energy is conserved (off-grid edge loss aside).
 
 Fuel↔air conduction (`exchange_fuel_air_heat`) keeps its exact two-body exponential form, with real
 heat capacities `C_air = m·c_p,air`, `C_fuel = fuel·c_p,fuel`, a conductance `k` in W/(m²·K), and the
@@ -454,25 +459,35 @@ Each phase is independently testable; we do not change everything at once.
      deposited only into **sub-flaming** fuel (below `flame_gate_temperature`, 700 K — flaming fuel is
      combustion-controlled, which bounds the front and stops the runaway), over a short
      `convective_radius_m` (10 m) reach, and **skewed downwind** by a per-cell, energy-conserving
-     **dipole** (`deposit = conv(S,K0) − β[conv(S·ŵₓ,gₓ)+conv(S·ŵ_y,g_y)]`, `β = convective_wind_bias
-     ≤ 1` to keep the upwind weight ≥ 0) — giving the lee bias (the same kernel carries the upslope
-     bias in leg d). The flame temperature is kept realistic by lowering `burn_heat_fuel_fraction` to **0.05**
+     **von Mises angular kernel** (`deposit(δ) ∝ K0(δ)·exp(b·δ̂)`, bias `b = convective_wind_bias·ŵ`)
+     — giving the lee bias (the same kernel carries the upslope bias in leg d). The flame temperature
+     is kept realistic by lowering `burn_heat_fuel_fraction` to **0.05**
      and diluting the plume to `plume_mixing_depth` **100 m**. *Result* (one-shot hot cell, then
      released): a self-sustaining front at a realistic ~1540 K flame (no runaway) spreading ~2–5 m/s,
      symmetric with no wind and biased downwind under ambient wind. No new state field, no
      `units_version` bump. *Tests* (`tests/test_spread.py`, full `step_fields` ticks): one-cell
      self-propagation (symmetric), downwind bias, physical flame band, and no spontaneous ignition.
-   - **(d) Upslope spread bias (Rothermel slope effect):** fire spreads faster uphill, because the
-     flame and plume tilt toward the upslope fuel, shortening the flame-to-fuel distance and
-     intensifying preheating. Much of this should **emerge** from (b): a buoyant plume over a slope
-     flows uphill through the existing free-surface forcing (`−g′∇s`, `s = terrain + η`; combustion
-     heat raises `η` → upslope indraft), so the convective spread already biases uphill. The
-     **dipole kernel built in leg (c)** (`_convective_deposit`, currently skewed by the wind) is the
-     ready-made machinery: add a slope term to its bias direction (`n̂ = normalize(α·∇terrain +
-     γ·wind)`) so the convective ignition also favors the fuel above, and optionally tilt
-     `_radiant_convolve` the same way for the radiative half. Calibrate the spread-rate increase
-     against Rothermel's slope factor (rate of spread rising ~`tan²(slope)`), and add a test that
-     an ignition on a ramp advances faster upslope than downslope.
+   - **(d) Upslope spread bias (Rothermel slope effect)** ✅ *done* — fire spreads faster uphill,
+     because the flame and plume tilt toward the upslope fuel, shortening the flame-to-fuel distance.
+     Part of this already **emerges** from (b) (a buoyant plume over a slope flows uphill via the
+     free-surface forcing `−g′∇s`), but the level-lid rest state cancels the terrain gradient there,
+     so the explicit driver is the **leg (c) convective kernel**: `_convective_deposit`'s bias vector
+     is now a blend `b = convective_wind_bias·ŵ + convective_slope_bias·∇z·|∇z|`. The slope term is
+     `∇z` (= `tan(slope)`, uphill) scaled by its own magnitude, so it points uphill with magnitude
+     `tan²(slope)` — the front skews uphill ever harder on steeper ground, tracking Rothermel's `~tan²`
+     slope factor. **The kernel was upgraded from the linear dipole to a von Mises angular form**
+     (`deposit(δ) ∝ K0(δ)·exp(b·δ̂)`): the old dipole stayed non-negative only for `|b| ≤ 1` and so had
+     to clamp the bias, which *saturated* the skew and killed the wind/slope synergy; the angular
+     kernel is non-negative for any `|b|`, reading `|b|` as the forward concentration, so aligning wind
+     and slope keeps focusing the deposit into a tighter, faster head. It is still **directional**
+     (redistributes the convective heat, does not boost the total burn), so it captures the
+     upslope/downslope asymmetry and the alignment synergy, not an absolute rate-of-spread gain.
+     `update_fire` gained a `terrain` argument; `_radiant_convolve` is left isotropic (convection is
+     the spread driver, so biasing it suffices). No new state field, no `units_version` bump.
+     *Result* (ramp, no wind): a front that advances clearly faster upslope than downslope (head >
+     flanks > backing) and stays symmetric across the slope; aligning a wind with the upslope drives a
+     tighter, faster head still. *Tests* (`tests/test_spread.py`): upslope-biased spread on a ~31° ramp,
+     and wind-aligned-with-slope focusing a faster head with pinched flanks (the non-saturation property).
    - *Optional:* a **fuel moisture** field — radiation's biggest real preheating job is drying;
      moisture would gate ignition and make the radiation→convection handoff faithful.
 6. **Observations / rendering / config / main** — `OBS_CHANNELS` now span physical ranges;
@@ -495,7 +510,7 @@ Each phase is independently testable; we do not change everything at once.
   --count 1024 --out maps --seed 0`, ~2 min); `validate_against_config` rejects mismatches.
 - **No pre-SI physics code remains** — every stage of `step_fields` is now SI (Phases 0–5).
   A fire burns physically, radiantly **preheats** its neighbours, and now **spreads** as a
-  self-sustaining convective front (Phase 5.5a–c); the upslope bias is the remaining leg (d).
+  self-sustaining convective front that also spreads faster uphill (Phase 5.5a–d).
   (`relax_to_equilibrium` is retained but now only drives oxygen replenishment; temperature is the
   physical balance of Phase 3.)
 - **Closed-core conservation tests**: pass `momentum={"sponge_strength":0,"drag_coeff":0}`
@@ -526,6 +541,15 @@ Each phase is independently testable; we do not change everything at once.
   `convective_fraction=0.12`, `flame_gate_temperature=700 K`, `convective_radius_m=10`,
   `convective_wind_bias=1.0` give ~2–5 m/s spread with a clean lee bias. Radiation was confirmed too
   weak to ignite at realistic flame temps, so convection is the spread driver (radiation stays preheat).
+- **Phase 5.5d** *(done)*: the convective deposit kernel is a **von Mises angular** form (replacing the
+  linear dipole, whose unit-magnitude clamp saturated the skew and killed the wind/slope synergy). It is
+  non-negative for any bias magnitude, so `|b|` is a true forward concentration. `convective_slope_bias`
+  was retuned to **2.5** for the uncapped kernel (was 4.0 under the clamped dipole): on a ~31° ramp the
+  front shows a clear elliptical shape (head > flanks > backing) and a wind aligned with the upslope
+  focuses a tighter, faster head. `convective_wind_bias=1.0` is unchanged (wind-only is identical to the
+  old dipole at `|b|=1`, so leg c stays calibrated). `convective_concentration_max=12` caps `|b|` only as
+  a numerical `exp`-overflow guard at the spurious terrain-wrap gradient. Still directional, so it
+  captures the upslope/downslope asymmetry and the alignment synergy, not an absolute ROS gain.
 
 ## Known limitations / deferred
 
