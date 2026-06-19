@@ -119,8 +119,11 @@ cfl_target      = 0.5     # max Courant number per substep (advective + gravity-
 # too weak to ignite it at realistic flame temps, so convection (hot plume gas / flame contact)
 # carries ignition and the spread is convection-dominant (realistic for grass). It is deposited only
 # into sub-flaming fuel (below flame_gate_temperature, so flaming fuel stays combustion-controlled and
-# the front does not run away), over a short convective_radius_m reach skewed downwind by
-# convective_wind_bias (giving the lee bias; the same kernel carries the upslope bias in leg d).
+# the front does not run away), over a short convective_radius_m reach skewed by a von Mises angular
+# kernel exp(b.offset_hat) whose bias vector b blends the wind (convective_wind_bias -> lee bias)
+# with the upslope terrain gradient (convective_slope_bias -> Rothermel slope effect, scaling as
+# tan^2(slope) so the front spreads faster uphill on steeper ground). |b| is the forward
+# concentration (no cap), so wind and slope aligning keeps focusing the deposit into a tighter head.
 enabled                  = true   # if false, combustion/radiant heat are skipped (watch convection only)
 burnt_threshold          = 0.01   # fuel below this level [kg/m^2] is considered ash (no longer burns)
 burn_heat_fuel_fraction  = 0.05   # fraction of burn heat deposited into fuel (sets flame temp; rest -> air)
@@ -130,7 +133,8 @@ plume_mixing_depth       = 100.0  # d_plume [m]: shallow plume the air-share bur
 convective_fraction      = 0.12   # share of the air-share heat convected to nearby fuel (spread driver)
 flame_gate_temperature   = 700.0  # K: convection ignites only fuel below this (flaming fuel is combustion-set)
 convective_radius_m      = 10.0   # reach [m] of the convective ignition onto neighbouring fuel
-convective_wind_bias     = 1.0    # downwind skew of the convective ignition (dipole; <=1 keeps weights >=0)
+convective_wind_bias     = 1.0    # downwind skew of the convective ignition (concentration on the unit wind)
+convective_slope_bias    = 2.5    # upslope skew of the convective ignition (concentration on tan^2(slope))
 spawn_fire               = false  # if true, a random fire spawns at reset; if false, left-click to ignite
 spawn_radius             = 5      # radius (in grid cells) of the circular ignition patch
 

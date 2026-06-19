@@ -143,14 +143,24 @@ class Simulation:
         # gas / flame contact) -- the mechanism that propagates the front (convection-dominant spread,
         # realistic for grass). convective_fraction is that share; it is deposited only into
         # sub-flaming fuel (below flame_gate_temperature -- flaming fuel is combustion-controlled, so
-        # this bounds the front temperature) over a short convective_radius_m reach, skewed downwind by
-        # convective_wind_bias (a dipole; <=1 keeps the upwind weight non-negative). The downwind skew
-        # gives the lee bias; the same kernel carries the upslope bias in leg (d).
+        # this bounds the front temperature) over a short convective_radius_m reach, skewed by a von
+        # Mises angular kernel whose bias vector blends the unit wind (convective_wind_bias -> lee
+        # bias, leg c) with the upslope terrain gradient (convective_slope_bias -> Rothermel slope
+        # effect, leg d). The slope term scales as tan^2(slope) so spread skews uphill ever harder on
+        # steeper ground; the bias magnitude is the forward concentration, so wind and slope aligning
+        # focuses the deposit into a tighter, faster head (no saturation).
         self.convective_fraction:         float = float(fire.get("convective_fraction",       0.12))
         self.flame_gate_temperature:      float = float(fire.get("flame_gate_temperature",    700.0))
         self.convective_wind_bias:        float = float(fire.get("convective_wind_bias",      1.0))
+        self.convective_slope_bias:       float = float(fire.get("convective_slope_bias",     2.5))
         conv_radius_m                           = float(fire.get("convective_radius_m",       10.0))
         self.convective_radius:           int   = max(1, round(conv_radius_m / self.cell_size_m))
+        # The convective deposit uses a von Mises angular kernel exp(b.offset_hat) (see
+        # _convective_deposit): the bias vector b = wind + slope acts as concentration*direction,
+        # non-negative for any |b|, so wind and slope aligning keeps focusing the deposit forward
+        # (no saturation). convective_concentration_max caps |b| only to keep exp() from overflowing
+        # at the spurious terrain-wrap gradient -- a numerical guard, not a physical limit.
+        self._conv_concentration_max:     float = float(fire.get("convective_concentration_max", 12.0))
 
         # ---------------------------------------------------------------------------
         # Fuel types — parsed in config order; add subtables to expand.
@@ -201,9 +211,9 @@ class Simulation:
         self.sky_escape_fraction:       float = float(radiant.get("sky_escape_fraction", 0.2))
 
         self._radiant_kernel = self._build_radiant_kernel(self.radiant_kernel_radius)
-        # Convective-ignition dipole kernels (Phase 5.5c): an isotropic K0 plus two antisymmetric
-        # direction kernels (gx, gy) so the deposit can be skewed per-cell by the local wind.
-        self._conv_k0, self._conv_gx, self._conv_gy = self._build_convective_kernels(self.convective_radius)
+        # Neighbour-offset table for the convective-ignition deposit (von Mises angular kernel,
+        # Phase 5.5c/d): a Gaussian-weighted neighbourhood skewed per-cell by the wind+slope bias.
+        self._conv_offsets = self._build_convective_offsets(self.convective_radius)
         # Fixed 5-point Laplacian stencil for explicit diffusion (1,1,3,3) on-device.
         self._laplace_kernel = torch.tensor(
             [[[[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]]],
@@ -253,14 +263,13 @@ class Simulation:
         kernel = kernel / kernel.sum()
         return kernel.view(1, 1, size, size)
 
-    def _build_convective_kernels(self, radius: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Isotropic + dipole kernels for the wind-skewed convective ignition (Phase 5.5c).
+    def _build_convective_offsets(self, radius: int) -> list[tuple[int, int, float, float, float]]:
+        """Neighbour-offset table for the convective deposit (von Mises angular kernel).
 
-        K0 is a normalised Gaussian over the neighbourhood (centre excluded -- a cell does not
-        convect to itself). gx, gy are K0 weighted by the unit offset in x/y, so they are
-        antisymmetric (sum to zero). A deposit conv(S,K0) - beta*(conv(S*wx,gx)+conv(S*wy,gy))
-        moves more of S downwind (along the per-cell unit wind w) while conserving the total, for
-        beta<=1 (beyond which the upwind weight would go negative).
+        Returns, for every neighbour within the radius (centre excluded), a tuple
+        (drow, dcol, k0_weight, dhat_x, dhat_y): the integer offset, a normalised Gaussian weight
+        over the neighbourhood, and the unit offset direction (x = cols, y = rows). The deposit
+        loops this table, so a small convective_radius (1 by default) is a handful of offsets.
         """
         size = 2 * radius + 1
         coords = torch.arange(size, dtype=self.dtype, device=self.device) - radius
@@ -269,26 +278,38 @@ class Simulation:
         k0 = torch.where(r_sq > 0, torch.exp(-r_sq / (2.0 * (radius / 1.5) ** 2)), torch.zeros_like(r_sq))
         k0 = k0 / k0.sum()
         r = torch.sqrt(r_sq.clamp(min=1e-9))
-        gx = torch.where(r_sq > 0, k0 * cols / r, torch.zeros_like(k0))   # +x dipole (cols index x)
-        gy = torch.where(r_sq > 0, k0 * rows / r, torch.zeros_like(k0))   # +y dipole (rows index y)
-        v = lambda t: t.view(1, 1, size, size)
-        return v(k0), v(gx), v(gy)
+        offsets: list[tuple[int, int, float, float, float]] = []
+        for i in range(size):
+            for j in range(size):
+                if float(r_sq[i, j]) > 0:
+                    offsets.append((
+                        int(rows[i, j]), int(cols[i, j]), float(k0[i, j]),
+                        float(cols[i, j] / r[i, j]), float(rows[i, j] / r[i, j]),
+                    ))
+        return offsets
 
-    def _convective_deposit(self, source: torch.Tensor, wx: torch.Tensor, wy: torch.Tensor) -> torch.Tensor:
-        """Redistribute `source` [.., H, W] to neighbours, skewed downwind by unit wind (wx, wy).
+    def _convective_deposit(self, source: torch.Tensor, bx: torch.Tensor, by: torch.Tensor) -> torch.Tensor:
+        """Redistribute `source` [.., H, W] to neighbours, skewed along the per-cell bias (bx, by).
 
-        Energy-conserving (the kernels' weights sum to 1 for any cell) apart from off-grid edge
-        loss, which is a real loss at the open boundary. Rank-agnostic via the trailing-axis conv.
+        A von Mises angular kernel: each source cell sheds k0(delta)*exp(b . delta_hat) to neighbour
+        offset delta, normalised per source so it conserves the total it convects. The bias vector b
+        acts as concentration*direction: as |b| grows the deposit focuses ever more sharply forward,
+        with every weight >= 0, so wind and slope aligning keeps concentrating the deposit (no
+        saturation). |b| is clamped only to keep exp() from overflowing (a numerical ceiling, not a
+        physical limit); at the periodic terrain-wrap edge grad(z) is spuriously huge, and that guard
+        keeps it finite (it sits in the sponge, where there is no fire). Uses periodic rolls, so it
+        wraps at the edges rather than losing off-grid. Rank-agnostic via the trailing axes.
         """
-        r = self.convective_radius
-        def conv(field: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-            *lead, h, w = field.shape
-            out = F.conv2d(field.reshape(-1, 1, h, w), kernel, padding=r)
-            return out.reshape(*lead, h, w)
-        beta = min(self.convective_wind_bias, 1.0)
-        return conv(source, self._conv_k0) - beta * (
-            conv(source * wx, self._conv_gx) + conv(source * wy, self._conv_gy)
-        )
+        mag = torch.sqrt(bx ** 2 + by ** 2)
+        scale = (self._conv_concentration_max / mag.clamp(min=1e-12)).clamp(max=1.0)
+        bx, by = bx * scale, by * scale
+        exps = [torch.exp(bx * dhx + by * dhy) for (_, _, _, dhx, dhy) in self._conv_offsets]
+        z = sum(k0w * e for (_, _, k0w, _, _), e in zip(self._conv_offsets, exps))
+        g = source / z.clamp(min=1e-30)
+        out = torch.zeros_like(source)
+        for (drow, dcol, k0w, _, _), e in zip(self._conv_offsets, exps):
+            out = out + k0w * torch.roll(g * e, shifts=(drow, dcol), dims=(-2, -1))
+        return out
 
     def _diffuse(self, field: torch.Tensor, sigma: float) -> torch.Tensor:
         # Explicit Laplacian diffusion with no-flux (reflect) boundaries. The
@@ -588,6 +609,7 @@ class Simulation:
         air_mass: torch.Tensor,           # (H, W)        boundary-layer areal mass m [kg/m^2]
         x_wind_vel: torch.Tensor | None = None,  # (H, W) wind u [m/s] -- skews convective ignition
         y_wind_vel: torch.Tensor | None = None,  # (H, W) wind v [m/s]
+        terrain: torch.Tensor | None = None,     # (H, W) elevation [m] -- skews ignition upslope
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Surface-area-controlled, oxygen-limited combustion over one tick.
 
@@ -607,8 +629,9 @@ class Simulation:
         (Phase 5.5b), not the full column, so a burn warms the air strongly enough to drive a
         convective signal. A fraction of that air share (convective_fraction) is convected to nearby
         fuel to ignite it (Phase 5.5c) -- the spread driver, since radiation preheats the fuel ahead
-        but is too weak to ignite it alone; skewed downwind by the wind so the spread shows a lee
-        bias. All rates use pre-step temperatures.
+        but is too weak to ignite it alone; skewed by a von Mises angular kernel whose bias blends the
+        wind (lee bias) with the upslope terrain gradient (faster spread uphill, Phase 5.5d). All rates
+        use pre-step temperatures.
         """
         R, cp_air = pc.UNIVERSAL_GAS_CONSTANT, pc.CP_AIR
         dt, d_mix = self.dt, self.combustion_mixing_depth
@@ -672,7 +695,7 @@ class Simulation:
         # neighbour at a realistic flame temperature, so a fraction of the fresh air-share heat is
         # convected to nearby fuel to ignite it -- the propagation driver. It is sourced from this tick's
         # combustion (not the advected air field, so wind cannot sweep the source away) and skewed
-        # downwind by a per-cell dipole, giving the lee bias. It is deposited only into sub-flaming
+        # downwind/upslope by the convective deposit kernel. It is deposited only into sub-flaming
         # fuel (below flame_gate -- flaming fuel is combustion-controlled), with a thermal-mass floor
         # so near-burnt cells do not superheat, and clamped so one tick cannot drive fuel past the
         # gate; whatever the fuel does not absorb stays in the plume air, so energy is conserved.
@@ -680,11 +703,23 @@ class Simulation:
             x_wind_vel = torch.zeros_like(air_temperatures)
         if y_wind_vel is None:
             y_wind_vel = torch.zeros_like(air_temperatures)
+        if terrain is None:
+            terrain = torch.zeros_like(air_temperatures)
         cf = self.convective_fraction
+
+        # Bias vector for the convective deposit (the directional skew). Blend the unit wind (lee
+        # bias, leg c) with the upslope terrain gradient (Rothermel slope effect, leg d): grad(z) is
+        # the slope (= tan of the slope angle) pointing uphill, scaled by its own magnitude so the
+        # slope term has magnitude tan^2(slope) -- the front skews uphill ever harder on steeper
+        # ground. The deposit kernel (see _convective_deposit) reads |b| as the forward concentration,
+        # so wind and slope aligning focuses the deposit into a tighter, faster head with no cap.
         speed = torch.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2).clamp(min=1e-9)
-        delivered = self._convective_deposit(
-            cf * air_share, x_wind_vel / speed, y_wind_vel / speed
-        ).clamp(min=0.0)                                      # (H, W) [J/m^2] arriving at neighbours
+        wx_unit, wy_unit = x_wind_vel / speed, y_wind_vel / speed
+        sgx, sgy = self._periodic_grad(terrain, self.cell_size_m)   # grad(z) = tan(slope), uphill +
+        smag = torch.sqrt(sgx ** 2 + sgy ** 2)                      # tan(slope)
+        bx = self.convective_wind_bias * wx_unit + self.convective_slope_bias * sgx * smag
+        by = self.convective_wind_bias * wy_unit + self.convective_slope_bias * sgy * smag
+        delivered = self._convective_deposit(cf * air_share, bx, by).clamp(min=0.0)  # (H,W) [J/m^2]
 
         C_floor    = (cp_fuel * 10.0 * self.fuel_burnt_threshold).expand_as(C_fuel)  # ~burnt-mass floor
         C_dep      = torch.maximum(C_fuel, C_floor)
@@ -795,7 +830,7 @@ class Simulation:
         if self.fire_enabled:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
                 s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
-                s.x_wind_vel, s.y_wind_vel,
+                s.x_wind_vel, s.y_wind_vel, s.terrain,
             )
             s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
                 s.fuel_temperatures, s.fuel, s.temp_eq
