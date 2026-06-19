@@ -155,6 +155,11 @@ the `η`-buoyancy term once Phase 3 builds cold-slope temperature gradients.
 **CFL:** substepped on `(|u| + √(g′η))·dt/dx`; with `g′ ≈ 0.2`, `η ≈ 1 km`, the gravity-wave
 speed is ~15 m/s (transcritical with the wind → strong terrain response).
 
+*This single ~1.5 km slab only **thins** over terrain — it never **blocks** it, so it has no
+gap/Venturi winds and exposes only a column-mean wind. **Phase 6** splits it into a thin
+near-surface layer + the upper layer to recover surface-wind realism (gap winds, blocking,
+drainage, downward momentum transport); the equations above remain the upper layer's.*
+
 ### Radiation (replaces `relax_to_equilibrium` for temperature)
 
 Sunlight is absorbed **at the surface**, not by the air — clear air is nearly transparent to
@@ -327,7 +332,8 @@ Each phase is independently testable; we do not change everything at once.
    stable under strong wind/steep terrain, closed-core (sponge off) conserves mass/energy/O₂.
    *Caveat:* default `layer_depth_ref=1000 m` is the recommended value — **lowering it makes
    valleys *slower*, not faster** (level-lid continuity: fast over thin-layer peaks, slow in
-   deep valleys); see Known limitations.
+   deep valleys); see Known limitations. This single-layer "rides over terrain, never blocks it"
+   behaviour is what **Phase 6** replaces with a two-layer surface-wind core.
 3. **Radiation** ✅ *done* — `Simulation.apply_radiation` replaces the temperature
    `relax_to_equilibrium` with a **surface energy balance (canopy-split model)**: sunlight is
    absorbed at the surface (air is shortwave-transparent) and split between the **ground skin**
@@ -374,7 +380,7 @@ Each phase is independently testable; we do not change everything at once.
    `test_heat_exchange` rebaselined to `cp_air`/`cp_fuel`/`dt`; `test_radiant_heat` rebaselined
    for the `specific_heat` repoint. *Known:* at flame temps `k·dt ≫ 1`, so a hot cell burns its
    fuel out in one tick (explicit-Euler saturation, capped at the fuel present — finite, but
-   sharp); revisit with sub-tick consumption in Phase 7. **Fire spread still awaits Phase 5**
+   sharp); revisit with sub-tick consumption in Phase 8. **Fire spread still awaits Phase 5**
    (`apply_radiant_heat` is the propagation mechanism and is still pre-SI; burnt cells have
    `C_fuel=0` and emit nothing).
 5. **Fire radiant transfer** ✅ *done* — `apply_radiant_heat` rewritten to a grey-body
@@ -432,7 +438,7 @@ Each phase is independently testable; we do not change everything at once.
      knee far more readily than a one-tick dump (co-calibrate with `burn_heat_fuel_fraction`). No new
      state field; reinterprets `[fuel_types].arrhenius_pre` as the surface pre-exponential `B`, adds
      `σ`/`ρ_p` per fuel and `[fire].surface_mass_transfer` (`h`). Also fixes the Phase 4
-     explicit-Euler burnout (was deferred to Phase 7). *Optional later:* a shrinking-core state so
+     explicit-Euler burnout (was deferred to Phase 8). *Optional later:* a shrinking-core state so
      `a_s` evolves as particles burn down, and wind-enhanced `h` (Sherwood ∝ Re); `σ` also feeds
      Rothermel in (d). The two-state flame-temperature model is the fallback if `B`/`h`/`σ`
      calibration proves stubborn. *Result:* in the full loop a lit grass cell holds ~1000–2400 K
@@ -496,16 +502,77 @@ Each phase is independently testable; we do not change everything at once.
      and wind-aligned-with-slope focusing a faster head with pinched flanks (the non-saturation property).
    - *Optional:* a **fuel moisture** field — radiation's biggest real preheating job is drying;
      moisture would gate ignition and make the radiation→convection handoff faithful.
-6. **Observations / rendering / config / main** — `OBS_CHANNELS` now span physical ranges;
+6. **Two-layer surface-wind dynamics** *(proposed — surface-wind realism, the driver of real
+   wildfire behaviour)* — Phases 2–5.5 run on a **single** ~1.5 km boundary-layer slab, so "the
+   wind" is the column-mean BL wind and terrain only *thins* the slab, never **blocks** it (a hill
+   is a constriction, not an obstacle). Two consequences matter for fire: (i) **gap/Venturi winds
+   are absent** (the level-lid slab gives fast ridges / slow valleys, never a funneled gap jet —
+   see Known limitations), and (ii) the wind the fire reads is the deep-layer mean, not the
+   **near-surface** wind a fire actually feels. Both are surface-layer phenomena. Split the
+   dynamics into a **thin near-surface layer** (`H_s ≈ 150–300 m`, the canyon/surface layer) under
+   the existing **upper layer** (~1.2 km), coupled by entrainment and interfacial drag. The surface
+   layer is thin enough that realistic terrain (a few hundred metres) is a **real obstacle** to it,
+   so flanking ridges block it and funnel flow through gaps — gap winds emerge at realistic relief,
+   in the layer that drives spread. Legs:
+   - **(a) Two-layer core.** New surface-layer state `m_s, (u_s,v_s), T_s` (the existing `m,u,v,T`
+     become the **upper** layer). Depths `h_s = m_s R_d T_s/p_ref`, `h_u = m_u R_d T_u/p_ref`;
+     interface `b_s = z + h_s`, free surface `s = z + h_s + h_u`. Upper layer forced by `-g'_u ∇s`
+     (as Phase 2); surface layer forced by the interface `-g'_s ∇b_s` with a stronger surface drag
+     `C_b`. Each layer's `m`, `E=m c_p T`, `(m u, m v)` advected conservatively by **its own** wind
+     (the Phase-2 `_advect_periodic`, run per layer). CFL on the `max` of both layers'
+     `(|u|+√(g'h))`. **On-disk change**: maps carry two layers → `units_version 3→4`, **regenerate
+     all 1024 maps + 7 fixtures**; `gen_maps` splits the level-lid mass into an `H_s` surface layer
+     + the remainder upper; `SimState`/env/rollout/obs thread the surface fields.
+   - **(b) Surface-layer terrain blocking → gap/Venturi winds.** Apply **fractional blocking** to
+     the *surface* layer only: at each face the bed rises by `Δb` into the flow, blocking a fraction
+     `f = clamp(Δb/h_s, 0, 1)` of that face's flux (mass/energy/momentum); the blocked share spills
+     to the open neighbour faces → funneled into the gap. `f→1` (a ridge taller than the local
+     surface layer) is full wetting/drying blocking; small `f` is a gentle Venturi — **monotonic in
+     relief**, present at any height, and meaningful where terrain is a real fraction of `H_s`
+     (mountain passes — exactly the fire-relevant case). Conservation is preserved (face-flux
+     redistribution, the same telescoping sum). The upper layer rides over, unblocked. This is the
+     proper fix the single-layer core could not give (binary blocking there needed terrain to pierce
+     the whole ~1.5 km slab; the thin surface layer brings the threshold down to realistic relief).
+     **Flips** `test_narrow_channel_does_not_speed_up_wind` from a strict xfail to a passing Venturi
+     test.
+   - **(c) Interfacial coupling.** Downward momentum transport — interfacial drag `D_int·(u_u − u_s)`
+     (mass-weighted into both layers) — so the faster upper layer **drags the surface layer along**
+     (the "fast wind mixed down to the surface" gustiness). Entrainment couples mass/heat across the
+     interface (daytime surface heating deepens the surface layer; nocturnal cooling thins and
+     decouples it). Keep it minimal and stable: an exact two-body exponential momentum/heat exchange
+     (mirrors `exchange_fuel_air_heat`), tunable rate.
+   - **(d) Rewire the fire stack to the surface wind.** `update_fire` reads `(u_s,v_s)` for the
+     convective bias and plume — fire now feels the **near-surface** wind (gap winds, blocking,
+     drainage), not the deep-layer mean. Oxygen advects with the surface wind. The combustion
+     **plume** (`d_plume ≈ 100 m ≲ H_s`) injects into the surface layer, so a burn lifts `h_s` →
+     surface indraft, and buoyant plume air entrains upward via (c). The Phase-3 ground sensible flux
+     `k_ga(T_g−T_a)` warms the **surface** layer (it is in contact with the ground), the mixed layer
+     growing into the upper layer by entrainment. **Katabatic drainage** now emerges cleanly: a cold
+     surface layer over a slope drives `-g'_s∇b_s` downslope in the thin layer (the effect Phase 3
+     anticipated but the level-lid rest state cancelled).
+   - **(e) Calibration + tests.** Tune `H_s, g'_s, C_b, D_int`, entrainment for: a prevailing surface
+     wind a touch below the upper-layer wind, a gap-wind speedup through a pass, realistic drainage.
+     *Tests*: gap channel **speeds up** (real Venturi, replacing the xfail); surface wind ≠
+     upper-layer wind and lags it; upper-layer momentum mixes down (surface wind rises when the aloft
+     wind does); katabatic drainage down a cooled slope; **closed-core conservation** extended to two
+     layers (each conserves mass/energy with sponge/drag off); CFL/stability at 256² with both layers
+     + all subsystems. Regression: flat-world holds ambient, ridge foehn still present.
+   *Risk:* the most invasive dynamics change since Phase 2 — touches maps, env, rollout, obs, and the
+   whole fire interface. **Gate behind `[momentum].two_layer` (default off)**, build leg-by-leg
+   keeping the single-layer path green, then flip the default in (e). Two-layer SWE can
+   shear-instability at the interface — interfacial drag + viscosity damp it; validate in (e).
+7. **Observations / rendering / config / main** — `OBS_CHANNELS` now span physical ranges;
    add a documented per-channel normalisation (mean/scale) for the world model (in
    `build_observation` or trainer boundary). Revisit rendering color windows for real flame
-   temps. Full `cfg/default.toml` pass (units on every key, drop "pre-SI" markers). Update
-   `main.py` info printouts.
-7. **Test rebaseline + numerical hardening** — consolidate SI tests; split conservation into
+   temps. Decide whether to surface the new two-layer fields (Phase 6) in the observation/render
+   (e.g. surface-layer wind). Full `cfg/default.toml` pass (units on every key, drop "pre-SI"
+   markers). Update `main.py` info printouts.
+8. **Test rebaseline + numerical hardening** — consolidate SI tests; split conservation into
    **closed** (exact) vs **open** (inflow/outflow budget). Regenerate `fixtures/` + port
    `tools/visualize.py` (legacy nondimensional, would fail `units_version`). Re-verify CFL/
-   stability at 256² with all subsystems on; check float64 throughput (~20 steps/s CPU at
-   256²; device-agnostic GPU path untested).
+   stability at 256² with all subsystems on, **including the two-layer core (Phase 6)** and its
+   interfacial shear; check float64 throughput (~20 steps/s CPU at 256²; device-agnostic GPU path
+   untested).
 
 ## Implementation conventions (for any continuation)
 
@@ -559,13 +626,14 @@ Each phase is independently testable; we do not change everything at once.
 
 ## Known limitations / deferred
 
-- **Valley/gap (Venturi) winds NOT captured**: the level-lid shallow layer gives fast
-  ridges / **slow valleys** + strong foehn lee winds; lowering `layer_depth_ref` makes
-  valleys *slower*, not faster. True fast-valley/gap winds need blocking-terrain (wetting–
-  drying) physics — optional future enhancement, not in the phase plan. Pinned by the strict
-  xfail `test_narrow_channel_does_not_speed_up_wind` (a channel aligned with the wind asserts the
-  real-Venturi speedup, which fails; the xfail flips to a failure if the model ever gains gap
-  physics).
+- **Valley/gap (Venturi) winds** — *NOT captured by the single-layer core; addressed by Phase 6.*
+  The level-lid slab gives fast ridges / **slow valleys** + strong foehn lee winds and only *thins*
+  over terrain (a hill is a constriction, never a blocking obstacle), so a channel aligned with the
+  wind does not speed up; lowering `layer_depth_ref` makes valleys *slower*, not faster. The fix is
+  the **two-layer surface-wind dynamics of Phase 6** (a thin surface layer that realistic relief can
+  block, with fractional blocking funnelling flow through gaps). Pinned by the strict xfail
+  `test_narrow_channel_does_not_speed_up_wind`, which Phase 6 leg (b) flips to a passing Venturi
+  test.
 - **Lee separation/turbulence** regime not modelled (hydraulic/foehn regime instead).
 - `column_mass_profile` (full barometric column) kept in `gen_maps` for reference but unused
   by dynamics; `equilibrium_mass` kept only for the legacy `fixtures/`/visualizer scenarios.
