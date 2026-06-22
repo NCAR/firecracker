@@ -30,6 +30,26 @@ O2_DENSITY_REF:   float = 0.2315 * 1.165    # ambient sea-level O2 partial densi
 # --- Radiation -------------------------------------------------------------
 EMISSIVITY: float = 0.95                    # grey-body emissivity of the surface
 
+# --- Domain reference scales -----------------------------------------------
+ELEV_MAX_M:     float = 500.0               # documented terrain elevation ceiling over the domain [m]
+FUEL_REF_KG_M2: float = 20.0                # representative dense-forest areal biomass [kg/m^2]
+
+# --- Observation normalization ---------------------------------------------
+# The world-model observation (Simulation.build_observation) carries SI fields whose
+# magnitudes span several orders (K vs kg/m^2 vs m). Each channel is mapped to roughly
+# [0, 1] by an affine (value - offset) / scale with a documented, physically motivated
+# window -- deterministic, not data-fitted. Keyed by the OBS_CHANNELS name. The high side
+# is intentionally not clamped: flames legitimately exceed the temperature window (they
+# ride a little above 1) rather than saturating the model's view of fire.
+OBS_NORM: dict[str, tuple[float, float]] = {
+    # rest air/fuel temperature (~T_REF) -> ~0; a ~2300 K flame -> ~1.
+    "fuel_temperature": (T_REF, 2000.0),
+    # bare ground -> 0; dense forest (~FUEL_REF) -> ~1.
+    "fuel":             (0.0, FUEL_REF_KG_M2),
+    # sea level -> 0; domain ceiling -> 1.
+    "terrain":          (0.0, ELEV_MAX_M),
+}
+
 # --- Default discretisation scales -----------------------------------------
 # Overridable from cfg/default.toml ([units].cell_size_m, [simulation].steps_per_second).
 DEFAULT_CELL_SIZE_M: float = 10.0           # dx = dy [m]

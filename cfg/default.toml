@@ -5,10 +5,9 @@
 # fuel [kg/m^2], wind [m/s]. Fixed constants of nature and the reference atmosphere
 # live in src/physics_constants.py.
 #
-# NOTE (units migration): map generation, I/O, and rendering are SI as of units_version 1.
-# The dynamics constants under [convection], [relaxation], [fire], [radiant_heat], [wind]
-# and [oxygen] are still the pre-SI values; they are redefined as the physical solvers
-# land (Phases 2-5 of docs/units.md). Stepping is not yet physically meaningful.
+# The model is fully SI: every stage of the step (boundary-layer wind, radiation, combustion,
+# radiant transfer, terrain channeling) runs in physical units (docs/units.md, phases 0-6).
+# The only non-physical block is the legacy [convection] (see its note).
 
 [units]
 # Physical discretisation. Each cell is cell_size_m on a side; the tick duration is
@@ -16,12 +15,9 @@
 cell_size_m = 10.0
 
 [simulation]
-steps_per_second     = 10     # physics ticks per second
-blur_sigma           = 1.0    # Gaussian diffusion width per tick
+steps_per_second     = 10     # physics ticks per second (tick duration dt = 1/steps_per_second [s])
 
 [wind]
-smooth_sigma        = 2.0   # (pre-SI diagnostic wind) Gaussian smoothing; replaced by the Phase 2 solver
-temporal_smoothing  = 0.1   # (pre-SI diagnostic wind) EMA weight; replaced by the Phase 2 solver
 # Per-map synoptic (prevailing) wind: each generated map draws a random bearing and a
 # speed [m/s] uniformly from this range. This is the steady background the momentum drag
 # relaxes toward (Phase 2); terrain then channels/accelerates it.
@@ -75,10 +71,11 @@ enabled     = true   # if false, skip oxygen replenishment
 oxygen_rate = 0.05   # fresh-air replenishment rate; keep below peak burn draw
 
 [convection]
-# Single-layer mass/energy convection. Surface pressure is the column mass m; the
-# column height H = terrain_height_scale*h + m*(1 + thermal_expansion*T). Mass and
-# energy (E = m*T) flow together down the transport potential
-# Phi = pressure_transport_rate*m + buoyancy_transport_rate*H, conserving both totals.
+# LEGACY (pre-SI): the live dynamics no longer use these. They feed only gen_maps' retained
+# reference column-mass profile, which survives for the legacy fixtures/ and tools/visualize.py
+# scenarios. Slated for removal in Phase 8 when those are ported (docs/units.md). The old model:
+# single-layer mass/energy convection down a transport potential
+# Phi = pressure_transport_rate*m + buoyancy_transport_rate*H, H from terrain + thermal expansion.
 thermal_expansion       = 0.5   # alpha: how much temperature expands the column (raises H)
 terrain_height_scale    = 0.5   # gamma: terrain's contribution to column-top height
 buoyancy_transport_rate = 0.1   # c_b: mass/energy flux down the column-height gradient

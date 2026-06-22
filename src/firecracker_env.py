@@ -50,8 +50,10 @@ _WIND_DISPLAY_THRESHOLD:       float = 1e-4
 DISPLAY_TEMP_FLOOR_K:    float = 290.0
 DISPLAY_AIR_TEMP_CEIL_K: float = 330.0
 DISPLAY_MIN_TEMP_SPAN_K: float = 50.0
-# Kelvin above ignition that spans the fire-overlay color ramp (ignition -> +span).
-FIRE_COLOR_TEMP_SPAN_K:  float = 600.0
+# Kelvin above ignition that spans the fire-overlay color ramp (ignition -> +span). Sized to
+# the SI flame band: ignition ~550-600 K up through a sustained ~1540 K front to ~2400 K peaks,
+# so the ramp resolves flame structure instead of saturating just above ignition.
+FIRE_COLOR_TEMP_SPAN_K:  float = 1600.0
 
 # EMA weight for the upper bound of the fuel-temperature and radiant-heat color
 # scales. Smaller = steadier (slower to track the peak); larger = more responsive.
@@ -353,8 +355,13 @@ class FirecrackerEnv(gymnasium.Env):
         self.render_mode = render_mode
         self._pixel_scale = self.window_size // self.grid_size
 
+        # Placeholder human-facing observation: reset/step return the raw air-temperature
+        # field [K], so the Box spans a physical Kelvin window (not [0, 1]). This is distinct
+        # from the normalized multi-channel world-model observation produced by
+        # Simulation.build_observation (OBS_CHANNELS), which the rollout collector consumes.
+        # Revisit when a real agent / action space is designed.
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(self.grid_size, self.grid_size), dtype=np.float32
+            low=0.0, high=3000.0, shape=(self.grid_size, self.grid_size), dtype=np.float32
         )
         # Single no-op action; replace with the real action space when designing the agent.
         self.action_space = spaces.Discrete(1)

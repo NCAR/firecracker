@@ -15,6 +15,7 @@ step B worlds in parallel for world-model training. These tests pin down that:
 import numpy as np
 import torch
 
+import physics_constants as pc
 from conftest import to_numpy
 from simulation import Simulation, SimState, OBS_CHANNELS
 from map_loader import save_map
@@ -110,7 +111,8 @@ def test_batched_conserves_mass_energy_per_world():
 
 
 def test_build_observation_shape_and_channels():
-    """build_observation stacks the documented channels into B x C x N x N."""
+    """build_observation stacks the documented channels into B x C x N x N, each normalized
+    by the per-channel affine window in physics_constants.OBS_NORM (see tests/test_observation.py)."""
     B, N = 4, 8
     names = ("grass", "tree")
     fuel_temps = torch.rand(B, len(names), N, N)
@@ -119,10 +121,14 @@ def test_build_observation_shape_and_channels():
 
     obs = Simulation.build_observation(fuel_temps, fuel, terrain)
 
+    def norm(channel, raw):
+        offset, scale = pc.OBS_NORM[channel]
+        return (to_numpy(raw) - offset) / scale
+
     assert obs.shape == (B, len(OBS_CHANNELS), N, N)
-    np.testing.assert_allclose(to_numpy(obs[:, 0]), to_numpy(fuel_temps.amax(dim=1)))  # hottest type
-    np.testing.assert_allclose(to_numpy(obs[:, 1]), to_numpy(fuel.sum(dim=1)))         # total fuel
-    np.testing.assert_allclose(to_numpy(obs[:, 2]), to_numpy(terrain))                 # terrain
+    np.testing.assert_allclose(to_numpy(obs[:, 0]), norm("fuel_temperature", fuel_temps.amax(dim=1)))  # hottest type
+    np.testing.assert_allclose(to_numpy(obs[:, 1]), norm("fuel", fuel.sum(dim=1)))                     # total fuel
+    np.testing.assert_allclose(to_numpy(obs[:, 2]), norm("terrain", terrain))                          # terrain
 
 
 def test_rollout_collects_and_samples(tmp_path):

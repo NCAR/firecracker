@@ -81,7 +81,6 @@ class Simulation:
 
         self.simulation_steps_per_second: int   = int(sim.get("steps_per_second",        10))
         self.ms_per_step:                 int   = 1000 // self.simulation_steps_per_second
-        self.blur_sigma:                  float = float(sim.get("blur_sigma",              1.0))
 
         # Physical discretisation scales. dx is the cell edge length; dt is the wall-clock
         # duration of one tick. Both are needed by the SI physics (Phase 2+); they are wired
@@ -976,15 +975,22 @@ class Simulation:
         fuel: torch.Tensor,               # (..., N_fuel, H, W)
         terrain: torch.Tensor,            # (..., H, W)
     ) -> torch.Tensor:
-        """Stack the OBS_CHANNELS into a (..., C, H, W) observation.
+        """Stack the OBS_CHANNELS into a normalized (..., C, H, W) observation.
 
         Each channel is reduced across fuel types: fuel temperature is the hottest type
         (amax), fuel/vegetation is the total mass (sum), terrain is passed through. With a
         leading batch axis the result is the B x C x N x N tensor the world model trains on.
+
+        The raw SI fields span very different magnitudes (K vs kg/m^2 vs m), so each channel
+        is mapped to roughly [0, 1] by the documented affine window in physics_constants.OBS_NORM
+        (value - offset) / scale. The high side is not clamped, so flames ride a little above 1.
         """
         channels = [
             fuel_temperatures.amax(dim=-3),  # fuel_temperature: hottest fuel type
             fuel.sum(dim=-3),                # fuel: total vegetation mass
             terrain,                         # terrain: elevation
         ]
-        return torch.stack(channels, dim=-3)
+        obs = torch.stack(channels, dim=-3)
+        offsets = torch.tensor([pc.OBS_NORM[c][0] for c in OBS_CHANNELS], dtype=obs.dtype, device=obs.device)
+        scales  = torch.tensor([pc.OBS_NORM[c][1] for c in OBS_CHANNELS], dtype=obs.dtype, device=obs.device)
+        return (obs - offsets[:, None, None]) / scales[:, None, None]

@@ -1,9 +1,9 @@
 # Physical Units Conversion — Design Doc
 
-Status: **in progress** — phases 0–6 done (scaffolding through terrain-channeling wind +
-wind-driven spread); phases 7–8 (observations/config polish, test rebaseline + hardening)
-remain. Target: convert Firecracker from a nondimensional, per-tick model to a fully physical
-SI simulation.
+Status: **in progress** — phases 0–7 done (scaffolding through terrain-channeling wind +
+wind-driven spread, plus observation/config/render polish); phase 8 (test rebaseline +
+numerical hardening) remains. Target: convert Firecracker from a nondimensional, per-tick
+model to a fully physical SI simulation.
 
 ## Goal & decisions
 
@@ -531,16 +531,27 @@ Each phase is independently testable; we do not change everything at once.
    tests (xfail kept); `test_spread.py` gains a wind-speed-drives-spread test and the preheat-synergy
    thresholds were re-tuned to the speed-scaled deposit (~1/25/37 burnt for preheat/convection/both).
    *Deferred:* wind-scaled convective *reach* (spotting) and the prognostic gap jet (Option 1).
-7. **Observations / rendering / config / main** — `OBS_CHANNELS` now span physical ranges;
-   add a documented per-channel normalisation (mean/scale) for the world model (in
-   `build_observation` or trainer boundary). Revisit rendering color windows for real flame
-   temps. Full `cfg/default.toml` pass (units on every key, drop "pre-SI" markers). Update
-   `main.py` info printouts.
+7. **Observations / rendering / config / main** ✅ *done* — the world-model observation is now
+   **normalised**: `OBS_CHANNELS` span physical ranges, so `Simulation.build_observation` maps each
+   channel to roughly `[0, 1]` by a documented affine window `(value − offset)/scale` from
+   `physics_constants.OBS_NORM` (`fuel_temperature` `(T_REF, 2000)`, `fuel` `(0, FUEL_REF=20)`,
+   `terrain` `(0, ELEV_MAX=500)`); the high side is unclamped so flames ride a little above 1.
+   Rank-agnostic, so the batched rollout pool stores normalised samples. The gym env's
+   `observation_space` was made honest (raw air-temp `Box` in Kelvin, distinct from the world-model
+   path; the env obs rework waits for a real agent). Rendering: `FIRE_COLOR_TEMP_SPAN_K` widened
+   (600 → 1600 K) so the flame ramp resolves the real ~573–2400 K band. Config: rewrote the stale
+   "pre-SI" header, dropped dead knobs (`[simulation].blur_sigma`, `[wind].smooth_sigma`/
+   `temporal_smoothing`), added unit annotations, and relabelled `[convection]` as **legacy**
+   (it now feeds only `gen_maps`' retained reference mass profile; removal is Phase 8). `main.py`
+   printouts gained units and a `[channeling]` section. No `units_version` bump, no map regen.
+   *Tests:* `tests/test_observation.py` (per-channel normalisation, hottest-type reduction, batched
+   == single); `test_batched.py` obs assertion rebaselined to the normalised channels.
 8. **Test rebaseline + numerical hardening** — consolidate SI tests; split conservation into
    **closed** (exact) vs **open** (inflow/outflow budget). Regenerate `fixtures/` + port
-   `tools/visualize.py` (legacy nondimensional, would fail `units_version`). Re-verify CFL/
-   stability at 256² with all subsystems on; check float64 throughput (~20 steps/s CPU at
-   256²; device-agnostic GPU path untested).
+   `tools/visualize.py` (legacy nondimensional, would fail `units_version`); remove the legacy
+   `[convection]` block + its `gen_maps` reference-mass path once those are ported. Re-verify CFL/
+   stability at 256² with all subsystems on; check float64 throughput (~15.7 steps/s CPU at
+   256² with fire+radiation+channeling on; device-agnostic GPU path untested).
 
 ## Implementation conventions (for any continuation)
 
