@@ -40,22 +40,28 @@ def make_config(
     relaxation: bool = False,
     radiation: bool = False,
     momentum: dict | None = None,
+    channeling: dict | None = None,
 ) -> dict:
     """A minimal config with the major sinks/sources toggled for isolation.
 
     The momentum core uses its code defaults unless `momentum` overrides are given
     (e.g. {"sponge_strength": 0.0, "drag_coeff": 0.0} for a closed, conservative core).
-    Each named fuel type gets a subtable so Simulation parses matching fuel_type_names.
+    Channeling defaults to OFF here (a `channeling` override opts it in) so the isolation
+    scenarios see the bare prognostic wind. Each named fuel type gets a subtable so
+    Simulation parses matching fuel_type_names.
     """
     config = {
         "environment": {"grid_size": grid_size, "window_size": grid_size, "max_steps": 10_000},
         "fire": {"enabled": fire, "spawn_fire": False},
         "relaxation": {"enabled": relaxation},
         "radiation": {"enabled": radiation},
+        "channeling": {"enabled": False},
         "fuel_types": {name: {"ignition_threshold": 1.5} for name in fuel_type_names},
     }
     if momentum is not None:
         config["momentum"] = dict(momentum)
+    if channeling is not None:
+        config["channeling"] = dict(channeling)
     return config
 
 

@@ -100,6 +100,23 @@ sponge_width    = 8       # cells: width of the boundary relaxation (open-domain
 sponge_strength = 10.0    # [1/s]: peak edge relaxation rate toward (u_amb, rest mass)
 cfl_target      = 0.5     # max Courant number per substep (advective + gravity-wave speed)
 
+[channeling]
+# Diagnostic terrain-channeling surface wind (Phase 6, Option 2; see docs/units.md). The prognostic
+# momentum core makes valleys *slow* (its level-lid layer deepens in low ground), so it cannot
+# produce gap/Venturi speedups. Instead of a second prognostic layer, a static per-map gain speeds
+# up -- direction unchanged -- the near-surface wind the fire and oxygen read. For each cell the
+# cross-stream relief (perpendicular to the synoptic wind) is scanned out to radius_m each way; each
+# step's openness = clamp(1 - rise/height_scale_m, 0, 1) is shadowed (running min) and summed into an
+# open width per side, the wider (more-open) side is kept, and gain = clamp(radius/open_width, 1,
+# gain_max). So a valley confined both ways gets a big gain while a hillside or mountain base (open on
+# one side) stays ~1; taller and closer walls both raise the gain continuously (no hard threshold).
+# The prognostic field is untouched, so the gap-wind xfail (which reads the prognostic field) stays.
+enabled        = true    # apply the channeling gain to the wind the fire/oxygen read (false = prognostic wind)
+radius_m       = 300.0   # cross-stream scan reach [m] each way (sets the gap scale the gain responds to)
+height_scale_m = 100.0   # terrain rise [m] that fully closes the channel (a smaller rise closes it partly)
+gain_max       = 3.0     # cap on the channeling speedup (a tight gap saturates here)
+smooth_sigma   = 1.0     # Gaussian smoothing [cells] of the gain field (removes per-cell speckle)
+
 [fire]
 # Surface-area-controlled, oxygen-limited combustion (see docs/units.md). Fuel reacts at its
 # surface, so the burn rate is the reactive surface area (a_s = sigma/particle_density, from each
@@ -133,7 +150,8 @@ plume_mixing_depth       = 100.0  # d_plume [m]: shallow plume the air-share bur
 convective_fraction      = 0.12   # share of the air-share heat convected to nearby fuel (spread driver)
 flame_gate_temperature   = 700.0  # K: convection ignites only fuel below this (flaming fuel is combustion-set)
 convective_radius_m      = 10.0   # reach [m] of the convective ignition onto neighbouring fuel
-convective_wind_bias     = 1.0    # downwind skew of the convective ignition (concentration on the unit wind)
+convective_wind_bias     = 1.0    # downwind skew of the convective ignition (concentration on wind/u_ref)
+convective_wind_ref      = 10.0   # u_ref [m/s]: wind speed at which the wind bias matches the old unit form
 convective_slope_bias    = 2.5    # upslope skew of the convective ignition (concentration on tan^2(slope))
 spawn_fire               = false  # if true, a random fire spawns at reset; if false, left-click to ignite
 spawn_radius             = 5      # radius (in grid cells) of the circular ignition patch

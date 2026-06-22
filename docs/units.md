@@ -1,7 +1,9 @@
 # Physical Units Conversion — Design Doc
 
-Status: **proposed** · Target: convert Firecracker from a nondimensional, per-tick
-model to a fully physical SI simulation.
+Status: **in progress** — phases 0–6 done (scaffolding through terrain-channeling wind +
+wind-driven spread); phases 7–8 (observations/config polish, test rebaseline + hardening)
+remain. Target: convert Firecracker from a nondimensional, per-tick model to a fully physical
+SI simulation.
 
 ## Goal & decisions
 
@@ -149,7 +151,8 @@ conservation tests.)
 **Observed orographic behaviour** (verified): windward blocking (slower), and
 lee/downslope **acceleration** above ambient — the foehn / downslope-wind pattern that
 drives real wildfires. Strength scales with how shallow the layer is (`layer_depth_ref`):
-shallower → stronger channeling and gap winds. **Katabatic** drainage emerges later from
+shallower → stronger channeling and lee/foehn winds (but valleys stay *slow* — fast valley/gap
+winds are not captured by this core; see Known limitations). **Katabatic** drainage emerges later from
 the `η`-buoyancy term once Phase 3 builds cold-slope temperature gradients.
 
 **CFL:** substepped on `(|u| + √(g′η))·dt/dx`; with `g′ ≈ 0.2`, `η ≈ 1 km`, the gravity-wave
@@ -374,7 +377,7 @@ Each phase is independently testable; we do not change everything at once.
    `test_heat_exchange` rebaselined to `cp_air`/`cp_fuel`/`dt`; `test_radiant_heat` rebaselined
    for the `specific_heat` repoint. *Known:* at flame temps `k·dt ≫ 1`, so a hot cell burns its
    fuel out in one tick (explicit-Euler saturation, capped at the fuel present — finite, but
-   sharp); revisit with sub-tick consumption in Phase 7. **Fire spread still awaits Phase 5**
+   sharp); revisit with sub-tick consumption in Phase 8. **Fire spread still awaits Phase 5**
    (`apply_radiant_heat` is the propagation mechanism and is still pre-SI; burnt cells have
    `C_fuel=0` and emit nothing).
 5. **Fire radiant transfer** ✅ *done* — `apply_radiant_heat` rewritten to a grey-body
@@ -432,7 +435,7 @@ Each phase is independently testable; we do not change everything at once.
      knee far more readily than a one-tick dump (co-calibrate with `burn_heat_fuel_fraction`). No new
      state field; reinterprets `[fuel_types].arrhenius_pre` as the surface pre-exponential `B`, adds
      `σ`/`ρ_p` per fuel and `[fire].surface_mass_transfer` (`h`). Also fixes the Phase 4
-     explicit-Euler burnout (was deferred to Phase 7). *Optional later:* a shrinking-core state so
+     explicit-Euler burnout (was deferred to Phase 8). *Optional later:* a shrinking-core state so
      `a_s` evolves as particles burn down, and wind-enhanced `h` (Sherwood ∝ Re); `σ` also feeds
      Rothermel in (d). The two-state flame-temperature model is the fallback if `B`/`h`/`σ`
      calibration proves stubborn. *Result:* in the full loop a lit grass cell holds ~1000–2400 K
@@ -496,12 +499,44 @@ Each phase is independently testable; we do not change everything at once.
      and wind-aligned-with-slope focusing a faster head with pinched flanks (the non-saturation property).
    - *Optional:* a **fuel moisture** field — radiation's biggest real preheating job is drying;
      moisture would gate ignition and make the radiation→convection handoff faithful.
-6. **Observations / rendering / config / main** — `OBS_CHANNELS` now span physical ranges;
+6. **Terrain-channeling surface wind + wind-driven spread (Phase 6, Option 2)** ✅ *done* — the
+   prognostic core is terrain-responsive (windward blocking, lee/foehn acceleration) but its
+   level-lid layer *deepens* in valleys, so it makes gaps **slow** and cannot produce the gap/Venturi
+   speedup (the strict xfail `test_narrow_channel_does_not_speed_up_wind`, kept). Rather than a second
+   prognostic layer (Option 1 — built, shelved on `phase6-two-layer` as research-grade; see Known
+   limitations), the gap speedup is imposed as a **diagnostic rule**: `compute_channel_gain`
+   precomputes a static per-map gain by scanning the **cross-stream relief** (the line perpendicular
+   to the fixed synoptic wind, sampled along the true bearing by bilinear `grid_sample` so any wind
+   angle works) out to `radius_m` each way, grading each step's openness by relief rather than a hard
+   wall threshold: `openness = clamp(1 − rise/height_scale_m, 0, 1)` (rise = terrain above the cell),
+   shadowed outward by a running min (a wall hides everything beyond it) and summed into an open width
+   per side. The two sides combine as `W_eff = max(W_plus, W_minus)` — the *more-open* side limits the
+   boost — and `gain = clamp(radius/W_eff, 1, gain_max)` (flat → 1, a tight gap → up to `gain_max`),
+   lightly Gaussian-smoothed. The `max` combiner is the key: a true valley is confined **both** ways
+   so `W_eff` is small and the gain is large, while a hillside, mountain base or one side of a saddle
+   stays open on one side → `W_eff = radius` → gain ≈ 1 (a bare gradient would wrongly accelerate
+   those). Both wall *height* (via the grading) and *distance* (a closer wall caps the width sooner)
+   feed the gain continuously. `step_fields` multiplies the wind the **fire and oxygen** read by this
+   gain (speedup only — direction preserved, since the core already deflects), leaving the
+   **prognostic field untouched** (so the xfail stays honest). New `SimState.channel_gain
+   /x_wind_fire/y_wind_fire` (optional — hand-built states are unaffected), `[channeling]` config
+   (`enabled` **on by default**, `radius_m=300`, `height_scale_m=100`, `gain_max=3`, `smooth_sigma=1`).
+   **Wind speed now drives rate-of-spread** (Phase 6's second half): the convective deposit's wind
+   bias was the *unit* wind (direction only); it is now `convective_wind_bias·(wind/convective_wind_ref)`
+   (`u_ref=10 m/s`), so a faster wind grows the forward concentration and throws the ignition heat
+   harder downwind. Paired with the channeling gain, a gap both speeds the wind and focuses the head.
+   *Result:* head reach grows ~3→6→9→11 cells as wind goes 0→5→10→15 m/s with the flanks pinching in;
+   the channeled surface wind exceeds ambient in a gap. No new state on disk, **no `units_version`
+   bump, no map regen**. *Tests:* `test_equilibrium.py` gains channel-speedup + flat-gain-unity
+   tests (xfail kept); `test_spread.py` gains a wind-speed-drives-spread test and the preheat-synergy
+   thresholds were re-tuned to the speed-scaled deposit (~1/25/37 burnt for preheat/convection/both).
+   *Deferred:* wind-scaled convective *reach* (spotting) and the prognostic gap jet (Option 1).
+7. **Observations / rendering / config / main** — `OBS_CHANNELS` now span physical ranges;
    add a documented per-channel normalisation (mean/scale) for the world model (in
    `build_observation` or trainer boundary). Revisit rendering color windows for real flame
    temps. Full `cfg/default.toml` pass (units on every key, drop "pre-SI" markers). Update
    `main.py` info printouts.
-7. **Test rebaseline + numerical hardening** — consolidate SI tests; split conservation into
+8. **Test rebaseline + numerical hardening** — consolidate SI tests; split conservation into
    **closed** (exact) vs **open** (inflow/outflow budget). Regenerate `fixtures/` + port
    `tools/visualize.py` (legacy nondimensional, would fail `units_version`). Re-verify CFL/
    stability at 256² with all subsystems on; check float64 throughput (~20 steps/s CPU at
@@ -556,16 +591,39 @@ Each phase is independently testable; we do not change everything at once.
   old dipole at `|b|=1`, so leg c stays calibrated). `convective_concentration_max=12` caps `|b|` only as
   a numerical `exp`-overflow guard at the spurious terrain-wrap gradient. Still directional, so it
   captures the upslope/downslope asymmetry and the alignment synergy, not an absolute ROS gain.
+- **Phase 6 (Option 2)** *(done)*: `convective_wind_ref=10 m/s` with `convective_wind_bias=1.0` gives a
+  clean wind-driven story (head reach ~3→6→9→11 cells over 0→15 m/s, flanks pinching) without the
+  thin-finger runaway that `convective_wind_bias≈2` produces at high wind. Channeling
+  `radius_m=300`, `height_scale_m=100`, `gain_max=3`, `smooth_sigma=1` give a gap gain ~3 on the
+  `si_channel` walls; on real maps the gain saturates at 3 in tight valleys with a mean ~1.1, and
+  low ground (valleys) reads a higher mean gain than ridges while cross-wind ridges stay exactly 1.
+  Tune `height_scale_m` (the rise that fully closes a channel; smaller → more bumps boost) and
+  `gain_max` if real maps over- or under-channel. Going past the ~R11 head
+  ceiling at extreme winds needs wind-scaled reach (spotting), deferred.
 
 ## Known limitations / deferred
 
-- **Valley/gap (Venturi) winds NOT captured**: the level-lid shallow layer gives fast
-  ridges / **slow valleys** + strong foehn lee winds; lowering `layer_depth_ref` makes
-  valleys *slower*, not faster. True fast-valley/gap winds need blocking-terrain (wetting–
-  drying) physics — optional future enhancement, not in the phase plan. Pinned by the strict
-  xfail `test_narrow_channel_does_not_speed_up_wind` (a channel aligned with the wind asserts the
-  real-Venturi speedup, which fails; the xfail flips to a failure if the model ever gains gap
-  physics).
+- **Valley/gap (Venturi) winds NOT captured by the prognostic core**: the level-lid shallow
+  layer gives fast ridges / **slow valleys** + strong foehn lee winds; lowering `layer_depth_ref`
+  makes valleys *slower*, not faster. True prognostic fast-valley/gap winds need blocking-terrain
+  (wetting–drying) physics. A prognostic **two-layer surface-wind core** was built for this and
+  **shelved as research-grade**: in this sponge-bounded shallow water the gap flow self-limits
+  below ambient (the windward dam bleeds out the open boundary; the layer stays subcritical so a
+  constriction deepens rather than speeds up). It lives on branch `phase6-two-layer`, write-up in
+  `docs/phase6b_investigation.md`. The strict xfail `test_narrow_channel_does_not_speed_up_wind`
+  (a wind-aligned channel asserting the real-Venturi speedup) stays pinned to the **prognostic**
+  field and keeps failing on purpose.
+  **Resolved for the fire (Phase 6, Option 2 — done):** the fire and oxygen instead read a cheap
+  **diagnostic terrain-channeling near-surface wind** — the continuity speedup imposed on the
+  single-layer wind, `gain = clamp(R/max(W_plus, W_minus), 1, gain_max)` from the graded cross-stream
+  relief (`openness = clamp(1 − rise/height_scale_m, 0, 1)`, shadowed and summed per side, the
+  more-open side limiting the boost so only two-sided valleys channel; `compute_channel_gain`,
+  `[channeling]` block, on by default) — applied speedup-only with the
+  prognostic field untouched, so the xfail above stays valid. It is paired with a **wind-magnitude
+  term in the convective deposit** (`b_wind = convective_wind_bias·wind/convective_wind_ref`, was
+  the unit wind) so wind *speed* now drives rate-of-spread, not just direction. See the Phase 6
+  entry (item 6 under Phased delivery) and `compute_channel_gain` in `src/simulation.py`. (The
+  *prognostic* gap jet — Option 1 — remains deferred on `phase6-two-layer`.)
 - **Lee separation/turbulence** regime not modelled (hydraulic/foehn regime instead).
 - `column_mass_profile` (full barometric column) kept in `gen_maps` for reference but unused
   by dynamics; `equilibrium_mass` kept only for the legacy `fixtures/`/visualizer scenarios.

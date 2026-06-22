@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from conftest import to_numpy
-from scenarios import si_channel, si_flat, si_ridge
+from scenarios import make_config, si_channel, si_flat, si_ridge
 
 
 def _speed(env) -> np.ndarray:
@@ -71,6 +71,42 @@ def test_narrow_channel_does_not_speed_up_wind(make_env):
     c = sp.shape[0] // 2
     channel = sp[c, 12:-12].mean()      # along the channel centreline, away from the sponge
     assert channel > np.hypot(*ambient)  # real Venturi speedup -- the model fails this
+
+
+def _fire_speed(env) -> np.ndarray:
+    """Magnitude of the diagnostic near-surface wind the fire/oxygen read (channeling applied)."""
+    return to_numpy(torch.sqrt(env._x_wind_fire ** 2 + env._y_wind_fire ** 2))
+
+
+def test_channeling_speeds_up_surface_wind(make_env):
+    """With channeling on, the wind the fire reads speeds up through the gap (the imposed Venturi).
+
+    The prognostic core leaves the channel slow (see the xfail above), but the diagnostic channeling
+    gain multiplies the near-surface wind by the cross-stream confinement, so the wind the fire/oxygen
+    feel along the channel exceeds the synoptic ambient -- the gap speedup, imposed as a rule.
+    """
+    ambient = (15.0, 0.0)
+    _, m = si_channel(grid=48, ambient=ambient, peak_m=800.0)
+    env = make_env(make_config(48, channeling={"enabled": True}), m)
+    for _ in range(800):
+        env.step(0)
+
+    fire = _fire_speed(env)
+    c = fire.shape[0] // 2
+    channel = fire[c, 12:-12].mean()       # along the channel centreline, away from the sponge
+    assert channel > np.hypot(*ambient)    # the channeled surface wind exceeds ambient
+
+
+def test_channeling_is_unity_over_flat_ground(make_env):
+    """Over flat terrain the gain is 1, so the wind the fire reads equals the prognostic wind."""
+    ambient = (12.0, -5.0)
+    env = make_env(make_config(48, channeling={"enabled": True}), si_flat(grid=48, ambient=ambient)[1])
+    for _ in range(150):
+        env.step(0)
+
+    # No relief -> no confinement -> gain == 1 everywhere, so the fire wind is the prognostic wind.
+    np.testing.assert_allclose(to_numpy(env._x_wind_fire), to_numpy(env._x_wind_vel), rtol=1e-12)
+    np.testing.assert_allclose(to_numpy(env._y_wind_fire), to_numpy(env._y_wind_vel), rtol=1e-12)
 
 
 def test_wind_is_steady_until_perturbed(make_env):

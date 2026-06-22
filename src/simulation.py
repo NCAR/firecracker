@@ -50,6 +50,13 @@ class SimState:
     u_amb_x:           torch.Tensor   # per-world synoptic ambient wind [m/s], broadcastable to (..., H, W)
     u_amb_y:           torch.Tensor
     radiant_flux:      torch.Tensor   # last per-cell absorbed radiant flux (diagnostic)
+    # Phase 6 (Option 2): the terrain-channeling surface wind. channel_gain is the static per-world
+    # Venturi speedup (>= 1, precomputed from terrain + the synoptic wind); x/y_wind_fire is the
+    # near-surface wind the fire and oxygen actually read (prognostic wind x gain). All three are
+    # optional so hand-built states (and the single-layer path) keep working unchanged.
+    channel_gain:      torch.Tensor | None = None
+    x_wind_fire:       torch.Tensor | None = None
+    y_wind_fire:       torch.Tensor | None = None
 
 
 def _resolve_device(name: str | None) -> torch.device:
@@ -116,6 +123,21 @@ class Simulation:
         self.cfl_target:      float = float(momentum.get("cfl_target",      0.5))
         self._sponge_cache: dict[tuple[int, int], torch.Tensor] = {}
 
+        # Phase 6 (Option 2): diagnostic terrain-channeling surface wind. The prognostic core above
+        # is terrain-responsive (windward blocking, lee/foehn acceleration) but its level-lid layer
+        # *deepens* in valleys, so it makes gaps slow -- it cannot produce the gap/Venturi speedup.
+        # Rather than a second prognostic layer, we impose the continuity Venturi as a rule: a static
+        # per-map gain (computed from the cross-stream relief and the fixed synoptic wind direction)
+        # speeds up -- direction unchanged -- the wind the fire and oxygen read. The prognostic field
+        # is untouched. See compute_channel_gain and docs/units.md.
+        channeling = (cfg or {}).get("channeling", {})
+        self.channeling_enabled:    bool  = bool(channeling.get("enabled", True))
+        chan_radius_m                     = float(channeling.get("radius_m", 300.0))
+        self.channel_radius:        int   = max(1, round(chan_radius_m / self.cell_size_m))
+        self.channel_height_scale_m: float = float(channeling.get("height_scale_m", 100.0))
+        self.channel_gain_max:      float = float(channeling.get("gain_max", 3.0))
+        self.channel_smooth_sigma:  float = float(channeling.get("smooth_sigma", 1.0))
+
         # Combustion (Phase 4). The reaction rate is a smooth Arrhenius law limited by oxygen,
         # so there is no hard ignition threshold -- cold fuel is inert because the exponential
         # is vanishingly small at ambient temperature. The oxygen field is the near-surface
@@ -152,6 +174,12 @@ class Simulation:
         self.convective_fraction:         float = float(fire.get("convective_fraction",       0.12))
         self.flame_gate_temperature:      float = float(fire.get("flame_gate_temperature",    700.0))
         self.convective_wind_bias:        float = float(fire.get("convective_wind_bias",      1.0))
+        # Reference wind speed [m/s] that the convective bias normalises by (Phase 6, Option 2): the
+        # wind term is convective_wind_bias*(wind/u_ref), so wind *speed* (not just direction) drives
+        # the forward concentration -- a faster wind throws the ignition heat harder downwind. At
+        # u_ref the term matches the old unit-wind form; below it the forcing is gentler, above it
+        # stronger. Set near a light prevailing wind so 5 m/s already bites and 10-15 m/s is strong.
+        self.convective_wind_ref:         float = float(fire.get("convective_wind_ref",       10.0))
         self.convective_slope_bias:       float = float(fire.get("convective_slope_bias",     2.5))
         conv_radius_m                           = float(fire.get("convective_radius_m",       10.0))
         self.convective_radius:           int   = max(1, round(conv_radius_m / self.cell_size_m))
@@ -394,6 +422,91 @@ class Simulation:
         rate = (self.sponge_strength * taper).to(self.dtype)
         self._sponge_cache[key] = rate
         return rate
+
+    def compute_channel_gain(
+        self, terrain: torch.Tensor, u_amb_x: torch.Tensor, u_amb_y: torch.Tensor
+    ) -> torch.Tensor:
+        """Static per-map terrain-channeling gain (>= 1): the continuity Venturi the fire reads.
+
+        The prognostic core (step_dynamics) gives a deep, *slow* layer in low ground, so it cannot
+        speed wind up through a gap. We impose that speedup as a rule. For every cell, scan the
+        cross-stream profile -- the line perpendicular to the fixed synoptic wind -- out to
+        channel_radius cells on each side and measure how *open* the channel stays, graded by relief:
+
+          rise_k     = max(terrain_k - terrain_self, 0)              relief above me at step k
+          openness_k = clamp(1 - rise_k / channel_height_scale_m, 0, 1)   1 fully open, 0 fully walled
+          O_run      = running min of openness outward                a wall shadows everything beyond
+          W_side     = sum of O_run over the R steps                  the open width on that side (cells)
+
+        A low bump barely closes the channel; a rise of channel_height_scale_m fully closes it; and a
+        wall at distance d caps W_side ~ d, so both wall *height* and *distance* feed the gain
+        continuously (no hard threshold). The two sides combine as `W_eff = max(W_plus, W_minus)` --
+        the more-open side limits the boost, so a true valley (confined both ways) gets a big gain
+        while a hillside, mountain base or one side of a saddle (open on one side) stays ~1. Then
+        `gain = clamp(R / W_eff, 1, gain_max)`: fully open -> W_eff = R -> gain 1, a tight gap pinches
+        W_eff -> gain > 1. The scan samples along the *true* cross-stream direction by bilinear
+        interpolation (grid_sample), so it is correct for any wind bearing, not just grid-aligned
+        ones. A light Gaussian smooth removes per-cell speckle (convex -> stays >= 1). Returned
+        per-cell with terrain's trailing shape; all-ones when channeling is disabled. The synoptic
+        wind is a per-map constant, so this is computed once.
+
+        Rank-agnostic: any leading dims (e.g. a batch B) are folded into grid_sample's batch axis,
+        each world using its own synoptic direction.
+        """
+        if not self.channeling_enabled:
+            return torch.ones_like(terrain)
+
+        R, height_scale = self.channel_radius, self.channel_height_scale_m
+        *lead, h, w = terrain.shape
+        n_worlds = 1
+        for d in lead:
+            n_worlds *= d
+        terr = terrain.reshape(n_worlds, 1, h, w)
+        own = terr.reshape(n_worlds, h, w)
+
+        # Per-world synoptic direction (the ambient wind is uniform per world -> reduce to a scalar).
+        ax = u_amb_x.expand(*lead, h, w).reshape(n_worlds, h, w).mean(dim=(-2, -1))   # (n_worlds,)
+        ay = u_amb_y.expand(*lead, h, w).reshape(n_worlds, h, w).mean(dim=(-2, -1))
+        speed = torch.sqrt(ax ** 2 + ay ** 2).clamp(min=1e-12)
+        # Cross-stream unit normal n_hat = wind rotated 90 deg: (wx, wy) -> (-wy, wx). x = cols, y = rows.
+        nx = (-ay / speed).view(n_worlds, 1, 1)
+        ny = ( ax / speed).view(n_worlds, 1, 1)
+
+        device = terrain.device
+        rows = torch.arange(h, device=device, dtype=self.dtype).view(-1, 1)
+        cols = torch.arange(w, device=device, dtype=self.dtype).view(1, -1)
+        # Normalised base coords for grid_sample (align_corners=True): idx -> 2*idx/(size-1) - 1.
+        step_x = 2.0 / max(w - 1, 1)
+        step_y = 2.0 / max(h - 1, 1)
+        base_x = cols * step_x - 1.0   # (1, w)
+        base_y = rows * step_y - 1.0   # (h, 1)
+
+        def sample(sign: float, k: int) -> torch.Tensor:
+            sx = base_x + sign * k * nx * step_x   # (n_worlds, h, w) via broadcast
+            sy = base_y + sign * k * ny * step_y
+            sx = sx.expand(n_worlds, h, w)
+            sy = sy.expand(n_worlds, h, w)
+            grid = torch.stack([sx, sy], dim=-1)   # (n_worlds, h, w, 2): last dim (x, y)
+            return F.grid_sample(
+                terr, grid, mode="bilinear", padding_mode="border", align_corners=True
+            ).reshape(n_worlds, h, w)
+
+        def open_width(sign: float) -> torch.Tensor:
+            """Graded open width (in cells) on one side: integral of the shadowed openness."""
+            o_run = torch.ones((n_worlds, h, w), dtype=self.dtype, device=device)   # fully open at the cell
+            width = torch.zeros((n_worlds, h, w), dtype=self.dtype, device=device)
+            for k in range(1, R + 1):
+                rise = (sample(sign, k) - own).clamp(min=0.0)
+                openness = (1.0 - rise / height_scale).clamp(min=0.0, max=1.0)
+                o_run = torch.minimum(o_run, openness)   # a wall shadows everything beyond it
+                width = width + o_run
+            return width
+
+        # The more-open side limits the boost: a valley is confined both ways, a slope only one way.
+        w_eff = torch.maximum(open_width(+1.0), open_width(-1.0)).clamp(min=1e-6)
+        gain = (float(R) / w_eff).clamp(min=1.0, max=self.channel_gain_max)
+        gain = self._diffuse(gain, self.channel_smooth_sigma)   # convex combination -> stays >= 1
+        return gain.reshape(*lead, h, w)
 
     def step_dynamics(self, s: SimState) -> SimState:
         """Advance the prognostic wind, boundary-layer mass and air energy one tick.
@@ -711,18 +824,21 @@ class Simulation:
             terrain = torch.zeros_like(air_temperatures)
         cf = self.convective_fraction
 
-        # Bias vector for the convective deposit (the directional skew). Blend the unit wind (lee
-        # bias, leg c) with the upslope terrain gradient (Rothermel slope effect, leg d): grad(z) is
-        # the slope (= tan of the slope angle) pointing uphill, scaled by its own magnitude so the
-        # slope term has magnitude tan^2(slope) -- the front skews uphill ever harder on steeper
-        # ground. The deposit kernel (see _convective_deposit) reads |b| as the forward concentration,
-        # so wind and slope aligning focuses the deposit into a tighter, faster head with no cap.
-        speed = torch.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2).clamp(min=1e-9)
-        wx_unit, wy_unit = x_wind_vel / speed, y_wind_vel / speed
+        # Bias vector for the convective deposit (the directional skew). Blend the wind (lee bias,
+        # leg c) with the upslope terrain gradient (Rothermel slope effect, leg d). The wind term is
+        # scaled by speed, not just direction (Phase 6, Option 2): b_wind = convective_wind_bias *
+        # (wind / u_ref), so a faster wind grows |b| and throws the ignition heat harder downwind --
+        # wind *speed* drives the rate of spread (paired with the channeling gain above, a gap both
+        # speeds the wind and focuses the head). grad(z) is the slope (= tan of the slope angle)
+        # pointing uphill, scaled by its own magnitude so the slope term has magnitude tan^2(slope) --
+        # the front skews uphill ever harder on steeper ground. The deposit kernel (see
+        # _convective_deposit) reads |b| as the forward concentration, so wind and slope aligning
+        # focuses the deposit into a tighter, faster head; |b| is capped only as a numerical guard.
+        u_ref = self.convective_wind_ref
         sgx, sgy = self._periodic_grad(terrain, self.cell_size_m)   # grad(z) = tan(slope), uphill +
         smag = torch.sqrt(sgx ** 2 + sgy ** 2)                      # tan(slope)
-        bx = self.convective_wind_bias * wx_unit + self.convective_slope_bias * sgx * smag
-        by = self.convective_wind_bias * wy_unit + self.convective_slope_bias * sgy * smag
+        bx = self.convective_wind_bias * (x_wind_vel / u_ref) + self.convective_slope_bias * sgx * smag
+        by = self.convective_wind_bias * (y_wind_vel / u_ref) + self.convective_slope_bias * sgy * smag
         delivered = self._convective_deposit(cf * air_share, bx, by).clamp(min=0.0)  # (H,W) [J/m^2]
 
         C_floor    = (cp_fuel * 10.0 * self.fuel_burnt_threshold).expand_as(C_fuel)  # ~burnt-mass floor
@@ -814,6 +930,17 @@ class Simulation:
         # prognostic, not a diagnostic of the pressure field.
         self.step_dynamics(s)
 
+        # Diagnostic terrain-channeling surface wind (Phase 6, Option 2): the fire and oxygen read
+        # the prognostic wind sped up through gaps by the static channeling gain (speedup only --
+        # direction is preserved, since the core already deflects the flow). The prognostic field is
+        # left untouched. Falls back to the prognostic wind when channeling is off or no gain was
+        # precomputed (e.g. a hand-built state), so the single-layer path is unchanged.
+        u_fire, v_fire = s.x_wind_vel, s.y_wind_vel
+        if self.channeling_enabled and s.channel_gain is not None:
+            u_fire = s.x_wind_vel * s.channel_gain
+            v_fire = s.y_wind_vel * s.channel_gain
+        s.x_wind_fire, s.y_wind_fire = u_fire, v_fire
+
         # Surface radiative energy balance: sun warms the ground/fuel skin, longwave cools it,
         # and the ground sheds sensible heat to the air (which is transparent to radiation).
         if self.radiation_enabled:
@@ -825,7 +952,7 @@ class Simulation:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.mass
         )
 
-        s.oxygen = self.diffuse_and_advect_oxygen(s.oxygen, s.x_wind_vel, s.y_wind_vel)
+        s.oxygen = self.diffuse_and_advect_oxygen(s.oxygen, u_fire, v_fire)
         # Fresh-air replenishment toward the elevation oxygen profile (combustion below
         # still draws this down, so a vigorous fire can outpace it locally).
         if self.relaxation_enabled:
@@ -834,7 +961,7 @@ class Simulation:
         if self.fire_enabled:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
                 s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
-                s.x_wind_vel, s.y_wind_vel, s.terrain,
+                u_fire, v_fire, s.terrain,
             )
             if self.radiant_heat_enabled:
                 s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(

@@ -164,6 +164,9 @@ class BatchedRollout:
         # begins near its steady state.
         x_wind = torch.zeros_like(mass) + u_amb_x
         y_wind = torch.zeros_like(mass) + u_amb_y
+        # Static terrain-channeling gain per world (Phase 6, Option 2): the fire/oxygen read the
+        # prognostic wind sped up through gaps by this gain (applied each step in step_fields).
+        channel_gain = self._sim.compute_channel_gain(terrain, u_amb_x, u_amb_y)
 
         self._state = SimState(
             mass=mass,
@@ -181,6 +184,7 @@ class BatchedRollout:
             u_amb_x=u_amb_x,
             u_amb_y=u_amb_y,
             radiant_flux=torch.zeros_like(mass),
+            channel_gain=channel_gain,
         )
         if self._spawn_fire:
             self._ignite()

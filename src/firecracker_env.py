@@ -371,6 +371,10 @@ class FirecrackerEnv(gymnasium.Env):
         self._terrain: np.ndarray | None = None
         self._u_amb_x: torch.Tensor | None = None   # synoptic ambient wind [m/s]
         self._u_amb_y: torch.Tensor | None = None
+        # Phase 6 (Option 2): static terrain-channeling gain and the near-surface wind the fire reads.
+        self._channel_gain: torch.Tensor | None = None
+        self._x_wind_fire: torch.Tensor | None = None
+        self._y_wind_fire: torch.Tensor | None = None
         # Rest-state targets (initial profiles): radiative-equilibrium temperature and oxygen.
         self._temp_eq: np.ndarray | None = None
         self._oxygen_eq: np.ndarray | None = None
@@ -448,6 +452,13 @@ class FirecrackerEnv(gymnasium.Env):
         self._u_amb_y = self._to_tensor(np.float32(m.ambient_wind_y))
         self._x_wind_vel = torch.full_like(self._mass, float(m.ambient_wind_x))
         self._y_wind_vel = torch.full_like(self._mass, float(m.ambient_wind_y))
+
+        # Static terrain-channeling gain (Phase 6, Option 2): precomputed once from the terrain and
+        # the per-map synoptic wind direction. The fire/oxygen read the prognostic wind sped up by
+        # this gain (set each step in step_fields); seed the diagnostic wind at the ambient.
+        self._channel_gain = self._sim.compute_channel_gain(self._terrain, self._u_amb_x, self._u_amb_y)
+        self._x_wind_fire = self._x_wind_vel.clone()
+        self._y_wind_fire = self._y_wind_vel.clone()
 
         # Terrain is static for the episode, so reduce its stats once here (one host
         # transfer) instead of re-syncing them every step in _build_info.
@@ -635,6 +646,9 @@ class FirecrackerEnv(gymnasium.Env):
             u_amb_x=self._u_amb_x,
             u_amb_y=self._u_amb_y,
             radiant_flux=self._last_radiant_flux,
+            channel_gain=self._channel_gain,
+            x_wind_fire=self._x_wind_fire,
+            y_wind_fire=self._y_wind_fire,
         )
 
     def _store_field_state(self, s: SimState) -> None:
@@ -647,6 +661,8 @@ class FirecrackerEnv(gymnasium.Env):
         self._oxygen            = s.oxygen
         self._x_wind_vel        = s.x_wind_vel
         self._y_wind_vel        = s.y_wind_vel
+        self._x_wind_fire       = s.x_wind_fire
+        self._y_wind_fire       = s.y_wind_fire
         self._last_radiant_flux = s.radiant_flux
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
