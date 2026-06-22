@@ -502,8 +502,8 @@ Each phase is independently testable; we do not change everything at once.
      and wind-aligned-with-slope focusing a faster head with pinched flanks (the non-saturation property).
    - *Optional:* a **fuel moisture** field — radiation's biggest real preheating job is drying;
      moisture would gate ignition and make the radiation→convection handoff faithful.
-6. **Two-layer surface-wind dynamics** *(proposed — surface-wind realism, the driver of real
-   wildfire behaviour)* — Phases 2–5.5 run on a **single** ~1.5 km boundary-layer slab, so "the
+6. **Two-layer surface-wind dynamics** *(in progress — leg (a) done; surface-wind realism, the
+   driver of real wildfire behaviour)* — Phases 2–5.5 run on a **single** ~1.5 km boundary-layer slab, so "the
    wind" is the column-mean BL wind and terrain only *thins* the slab, never **blocks** it (a hill
    is a constriction, not an obstacle). Two consequences matter for fire: (i) **gap/Venturi winds
    are absent** (the level-lid slab gives fast ridges / slow valleys, never a funneled gap jet —
@@ -514,15 +514,32 @@ Each phase is independently testable; we do not change everything at once.
    layer is thin enough that realistic terrain (a few hundred metres) is a **real obstacle** to it,
    so flanking ridges block it and funnel flow through gaps — gap winds emerge at realistic relief,
    in the layer that drives spread. Legs:
-   - **(a) Two-layer core.** New surface-layer state `m_s, (u_s,v_s), T_s` (the existing `m,u,v,T`
-     become the **upper** layer). Depths `h_s = m_s R_d T_s/p_ref`, `h_u = m_u R_d T_u/p_ref`;
-     interface `b_s = z + h_s`, free surface `s = z + h_s + h_u`. Upper layer forced by `-g'_u ∇s`
-     (as Phase 2); surface layer forced by the interface `-g'_s ∇b_s` with a stronger surface drag
-     `C_b`. Each layer's `m`, `E=m c_p T`, `(m u, m v)` advected conservatively by **its own** wind
-     (the Phase-2 `_advect_periodic`, run per layer). CFL on the `max` of both layers'
-     `(|u|+√(g'h))`. **On-disk change**: maps carry two layers → `units_version 3→4`, **regenerate
-     all 1024 maps + 7 fixtures**; `gen_maps` splits the level-lid mass into an `H_s` surface layer
-     + the remainder upper; `SimState`/env/rollout/obs thread the surface fields.
+   - **(a) Two-layer core** ✅ *done* — `SimState` gained surface-layer fields `m_s, (u_s,v_s), T_s`
+     plus a surface rest mass `mass_surface_eq` (all `None` in single-layer mode); the existing
+     `m,u,v,T` are the **upper** layer when two-layer is on. Depths `h_s = m_s R_d T_s/p_ref`,
+     `h_u = m_u R_d T_u/p_ref`; interface `b_s = z + h_s`, free surface `s = z + h_s + h_u`. Upper
+     layer forced by `-g'_u ∇s` (as Phase 2); surface layer forced by the interface `-g'_s ∇b_s`
+     with a stronger surface drag `C_b`. The per-layer forcing+advect+recover step is factored into
+     `Simulation._advance_layer`, so the single-layer path reuses it unchanged and both layers of the
+     two-layer path call it; CFL on the `max` of both layers' `(|u|+√(g'h))`. The non-dynamics
+     subsystems (radiation, fuel↔air conduction, combustion) read the **total** column mass via
+     `Simulation._total_mass` (`m_u + m_s`) and the **upper** wind — unchanged until the fire stack
+     moves onto the surface layer in leg (d). **No on-disk change** (revises the original plan):
+     because both layers share the rest temperature, the rest split is *exact and purely geometric*
+     and is **derived at load** by `map_loader.surface_layer_mass` (`m_s = m·(surface_lid−z)/
+     (upper_lid−z)`, a physics-free helper given the elevation scalars; `m_u = m − m_s`), so
+     `units_version` stays **3** and **no maps/fixtures are regenerated**. The rest state uses a
+     **level interface** (`b_s` flat at rest → the surface layer thins over peaks and both forcings
+     vanish at rest), so `H_s` (`surface_depth`) is the surface depth at the *highest* peak (its
+     minimum), with the surface lid at `elev_max + H_s`. `firecracker_env`/`rollout` derive and thread
+     the surface fields at reset; the pressure view shows the total mass. **Gated behind
+     `[momentum].two_layer` (default `false`)**: with it off the path is byte-identical (the full
+     suite is unchanged). New `[momentum]` knobs `surface_depth=200`, `reduced_gravity_surface=0.2`,
+     `surface_drag_coeff=0.002`. *Tests* (`tests/test_two_layer.py`): exact mass split (both layers
+     positive), both layers hold ambient over flat ground and stay steady, closed-core per-layer
+     mass/energy conservation, ridge stability, and the rollout split path. *Deferred:* a genuine
+     on-disk two-layer format + `units_version` bump lands only when a later leg first needs a stored
+     field that isn't derivable at load.
    - **(b) Surface-layer terrain blocking → gap/Venturi winds.** Apply **fractional blocking** to
      the *surface* layer only: at each face the bed rises by `Δb` into the flow, blocking a fraction
      `f = clamp(Δb/h_s, 0, 1)` of that face's flux (mass/energy/momentum); the blocked share spills
@@ -623,6 +640,13 @@ Each phase is independently testable; we do not change everything at once.
   old dipole at `|b|=1`, so leg c stays calibrated). `convective_concentration_max=12` caps `|b|` only as
   a numerical `exp`-overflow guard at the spurious terrain-wrap gradient. Still directional, so it
   captures the upslope/downslope asymmetry and the alignment synergy, not an absolute ROS gain.
+- **Phase 6a** *(structural defaults; calibration deferred to 6e)*: `surface_depth=200 m` (the
+  surface-layer minimum depth, at the highest peak; level interface), `reduced_gravity_surface=0.2`
+  (= the upper `g'`), `surface_drag_coeff=0.002` (4× the upper `drag_coeff`, since the surface layer
+  feels the ground more strongly). These are placeholders that keep the two-layer core stable and
+  near-ambient over flat ground; the real tuning of `H_s, g'_s, C_b` (with the interfacial-coupling
+  and blocking knobs) happens in leg (e) against the gap-wind / drainage / surface-vs-upper-wind
+  tests. **`two_layer` stays `false` by default until leg (e).**
 
 ## Known limitations / deferred
 

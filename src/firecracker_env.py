@@ -16,7 +16,7 @@ import gymnasium
 from gymnasium import spaces
 
 from simulation import Simulation, SimState
-from map_loader import load_map, resolve_map, validate_against_config
+from map_loader import load_map, resolve_map, surface_layer_mass, validate_against_config
 
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
@@ -366,8 +366,14 @@ class FirecrackerEnv(gymnasium.Env):
         self._y_wind_vel: np.ndarray | None = None
         self._fuel: np.ndarray | None = None
         self._oxygen: np.ndarray | None = None
-        self._mass: np.ndarray | None = None   # boundary-layer areal mass [kg/m^2]
+        self._mass: np.ndarray | None = None   # boundary-layer areal mass [kg/m^2] (upper layer when two-layer)
         self._mass_eq: torch.Tensor | None = None   # rest-state mass (open-boundary sponge target)
+        # Two-layer surface wind (Phase 6, only populated when [momentum].two_layer is on).
+        self._mass_surface: torch.Tensor | None = None
+        self._air_temperatures_surface: torch.Tensor | None = None
+        self._x_wind_surface: torch.Tensor | None = None
+        self._y_wind_surface: torch.Tensor | None = None
+        self._mass_surface_eq: torch.Tensor | None = None
         self._terrain: np.ndarray | None = None
         self._u_amb_x: torch.Tensor | None = None   # synoptic ambient wind [m/s]
         self._u_amb_y: torch.Tensor | None = None
@@ -438,6 +444,24 @@ class FirecrackerEnv(gymnasium.Env):
         self._mass              = self._to_tensor(m.mass)
         self._mass_eq           = self._mass.clone()   # level-lid rest state -> sponge target
         self._fuel              = self._to_tensor(m.fuel)
+
+        # Two-layer split (Phase 6 leg a): slice a thin surface layer off the level-lid mass
+        # and leave the remainder as the upper layer. Derived at load (no on-disk change); the
+        # surface layer starts at the shared rest temperature and the synoptic ambient wind.
+        if self._sim.two_layer:
+            m_s = surface_layer_mass(
+                m.mass, m.terrain,
+                elev_max=self._sim.elev_max,
+                surface_depth=self._sim.surface_depth,
+                layer_depth_ref=self._sim.layer_depth_ref,
+            )
+            self._mass_surface      = self._to_tensor(m_s)
+            self._mass_surface_eq   = self._mass_surface.clone()
+            self._mass              = self._to_tensor(m.mass - m_s)   # upper layer
+            self._mass_eq           = self._mass.clone()
+            self._air_temperatures_surface = self._to_tensor(m.temp_eq)
+            self._x_wind_surface    = torch.full_like(self._mass, float(m.ambient_wind_x))
+            self._y_wind_surface    = torch.full_like(self._mass, float(m.ambient_wind_y))
         self._fuel_temperatures = self._to_tensor(m.fuel_temperatures)
         # Surface skin starts at the rest temperature profile (radiative-equilibrium target).
         self._ground_temperature = self._temp_eq.clone()
@@ -573,7 +597,10 @@ class FirecrackerEnv(gymnasium.Env):
         # once here — the numpy/tensor boundary lives at the render edge.
         temp = _to_numpy(self._air_temperatures)
         wx, wy = _to_numpy(self._x_wind_vel), _to_numpy(self._y_wind_vel)
-        pressure_field = _to_numpy(self._mass)
+        # Pressure view shows the total column mass (upper + surface in the two-layer core).
+        pressure_field = _to_numpy(
+            self._mass if self._mass_surface is None else self._mass + self._mass_surface
+        )
         fuel_temps = _to_numpy(self._fuel_temperatures)
         fuel = _to_numpy(self._fuel)
         oxygen = _to_numpy(self._oxygen)
@@ -635,6 +662,11 @@ class FirecrackerEnv(gymnasium.Env):
             u_amb_x=self._u_amb_x,
             u_amb_y=self._u_amb_y,
             radiant_flux=self._last_radiant_flux,
+            mass_surface=self._mass_surface,
+            air_temperatures_surface=self._air_temperatures_surface,
+            x_wind_surface=self._x_wind_surface,
+            y_wind_surface=self._y_wind_surface,
+            mass_surface_eq=self._mass_surface_eq,
         )
 
     def _store_field_state(self, s: SimState) -> None:
@@ -648,6 +680,10 @@ class FirecrackerEnv(gymnasium.Env):
         self._x_wind_vel        = s.x_wind_vel
         self._y_wind_vel        = s.y_wind_vel
         self._last_radiant_flux = s.radiant_flux
+        self._mass_surface             = s.mass_surface
+        self._air_temperatures_surface = s.air_temperatures_surface
+        self._x_wind_surface           = s.x_wind_surface
+        self._y_wind_surface           = s.y_wind_surface
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
         rows_idx = torch.arange(self.grid_size, device=self._sim.device).view(-1, 1)

@@ -33,6 +33,11 @@ def print_config_info(env: FirecrackerEnv) -> None:
     print(f"    drag_coeff             : {sim.drag_coeff}")
     print(f"    viscosity              : {sim.viscosity}")
     print(f"    cfl_target             : {sim.cfl_target}")
+    print(f"    two_layer              : {sim.two_layer}")
+    if sim.two_layer:
+        print(f"    surface_depth          : {sim.surface_depth}")
+        print(f"    reduced_gravity_surface: {sim.reduced_gravity_surface}")
+        print(f"    surface_drag_coeff     : {sim.surface_drag_coeff}")
     print("  [oxygen]")
     print(f"    diffusion_sigma        : {sim.oxygen_diffusion_sigma}")
     print("  [maps]")

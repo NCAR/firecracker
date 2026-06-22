@@ -50,6 +50,16 @@ class SimState:
     u_amb_x:           torch.Tensor   # per-world synoptic ambient wind [m/s], broadcastable to (..., H, W)
     u_amb_y:           torch.Tensor
     radiant_flux:      torch.Tensor   # last per-cell absorbed radiant flux (diagnostic)
+    # Two-layer surface wind (Phase 6, only set when [momentum].two_layer is on). When the
+    # two-layer core is active the fields above describe the UPPER layer; these describe the
+    # thin near-surface layer riding underneath it. T_s relaxes to temp_eq and the surface
+    # wind to (u_amb_x, u_amb_y) -- the same rest targets as the upper layer -- so only the
+    # surface mass needs its own sponge target. All None in single-layer mode.
+    mass_surface:             torch.Tensor | None = None  # surface-layer areal mass m_s [kg/m^2]
+    air_temperatures_surface: torch.Tensor | None = None  # surface-layer temperature T_s [K]
+    x_wind_surface:           torch.Tensor | None = None  # surface-layer wind u_s [m/s]
+    y_wind_surface:           torch.Tensor | None = None  # surface-layer wind v_s [m/s]
+    mass_surface_eq:          torch.Tensor | None = None  # surface-layer rest mass (sponge target)
 
 
 def _resolve_device(name: str | None) -> torch.device:
@@ -115,6 +125,18 @@ class Simulation:
         self.sponge_strength: float = float(momentum.get("sponge_strength", 10.0))
         self.cfl_target:      float = float(momentum.get("cfl_target",      0.5))
         self._sponge_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+        # Two-layer surface-wind core (Phase 6, leg a). Off by default: the single ~1.5 km
+        # slab above is unchanged. When on, that slab becomes the UPPER layer and a thin
+        # near-surface layer (depth surface_depth at the highest peak) rides underneath it,
+        # forced by the interface gradient -g'_s*grad(b_s) with a stronger surface drag C_b.
+        # The rest split is derived at load (map_loader.surface_layer_mass); elev_max sets the
+        # level-lid reference shared with the level-lid rest mass in gen_maps.
+        self.two_layer:               bool  = bool(momentum.get("two_layer", False))
+        self.surface_depth:           float = float(momentum.get("surface_depth", 200.0))
+        self.reduced_gravity_surface: float = float(momentum.get("reduced_gravity_surface", self.reduced_gravity))
+        self.surface_drag_coeff:      float = float(momentum.get("surface_drag_coeff", 0.002))
+        self.elev_max:                float = float((cfg or {}).get("terrain", {}).get("elev_max", 500.0))
 
         # Combustion (Phase 4). The reaction rate is a smooth Arrhenius law limited by oxygen,
         # so there is no hard ignition threshold -- cold fuel is inert because the exponential
@@ -395,6 +417,38 @@ class Simulation:
         self._sponge_cache[key] = rate
         return rate
 
+    def _advance_layer(
+        self,
+        m: torch.Tensor, T: torch.Tensor, u: torch.Tensor, v: torch.Tensor,
+        forcing_surface: torch.Tensor, g_prime: float, drag: float, dts: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One shallow-water substep for a single layer, forced by grad(forcing_surface).
+
+        Updates the wind by -g'*grad(forcing_surface) with linear drag and eddy viscosity,
+        then conservatively advects the layer's mass, energy (E = m*c_p*T) and momentum by
+        that wind. Shared by the single-layer core (forcing_surface = terrain + eta) and both
+        layers of the two-layer core (upper: the free surface; surface: the interface).
+        """
+        cp, dx, nu = pc.CP_AIR, self.cell_size_m, self.viscosity
+        gx, gy = self._periodic_grad(forcing_surface, dx)
+        # Forcing: -g'*grad(surface), linear surface friction, eddy viscosity.
+        u = u + dts * (-g_prime * gx - drag * u + nu * self._periodic_laplacian(u, dx))
+        v = v + dts * (-g_prime * gy - drag * v + nu * self._periodic_laplacian(v, dx))
+
+        # Conservative transport of mass, energy and momentum by the updated wind.
+        dispx, dispy = u * dts / dx, v * dts / dx
+        energy = m * cp * T
+        mom_x, mom_y = m * u, m * v
+        m      = self._advect_periodic(m,      dispx, dispy)
+        energy = self._advect_periodic(energy, dispx, dispy)
+        mom_x  = self._advect_periodic(mom_x,  dispx, dispy)
+        mom_y  = self._advect_periodic(mom_y,  dispx, dispy)
+
+        m_safe = m.clamp(min=1e-9)
+        u, v = mom_x / m_safe, mom_y / m_safe
+        T = energy / (cp * m_safe)
+        return m, T, u, v
+
     def step_dynamics(self, s: SimState) -> SimState:
         """Advance the prognostic wind, boundary-layer mass and air energy one tick.
 
@@ -406,54 +460,88 @@ class Simulation:
         relaxes the edges toward the per-map synoptic wind and the rest-state mass, making the
         domain open (inflow upwind, outflow downwind). CFL-substepped on the advective +
         gravity-wave speed. Rank-agnostic (single world or (B, H, W)).
+
+        With the two-layer core on ([momentum].two_layer), this slab is the UPPER layer and a
+        thin surface layer rides underneath: the upper layer is forced by the free surface
+        s = terrain + eta_s + eta_u, the surface layer by the interface b_s = terrain + eta_s
+        (with a stronger surface drag). Each layer advects its own fields by its own wind; the
+        only coupling here is geometric (the surface layer's thickness lifts the upper layer's
+        free surface). Both layers are sponged toward the shared rest state.
         """
-        cp, R_d, p_ref = pc.CP_AIR, pc.GAS_CONSTANT_DRY_AIR, pc.P_REF
+        R_d, p_ref = pc.GAS_CONSTANT_DRY_AIR, pc.P_REF
         dx, dt = self.cell_size_m, self.dt
-        g_prime, C_d, nu = self.reduced_gravity, self.drag_coeff, self.viscosity
+        g_u = self.reduced_gravity
 
         m, T = s.mass, s.air_temperatures
         u, v = s.x_wind_vel, s.y_wind_vel
 
-        # Substep count from the worst-case Courant number: advective speed |u| plus the
-        # gravity-wave speed c = sqrt(g'*eta).
-        eta = m * R_d * T / p_ref
-        wave = float(torch.sqrt((g_prime * eta).clamp(min=0.0)).max())
-        flow = float((u.abs() + v.abs()).max())
+        if not self.two_layer:
+            # Substep count from the worst-case Courant number: advective speed |u| plus the
+            # gravity-wave speed c = sqrt(g'*eta).
+            eta = m * R_d * T / p_ref
+            wave = float(torch.sqrt((g_u * eta).clamp(min=0.0)).max())
+            flow = float((u.abs() + v.abs()).max())
+            courant = (flow + wave) * dt / dx
+            n = max(1, int(math.ceil(courant / self.cfl_target)))
+            dts = dt / n
+
+            for _ in range(n):
+                eta = m * R_d * T / p_ref
+                surface = s.terrain + eta
+                m, T, u, v = self._advance_layer(m, T, u, v, surface, g_u, self.drag_coeff, dts)
+
+            # Open-boundary sponge: relax the edge belt toward the free-stream (synoptic wind and
+            # rest-state mass/temperature) so the wind enters upwind and leaves downwind without
+            # piling or reflecting. Exact-exponential, so stable for any sponge strength.
+            decay = torch.exp(-self._sponge_rate(m.shape[-2:]) * dt)
+            u = s.u_amb_x + (u - s.u_amb_x) * decay
+            v = s.u_amb_y + (v - s.u_amb_y) * decay
+            m = s.mass_eq + (m - s.mass_eq) * decay
+            T = s.temp_eq + (T - s.temp_eq) * decay
+
+            s.mass, s.air_temperatures, s.x_wind_vel, s.y_wind_vel = m, T, u, v
+            return s
+
+        # Two-layer core: advance the upper and surface layers together each substep.
+        g_s = self.reduced_gravity_surface
+        m_s, T_s = s.mass_surface, s.air_temperatures_surface
+        u_s, v_s = s.x_wind_surface, s.y_wind_surface
+
+        # CFL over the worst case of both layers (advective + gravity-wave speed each).
+        eta_u = m * R_d * T / p_ref
+        eta_s = m_s * R_d * T_s / p_ref
+        wave = max(
+            float(torch.sqrt((g_u * eta_u).clamp(min=0.0)).max()),
+            float(torch.sqrt((g_s * eta_s).clamp(min=0.0)).max()),
+        )
+        flow = max(float((u.abs() + v.abs()).max()), float((u_s.abs() + v_s.abs()).max()))
         courant = (flow + wave) * dt / dx
         n = max(1, int(math.ceil(courant / self.cfl_target)))
         dts = dt / n
 
         for _ in range(n):
-            eta = m * R_d * T / p_ref
-            surface = s.terrain + eta
-            gx, gy = self._periodic_grad(surface, dx)
-            # Forcing: -g'*grad(s) (terrain + buoyancy), weak surface friction, eddy viscosity.
-            u = u + dts * (-g_prime * gx - C_d * u + nu * self._periodic_laplacian(u, dx))
-            v = v + dts * (-g_prime * gy - C_d * v + nu * self._periodic_laplacian(v, dx))
+            eta_u = m * R_d * T / p_ref
+            eta_s = m_s * R_d * T_s / p_ref
+            interface = s.terrain + eta_s          # b_s: forces the surface layer
+            free_surface = interface + eta_u       # s = terrain + eta_s + eta_u: forces the upper layer
+            m,   T,   u,   v   = self._advance_layer(m,   T,   u,   v,   free_surface, g_u, self.drag_coeff,        dts)
+            m_s, T_s, u_s, v_s = self._advance_layer(m_s, T_s, u_s, v_s, interface,    g_s, self.surface_drag_coeff, dts)
 
-            # Conservative transport of mass, energy and momentum by the updated wind.
-            dispx, dispy = u * dts / dx, v * dts / dx
-            energy = m * cp * T
-            mom_x, mom_y = m * u, m * v
-            m      = self._advect_periodic(m,      dispx, dispy)
-            energy = self._advect_periodic(energy, dispx, dispy)
-            mom_x  = self._advect_periodic(mom_x,  dispx, dispy)
-            mom_y  = self._advect_periodic(mom_y,  dispx, dispy)
-
-            m_safe = m.clamp(min=1e-9)
-            u, v = mom_x / m_safe, mom_y / m_safe
-            T = energy / (cp * m_safe)
-
-        # Open-boundary sponge: relax the edge belt toward the free-stream (synoptic wind and
-        # rest-state mass/temperature) so the wind enters upwind and leaves downwind without
-        # piling or reflecting. Exact-exponential, so stable for any sponge strength.
+        # Sponge both layers toward the shared rest state (same synoptic wind and temperature;
+        # each layer toward its own rest mass).
         decay = torch.exp(-self._sponge_rate(m.shape[-2:]) * dt)
         u = s.u_amb_x + (u - s.u_amb_x) * decay
         v = s.u_amb_y + (v - s.u_amb_y) * decay
         m = s.mass_eq + (m - s.mass_eq) * decay
         T = s.temp_eq + (T - s.temp_eq) * decay
+        u_s = s.u_amb_x + (u_s - s.u_amb_x) * decay
+        v_s = s.u_amb_y + (v_s - s.u_amb_y) * decay
+        m_s = s.mass_surface_eq + (m_s - s.mass_surface_eq) * decay
+        T_s = s.temp_eq + (T_s - s.temp_eq) * decay
 
         s.mass, s.air_temperatures, s.x_wind_vel, s.y_wind_vel = m, T, u, v
+        s.mass_surface, s.air_temperatures_surface = m_s, T_s
+        s.x_wind_surface, s.y_wind_surface = u_s, v_s
         return s
 
     def _cover_fractions(self, fuel: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -554,6 +642,17 @@ class Simulation:
         for _ in range(n):
             oxygen = self._advect_periodic(oxygen, sx, sy)
         return self._diffuse(oxygen, self.oxygen_diffusion_sigma)
+
+    def _total_mass(self, s: SimState) -> torch.Tensor:
+        """Total air-column areal mass [kg/m^2] feeding the non-dynamics subsystems.
+
+        Single-layer: the only layer. Two-layer: upper + surface, so radiation, fuel<->air
+        conduction and combustion see the same total column they did before the split (the
+        fire stack moves onto the surface layer specifically in Phase 6 leg d, not here).
+        """
+        if self.two_layer and s.mass_surface is not None:
+            return s.mass + s.mass_surface
+        return s.mass
 
     def column_height(self, mass: torch.Tensor, terrain: torch.Tensor, air_temperatures: torch.Tensor) -> torch.Tensor:
         """Column-top geopotential height [m]: H = terrain + eta, eta = m*R_d*T/p_ref."""
@@ -814,15 +913,20 @@ class Simulation:
         # prognostic, not a diagnostic of the pressure field.
         self.step_dynamics(s)
 
+        # The non-dynamics subsystems read the total air-column mass (upper + surface in the
+        # two-layer core) and the upper-layer wind/temperature -- unchanged from single-layer
+        # until the fire stack is rewired to the surface layer in Phase 6 leg d.
+        air_mass = self._total_mass(s)
+
         # Surface radiative energy balance: sun warms the ground/fuel skin, longwave cools it,
         # and the ground sheds sensible heat to the air (which is transparent to radiation).
         if self.radiation_enabled:
             s.air_temperatures, s.fuel_temperatures, s.ground_temperature = self.apply_radiation(
-                s.air_temperatures, s.ground_temperature, s.fuel_temperatures, s.fuel, s.mass, s.temp_eq
+                s.air_temperatures, s.ground_temperature, s.fuel_temperatures, s.fuel, air_mass, s.temp_eq
             )
 
         s.air_temperatures, s.fuel_temperatures = self.exchange_fuel_air_heat(
-            s.air_temperatures, s.fuel_temperatures, s.fuel, s.mass
+            s.air_temperatures, s.fuel_temperatures, s.fuel, air_mass
         )
 
         s.oxygen = self.diffuse_and_advect_oxygen(s.oxygen, s.x_wind_vel, s.y_wind_vel)
@@ -833,7 +937,7 @@ class Simulation:
 
         if self.fire_enabled:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
-                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
+                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, air_mass,
                 s.x_wind_vel, s.y_wind_vel, s.terrain,
             )
             if self.radiant_heat_enabled:

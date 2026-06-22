@@ -56,7 +56,7 @@ from torch.utils.data import Dataset
 
 from config import load_config
 from simulation import Simulation, SimState, OBS_CHANNELS
-from map_loader import load_map, resolve_map, validate_against_config
+from map_loader import load_map, resolve_map, surface_layer_mass, validate_against_config
 
 DEFAULT_GRID_SIZE = 256
 
@@ -165,22 +165,47 @@ class BatchedRollout:
         x_wind = torch.zeros_like(mass) + u_amb_x
         y_wind = torch.zeros_like(mass) + u_amb_y
 
+        # Two-layer split (Phase 6 leg a), mirroring FirecrackerEnv.reset: slice a thin surface
+        # layer off the level-lid mass, leaving the remainder as the upper layer. Derived at
+        # load (pure geometry); surface fields stay None in single-layer mode.
+        mass_surface = air_surface = x_wind_surface = y_wind_surface = mass_surface_eq = None
+        upper_mass = mass
+        temp_eq = stack("temp_eq")
+        if self._sim.two_layer:
+            m_s_np = surface_layer_mass(
+                np.stack(fields["mass"]), np.stack(fields["terrain"]),
+                elev_max=self._sim.elev_max,
+                surface_depth=self._sim.surface_depth,
+                layer_depth_ref=self._sim.layer_depth_ref,
+            )
+            mass_surface = torch.as_tensor(m_s_np, dtype=self._sim.dtype, device=self._sim.device)
+            upper_mass = mass - mass_surface
+            mass_surface_eq = mass_surface.clone()
+            air_surface = temp_eq.clone()
+            x_wind_surface = torch.zeros_like(upper_mass) + u_amb_x
+            y_wind_surface = torch.zeros_like(upper_mass) + u_amb_y
+
         self._state = SimState(
-            mass=mass,
+            mass=upper_mass,
             air_temperatures=air,
-            ground_temperature=stack("temp_eq"),   # surface skin starts at the rest profile
+            ground_temperature=temp_eq.clone(),   # surface skin starts at the rest profile
             fuel_temperatures=stack("fuel_temperatures"),
             fuel=stack("fuel"),
             oxygen=stack("oxygen"),
             terrain=terrain,
-            temp_eq=stack("temp_eq"),
+            temp_eq=temp_eq,
             oxygen_eq=stack("oxygen_eq"),
-            mass_eq=mass.clone(),
+            mass_eq=upper_mass.clone(),
             x_wind_vel=x_wind,
             y_wind_vel=y_wind,
             u_amb_x=u_amb_x,
             u_amb_y=u_amb_y,
-            radiant_flux=torch.zeros_like(mass),
+            radiant_flux=torch.zeros_like(upper_mass),
+            mass_surface=mass_surface,
+            air_temperatures_surface=air_surface,
+            x_wind_surface=x_wind_surface,
+            y_wind_surface=y_wind_surface,
+            mass_surface_eq=mass_surface_eq,
         )
         if self._spawn_fire:
             self._ignite()

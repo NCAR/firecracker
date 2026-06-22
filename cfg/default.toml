@@ -99,6 +99,14 @@ viscosity       = 50.0    # nu [m^2/s]: eddy viscosity (smoothing)
 sponge_width    = 8       # cells: width of the boundary relaxation (open-domain inflow/outflow)
 sponge_strength = 10.0    # [1/s]: peak edge relaxation rate toward (u_amb, rest mass)
 cfl_target      = 0.5     # max Courant number per substep (advective + gravity-wave speed)
+# Two-layer surface-wind core (Phase 6, leg a). Off keeps the single-slab model above. On
+# splits the slab into a thin near-surface layer (the canyon/surface layer) under the upper
+# layer, forced by the interface gradient -g'_s*grad(b_s) with a stronger surface drag. The
+# rest split is derived at load (no on-disk change). Behaviour is unchanged while off.
+two_layer               = false   # enable the two-layer surface-wind dynamics
+surface_depth           = 200.0   # H_s [m]: surface-layer depth at the highest peak (its minimum)
+reduced_gravity_surface = 0.2     # g'_s [m/s^2]: surface-layer interface forcing strength
+surface_drag_coeff      = 0.002   # C_b [1/s]: surface-layer friction (stronger than the upper drag)
 
 [fire]
 # Surface-area-controlled, oxygen-limited combustion (see docs/units.md). Fuel reacts at its

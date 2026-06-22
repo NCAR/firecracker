@@ -140,6 +140,41 @@ def load_map(path: str | Path) -> MapData:
 
 
 # ---------------------------------------------------------------------------
+# Two-layer split (Phase 6 leg a) -- pure geometry, no physics dependency
+# ---------------------------------------------------------------------------
+
+def surface_layer_mass(
+    mass: np.ndarray,
+    terrain: np.ndarray,
+    *,
+    elev_max: float,
+    surface_depth: float,
+    layer_depth_ref: float,
+    floor: float = 1e-3,
+) -> np.ndarray:
+    """Surface-layer share of the level-lid boundary-layer mass [kg/m^2].
+
+    The single-layer rest mass fills a level-lid slab of depth h(z) = (elev_max +
+    layer_depth_ref) - z. The two-layer rest state slices off a thin surface layer beneath a
+    second level interface at (elev_max + surface_depth), giving surface depth
+    h_s(z) = (elev_max + surface_depth) - z. Since both layers share the rest temperature, the
+    mass split is exactly the depth ratio:
+
+        m_s = mass * h_s / h = mass * (surface_lid - z) / (upper_lid - z).
+
+    The fraction is purely geometric (the physics constants cancel), so this stays free of any
+    physics dependency. It is clamped to [floor, 1 - floor] so terrain taller than elev_max
+    (only in synthetic test maps) cannot drive either layer's mass negative; the upper layer is
+    then mass - m_s. The caller supplies the elevation scalars from config.
+    """
+    upper_lid = elev_max + layer_depth_ref
+    surface_lid = elev_max + surface_depth
+    frac = (surface_lid - terrain) / (upper_lid - terrain)
+    frac = np.clip(frac, floor, 1.0 - floor)
+    return (mass * frac).astype(mass.dtype)
+
+
+# ---------------------------------------------------------------------------
 # Discovery / selection
 # ---------------------------------------------------------------------------
 
