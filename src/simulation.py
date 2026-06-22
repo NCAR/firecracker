@@ -633,7 +633,7 @@ class Simulation:
         # present -- a_fuel and the thermal mass both vanish as fuel -> 0, so guard the divide.
         present = fuel > self.fuel_burnt_threshold
         C_fuel = (fuel * self.fuel_specific_heat).clamp(min=1e-9)
-        q_fuel = a_fuel * s_net - a_fuel * eps * sigma * fuel_temperatures ** 4
+        q_fuel = a_fuel * s_net.unsqueeze(-3) - a_fuel * eps * sigma * fuel_temperatures ** 4
         dT_fuel = torch.where(present, dt * q_fuel / C_fuel, torch.zeros_like(fuel_temperatures))
         fuel_new = (fuel_temperatures + dT_fuel).clamp(min=0.0)
 

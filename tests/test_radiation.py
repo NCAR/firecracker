@@ -135,6 +135,33 @@ def test_calibration_net_flux_at_reference():
     assert abs(s_net - 455.0) < 5.0
 
 
+def test_batched_multifuel_radiation_broadcasts_over_types():
+    """A batched, multi-fuel call must broadcast S_net over the fuel-type axis, not the batch.
+
+    apply_radiation reduces the per-cell S_net (..., H, W) against the per-type a_fuel
+    (..., N, H, W); without an explicit fuel axis on S_net the two right-align so N collides with
+    the batch axis B -- a crash when B != N and a silent wrong result when B == N. This pins the
+    batched path with B != N (4 worlds, 2 fuel types), which the single-world tests cannot catch.
+    """
+    sim = Simulation(make_config(fuel_type_names=("grass", "tree"), radiation=True))
+    B, N, H, W = 4, 2, 8, 8
+    full = lambda v, *s: torch.full(s, float(v), dtype=sim.dtype, device=sim.device)
+
+    air = full(pc.T_REF, B, H, W)
+    fuel = full(1.0, B, N, H, W)
+    fuel_t = full(pc.T_REF, B, N, H, W)
+    air_new, fuel_new, ground_new = sim.apply_radiation(
+        air, air.clone(), fuel_t, fuel, full(1500.0, B, H, W), air.clone()
+    )
+
+    assert air_new.shape == (B, H, W)
+    assert fuel_new.shape == (B, N, H, W)
+    assert torch.isfinite(fuel_new).all()
+    # Uniform worlds at the rest profile: every world and type lands identically (no batch bleed).
+    torch.testing.assert_close(fuel_new[0], fuel_new[1], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(fuel_new[:, 0], fuel_new[:, 1], atol=0.0, rtol=0.0)
+
+
 def test_quiescent_world_holds_station(make_env):
     """A flat, windless world at its rest profile stays put through step_fields with radiation on."""
     _, m = si_flat(grid=16, ambient=(0.0, 0.0))
