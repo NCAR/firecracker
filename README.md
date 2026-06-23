@@ -17,3 +17,6 @@ Fire will only ignite once the cell reaches a certain theshold for fuel temperat
 Once a fire ignites, it will begin consuming fuel at a rate proportional to the cell's fuel temperature. If the fuel remaining for a cell reaches zero (or an amount very close to it), then the fire will extinguish.
 ### Oxygen
 Once a fire ignites, it will begin consuming oxygen at a rate proportional to the cell's fuel temperature. If the oxygen remaining for a cell reaches zero (or an amount very close to it), then the fire will extinguish. Note: if there is still fuel and the cell's fuel temperature is still above the ignition point when oxygen returns, then the fire will re-ignite.
+
+## AI Usage Disclosure
+All code in this project was written with [Claude Code](https://claude.ai/code). Claude was also used to assist in writing this documentation.
