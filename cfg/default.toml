@@ -9,12 +9,18 @@
 # radiant transfer, terrain channeling) runs in physical units (docs/units.md, phases 0-6).
 
 [units]
-# Physical discretisation. Each cell is cell_size_m on a side; the tick duration is
-# 1/steps_per_second seconds (see [simulation]).
+# Physical discretisation. Each cell is cell_size_m on a side; seconds_per_tick is how much
+# physical time one tick advances (the physics dt), decoupled from the display tick-rate below.
 cell_size_m = 10.0
+# seconds_per_tick = 0.1   # physics dt [s]; omit to default to 1/steps_per_second (= 0.1 s).
+# Raise it to simulate more physics per tick (faster than real time) at some loss of temporal
+# resolution: e.g. 1.0 -> 10x real time at steps_per_second = 10. The wind core CFL-substeps and
+# combustion/heat-exchange are exact-exponential, so a large dt stays stable (re-validate spread
+# behavior if you change it -- the spread scenarios are calibrated at dt = 0.1 s).
 
 [simulation]
-steps_per_second     = 10     # physics ticks per second (tick duration dt = 1/steps_per_second [s])
+steps_per_second     = 10     # real-time DISPLAY throttle [Hz]: ticks rendered per wall-second.
+                              # The physics dt is [units].seconds_per_tick, not this.
 
 [wind]
 # Per-map synoptic (prevailing) wind: each generated map draws a random bearing and a
