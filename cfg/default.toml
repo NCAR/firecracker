@@ -84,6 +84,8 @@ oxygen_rate = 0.05   # fresh-air replenishment rate; keep below peak burn draw
 # wind at the upwind edge and absorbs outflow at the downwind edge (open domain); the interior
 # feels only weak surface friction + viscosity, so terrain shapes the flow.
 layer_depth_ref = 1000.0  # h_ref [m]: free-stream boundary-layer depth (sets the level lid)
+spinup_steps    = 800     # gen_maps: solver ticks to develop the orographic wind before baking it
+                          # into each map (0 = ship the level-lid rest state with uniform wind)
 reduced_gravity = 0.2     # g' [m/s^2]: free-surface forcing strength (gravity-wave speed sqrt(g'*eta))
 drag_coeff      = 0.0005  # C_d [1/s]: weak interior surface friction (toward rest)
 viscosity       = 50.0    # nu [m^2/s]: eddy viscosity (smoothing)

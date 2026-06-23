@@ -567,9 +567,21 @@ Each phase is independently testable; we do not change everything at once.
 
 - **SI everywhere**, `Simulation.dtype = torch.float64`. **Rank-agnostic** ops (trailing
   `…,H,W`) so single-world and batched `(B,H,W)` share `step_fields`.
-- **`units_version`** (`map_loader.py`, currently **3**): bump on any on-disk semantics
+- **`units_version`** (`map_loader.py`, currently **4**): bump on any on-disk semantics
   change, update the comment, **regenerate all 1024 maps** (`python src/gen_maps.py
-  --count 1024 --out maps --seed 0`, ~2 min); `validate_against_config` rejects mismatches.
+  --count 1024 --out maps --seed 0`, ~40 min — dominated by the wind spin-up, not generation);
+  `validate_against_config` rejects mismatches.
+- **Maps are baked in their developed orographic state (v4)**: `gen_maps.spin_up_maps` runs the
+  shallow-water solver ~800 ticks so each map stores the developed mass/air-temperature and the
+  prognostic wind (`x_wind_vel/y_wind_vel`), plus the level-lid rest mass as `mass_eq` (the sponge
+  target, now distinct from the developed initial mass). So a map loads already terrain-shaped
+  (windward blocking, lee/foehn acceleration, advected temperature) instead of relaxing into it at
+  runtime. The flow is unsteady, so this is a developed snapshot, not a fixed point. The WIND view /
+  fire / oxygen read the channeled near-surface wind `x_wind_fire = x_wind_vel·channel_gain` (so the
+  gap/Venturi speedup is visible), while the bare prognostic field stays untouched (the gap-wind
+  xfail still holds). `gen_maps` runs a chunked generate→spin-up→save pipeline (durable progress,
+  bounded memory) with parallel rest-state generation (`--jobs`); spin-up batches at ~16 for CPU
+  throughput.
 - **No pre-SI physics code remains** — every stage of `step_fields` is now SI (Phases 0–5).
   A fire burns physically, radiantly **preheats** its neighbours, and now **spreads** as a
   self-sustaining convective front that also spreads faster uphill (Phase 5.5a–d).

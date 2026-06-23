@@ -137,7 +137,8 @@ class BatchedRollout:
     def reset(self) -> None:
         """(Re)load `B` worlds from the maps dir and build the batched simulation state."""
         fields = {k: [] for k in ("terrain", "air_temperatures", "temp_eq", "oxygen",
-                                  "oxygen_eq", "mass", "fuel", "fuel_temperatures")}
+                                  "oxygen_eq", "mass", "mass_eq", "x_wind_vel", "y_wind_vel",
+                                  "fuel", "fuel_temperatures")}
         amb_x, amb_y = [], []
         for _ in range(self.num_envs):
             # Sample with replacement so num_envs can exceed the number of map files.
@@ -160,10 +161,10 @@ class BatchedRollout:
         def amb(values: list) -> torch.Tensor:
             return torch.as_tensor(values, dtype=self._sim.dtype, device=self._sim.device).view(-1, 1, 1)
         u_amb_x, u_amb_y = amb(amb_x), amb(amb_y)
-        # Prognostic wind starts at the ambient (broadcast to full fields) so each world
-        # begins near its steady state.
-        x_wind = torch.zeros_like(mass) + u_amb_x
-        y_wind = torch.zeros_like(mass) + u_amb_y
+        # Prognostic wind starts at each map's developed (spun-up) orographic field, so every
+        # world begins in its terrain-shaped state rather than relaxing into it.
+        x_wind = stack("x_wind_vel")
+        y_wind = stack("y_wind_vel")
         # Static terrain-channeling gain per world (Phase 6, Option 2): the fire/oxygen read the
         # prognostic wind sped up through gaps by this gain (applied each step in step_fields).
         channel_gain = self._sim.compute_channel_gain(terrain, u_amb_x, u_amb_y)
@@ -178,7 +179,7 @@ class BatchedRollout:
             terrain=terrain,
             temp_eq=stack("temp_eq"),
             oxygen_eq=stack("oxygen_eq"),
-            mass_eq=mass.clone(),
+            mass_eq=stack("mass_eq"),
             x_wind_vel=x_wind,
             y_wind_vel=y_wind,
             u_amb_x=u_amb_x,

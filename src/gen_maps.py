@@ -6,9 +6,15 @@ Synthetic map producer for the Firecracker simulation.
 Owns the procedural initial-state generation that used to live inside
 Simulation/reset(): octave Perlin terrain, elevation-driven temperature/oxygen
 profiles, the convective rest-state pressure, and the grass/tree fuel layers.
-None of this depends on the physics engine — `MapGenerator` reads what it needs
-straight from the config dict and emits a `MapData`, the same contract a future
-real-data importer would target.
+`MapGenerator` reads what it needs straight from the config dict and emits a
+`MapData`, the same contract a future real-data importer would target.
+
+After the rest state is built, `spin_up_maps` runs the shallow-water wind solver
+to its developed orographic state and bakes the result (mass, air temperature, and
+the prognostic wind) back into each map, so a loaded map already shows the terrain-
+shaped flow (windward blocking, lee/foehn acceleration) instead of relaxing into it
+at runtime. This is the one place generation touches the physics engine; the emitted
+`MapData` is still a plain baked state.
 
 Run as a script to bake a batch of maps to disk:
 
@@ -16,6 +22,8 @@ Run as a script to bake a batch of maps to disk:
 """
 
 import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import noise
@@ -55,6 +63,12 @@ class MapGenerator:
         # Free-stream depth of the modelled boundary layer [m]; sets the level-lid rest state.
         momentum = (cfg or {}).get("momentum", {})
         self.layer_depth_ref = float(momentum.get("layer_depth_ref", 1000.0))
+        # Wind spin-up: how many solver ticks to develop the orographic flow before baking it
+        # into the map. The flow is unsteady (lee waves never freeze), so this is "developed",
+        # not a fixed point: ~800 ticks is where the blocking/foehn/channeling structure is
+        # fully formed (see docs/units.md). 0 skips the spin-up (maps stay in the level-lid rest
+        # state with uniform wind, the pre-v4 behaviour).
+        self.spinup_steps = int(momentum.get("spinup_steps", 800))
 
         fuel_types_cfg = (cfg or {}).get("fuel_types", {})
         self.fuel_type_names: list[str] = list(fuel_types_cfg.keys())
@@ -274,6 +288,91 @@ def generate_map(
     )
 
 
+def _generate_one(task: tuple) -> MapData:
+    """Build one rest-state map. Top-level (picklable) so it can run in a worker process.
+
+    Rest-state generation is pure-Python Perlin noise (a scalar per-cell loop), the slowest part
+    of map-making and embarrassingly parallel across maps, so it is fanned out over a process pool.
+    Each worker rebuilds its own MapGenerator from the config (cheap) and draws from the per-map
+    SeedSequence child, so the output is identical to and independent of the serial path.
+    """
+    cfg, grid_size, child, map_seed = task
+    gen = MapGenerator(cfg)
+    rng = np.random.default_rng(child)
+    return generate_map(gen, grid_size, rng, seed=map_seed)
+
+
+def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int = 16) -> None:
+    """Develop the orographic wind for each map and bake it back in (in place).
+
+    Each map is built in its level-lid rest state (uniform synoptic wind, flat free surface).
+    That is not the wind a real terrain produces, and the prognostic solver only relaxes into
+    the terrain-shaped flow over hundreds of ticks. We run that relaxation here, once, at
+    generation time: stack the rest states into a batch and step the shallow-water core `steps`
+    times (the engine is rank-agnostic, so the batch runs far faster than one map at a time),
+    then write the developed mass, air temperature and prognostic wind back into each MapData.
+    The level-lid rest mass is preserved as `mass_eq` (the open-boundary sponge target) and the
+    rest temperature as `temp_eq`, so the runtime sponge still injects the correct free stream.
+
+    The flow is genuinely unsteady (lee/gravity waves do not settle to a frozen field), so the
+    baked state is a developed snapshot, not a fixed point: it loads already terrain-shaped and
+    keeps evolving naturally.
+
+    Spin-up is the dominant cost of map generation (~19x the Perlin rest-state build), all in the
+    batched solver. On CPU its per-map throughput peaks around a batch of ~16 (wider batches lose
+    to memory bandwidth), so `chunk` defaults there rather than to the pipeline's save chunk.
+    """
+    if steps <= 0 or not maps:
+        return
+    # Imported here (not at module load) so the rest-state generator stays import-light and the
+    # engine dependency is confined to the spin-up.
+    import torch
+    from simulation import Simulation, SimState
+
+    sim = Simulation(cfg)
+
+    def t(arr):
+        return torch.as_tensor(arr, dtype=sim.dtype, device=sim.device)
+
+    for start in range(0, len(maps), chunk):
+        batch = maps[start:start + chunk]
+        mass = torch.stack([t(m.mass) for m in batch])              # (B, H, W) level-lid rest
+        air  = torch.stack([t(m.air_temperatures) for m in batch])
+        amb_x = t([m.ambient_wind_x for m in batch]).view(-1, 1, 1)
+        amb_y = t([m.ambient_wind_y for m in batch]).view(-1, 1, 1)
+        s = SimState(
+            mass=mass,
+            air_temperatures=air,
+            ground_temperature=air.clone(),
+            fuel_temperatures=torch.stack([t(m.fuel_temperatures) for m in batch]),
+            fuel=torch.stack([t(m.fuel) for m in batch]),
+            oxygen=torch.stack([t(m.oxygen) for m in batch]),
+            terrain=torch.stack([t(m.terrain) for m in batch]),
+            temp_eq=air.clone(),                                    # rest temperature (sponge target)
+            oxygen_eq=torch.stack([t(m.oxygen) for m in batch]),
+            mass_eq=mass.clone(),                                   # level-lid rest mass (sponge target)
+            x_wind_vel=torch.zeros_like(mass) + amb_x,
+            y_wind_vel=torch.zeros_like(mass) + amb_y,
+            u_amb_x=amb_x,
+            u_amb_y=amb_y,
+            radiant_flux=torch.zeros_like(mass),
+        )
+        for _ in range(steps):
+            sim.step_dynamics(s)
+
+        dev_mass = s.mass.cpu().numpy()
+        dev_air  = s.air_temperatures.cpu().numpy()
+        dev_u    = s.x_wind_vel.cpu().numpy()
+        dev_v    = s.y_wind_vel.cpu().numpy()
+        for i, m in enumerate(batch):
+            m.mass_eq = m.mass.copy()                  # the level-lid rest state -> sponge target
+            m.mass = dev_mass[i].astype(np.float32)    # developed initial state
+            m.air_temperatures = dev_air[i].astype(np.float32)
+            m.x_wind_vel = dev_u[i].astype(np.float32)
+            m.y_wind_vel = dev_v[i].astype(np.float32)
+        print(f"  spun up maps {start + 1}-{start + len(batch)} / {len(maps)} ({steps} ticks)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Firecracker maps")
     parser.add_argument("--count", type=int, default=1, help="number of maps to generate")
@@ -285,20 +384,52 @@ def main() -> None:
         "--start-index", type=int, default=0,
         help="first output file index (e.g. 8 to append after map_0007 without overwriting)",
     )
+    parser.add_argument(
+        "--jobs", type=int, default=None,
+        help="parallel worker processes for rest-state generation (default: all CPUs)",
+    )
+    parser.add_argument(
+        "--chunk", type=int, default=32,
+        help="maps per generate->spin-up->save chunk (bounds memory; saves progress durably)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
     grid_size = int((config or {}).get("environment", {}).get("grid_size", DEFAULT_GRID_SIZE))
     gen = MapGenerator(config)
+    jobs = args.jobs if args.jobs is not None else (os.cpu_count() or 1)
+    chunk = max(1, args.chunk)
 
-    print(f"Generating {args.count} map(s) at {grid_size}x{grid_size} into '{args.out}/' ...")
-    for i, child in enumerate(np.random.SeedSequence(args.seed).spawn(args.count)):
-        rng = np.random.default_rng(child)
-        map_seed = int(child.generate_state(1)[0])
-        m = generate_map(gen, grid_size, rng, seed=map_seed)
-        path = save_map(f"{args.out}/{args.prefix}_{args.start_index + i:04d}.npz", m)
-        print(f"  [{i + 1}/{args.count}] {path}  (seed={map_seed})")
-    print("Done.")
+    # Per-map seeds, spawned once so each map is reproducible regardless of chunking/parallelism.
+    children = np.random.SeedSequence(args.seed).spawn(args.count)
+    seeds = [int(c.generate_state(1)[0]) for c in children]
+
+    print(f"Generating {args.count} map(s) at {grid_size}x{grid_size} into '{args.out}/' "
+          f"({jobs} worker(s), chunk={chunk}, spinup={gen.spinup_steps} ticks) ...", flush=True)
+
+    # Process the maps in chunks: generate the chunk's rest states in parallel, spin up the whole
+    # chunk in one batched solver pass, then save it before moving on. So progress is durable (each
+    # chunk is on disk before the next starts), memory stays bounded (one chunk in RAM), and the
+    # parallel Perlin generation overlaps across CPUs -- the slow part of map-making.
+    def run(pool) -> None:
+        done = 0
+        for start in range(0, args.count, chunk):
+            idx = range(start, min(start + chunk, args.count))
+            tasks = [(config, grid_size, children[i], seeds[i]) for i in idx]
+            maps = list(pool.map(_generate_one, tasks)) if pool else [_generate_one(t) for t in tasks]
+            if gen.spinup_steps > 0:
+                spin_up_maps(maps, config, gen.spinup_steps)
+            for off, m in enumerate(maps):
+                save_map(f"{args.out}/{args.prefix}_{args.start_index + start + off:04d}.npz", m)
+            done += len(maps)
+            print(f"  [{done}/{args.count}] generated + spun up + saved", flush=True)
+
+    if jobs > 1:
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            run(pool)
+    else:
+        run(None)
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":

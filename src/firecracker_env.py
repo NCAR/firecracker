@@ -446,26 +446,28 @@ class FirecrackerEnv(gymnasium.Env):
         self._temp_eq           = self._to_tensor(m.temp_eq)
         self._oxygen            = self._to_tensor(m.oxygen)
         self._oxygen_eq         = self._to_tensor(m.oxygen_eq)
-        self._mass              = self._to_tensor(m.mass)
-        self._mass_eq           = self._mass.clone()   # level-lid rest state -> sponge target
+        self._mass              = self._to_tensor(m.mass)      # developed (spun-up) initial mass
+        self._mass_eq           = self._to_tensor(m.mass_eq)   # level-lid rest state -> sponge target
         self._fuel              = self._to_tensor(m.fuel)
         self._fuel_temperatures = self._to_tensor(m.fuel_temperatures)
         # Surface skin starts at the rest temperature profile (radiative-equilibrium target).
         self._ground_temperature = self._temp_eq.clone()
 
-        # Per-map synoptic ambient wind: the momentum drag relaxes toward it, and the
-        # prognostic wind is initialised to it so the world starts near its steady state.
+        # Per-map synoptic ambient wind: the momentum drag relaxes toward it. The prognostic wind
+        # is initialised to the map's developed (spun-up) orographic field, so the world starts in
+        # its terrain-shaped state rather than relaxing into it over hundreds of ticks.
         self._u_amb_x = self._to_tensor(np.float32(m.ambient_wind_x))
         self._u_amb_y = self._to_tensor(np.float32(m.ambient_wind_y))
-        self._x_wind_vel = torch.full_like(self._mass, float(m.ambient_wind_x))
-        self._y_wind_vel = torch.full_like(self._mass, float(m.ambient_wind_y))
+        self._x_wind_vel = self._to_tensor(m.x_wind_vel)
+        self._y_wind_vel = self._to_tensor(m.y_wind_vel)
 
         # Static terrain-channeling gain (Phase 6, Option 2): precomputed once from the terrain and
-        # the per-map synoptic wind direction. The fire/oxygen read the prognostic wind sped up by
-        # this gain (set each step in step_fields); seed the diagnostic wind at the ambient.
+        # the per-map synoptic wind direction. The fire/oxygen read -- and the WIND view shows -- the
+        # prognostic wind sped up through gaps by this gain (the near-surface wind the model actually
+        # estimates). Seed it now from the developed wind so the Venturi is visible on the first frame.
         self._channel_gain = self._sim.compute_channel_gain(self._terrain, self._u_amb_x, self._u_amb_y)
-        self._x_wind_fire = self._x_wind_vel.clone()
-        self._y_wind_fire = self._y_wind_vel.clone()
+        self._x_wind_fire = self._x_wind_vel * self._channel_gain
+        self._y_wind_fire = self._y_wind_vel * self._channel_gain
 
         # Terrain is static for the episode, so reduce its stats once here (one host
         # transfer) instead of re-syncing them every step in _build_info.
@@ -590,7 +592,11 @@ class FirecrackerEnv(gymnasium.Env):
         # The surface builders are CPU/pygame numpy code, so pull the state to the host
         # once here — the numpy/tensor boundary lives at the render edge.
         temp = _to_numpy(self._air_temperatures)
-        wx, wy = _to_numpy(self._x_wind_vel), _to_numpy(self._y_wind_vel)
+        # The WIND view shows the near-surface wind the fire/oxygen actually read: the prognostic
+        # wind sped up through gaps by the terrain-channeling gain (so the Venturi is visible).
+        # Falls back to the prognostic wind when channeling produced no fire-wind field.
+        wx = _to_numpy(self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel)
+        wy = _to_numpy(self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel)
         pressure_field = _to_numpy(self._mass)
         fuel_temps = _to_numpy(self._fuel_temperatures)
         fuel = _to_numpy(self._fuel)

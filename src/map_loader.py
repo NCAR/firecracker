@@ -29,7 +29,11 @@ MAP_SUFFIX = ".npz"
 #   v2 = + per-map synoptic ambient wind vector (ambient_wind_x/y) [m/s].
 #   v3 = mass is now the shallow boundary-layer areal mass (level-lid rest state), not the
 #        full hydrostatic column -- so terrain strongly channels the wind.
-UNITS_VERSION = 3
+#   v4 = maps are baked in their developed orographic state: mass/air_temperatures are the
+#        spun-up fields and the converged prognostic wind (x_wind_vel/y_wind_vel) is stored,
+#        so a map loads already terrain-shaped. mass_eq (the level-lid rest mass the sponge
+#        relaxes toward) is now stored explicitly, distinct from the developed initial mass.
+UNITS_VERSION = 4
 
 # Maps live at <repo_root>/maps by default (alongside cfg/), same convention as
 # config.py. A relative maps dir is anchored here so the app finds its maps
@@ -52,15 +56,18 @@ class MapData:
     """
 
     terrain:           np.ndarray  # (H, W)
-    air_temperatures:  np.ndarray  # (H, W)
-    mass:              np.ndarray  # (H, W) shallow boundary-layer areal mass [kg/m^2]
+    air_temperatures:  np.ndarray  # (H, W) developed (spun-up) air temperature [K]
+    mass:              np.ndarray  # (H, W) developed shallow boundary-layer areal mass [kg/m^2]
     oxygen:            np.ndarray  # (H, W)
     fuel:              np.ndarray  # (N, H, W)
     fuel_temperatures: np.ndarray  # (N, H, W)
     fuel_type_names:   list[str]
     grid_size:         int
-    temp_eq:           np.ndarray | None = None  # (H, W) temperature relaxation target
+    temp_eq:           np.ndarray | None = None  # (H, W) temperature relaxation target (rest profile)
     oxygen_eq:         np.ndarray | None = None  # (H, W) oxygen replenishment target
+    mass_eq:           np.ndarray | None = None  # (H, W) level-lid rest mass (open-boundary sponge target)
+    x_wind_vel:        np.ndarray | None = None  # (H, W) developed prognostic wind u [m/s]
+    y_wind_vel:        np.ndarray | None = None  # (H, W) developed prognostic wind v [m/s]
     seed:              int | None = None
     source:            str = "unknown"
     units_version:     int = UNITS_VERSION       # field semantics version (see UNITS_VERSION)
@@ -74,6 +81,15 @@ class MapData:
             self.temp_eq = self.air_temperatures.copy()
         if self.oxygen_eq is None:
             self.oxygen_eq = self.oxygen.copy()
+        # A map that is not spun up (hand-built scenarios, a real-data importer) has no
+        # developed wind/rest-mass: default the sponge target to the loaded mass and the
+        # wind to the spatially-uniform synoptic ambient, the pre-v4 behaviour.
+        if self.mass_eq is None:
+            self.mass_eq = self.mass.copy()
+        if self.x_wind_vel is None:
+            self.x_wind_vel = np.full_like(self.mass, self.ambient_wind_x)
+        if self.y_wind_vel is None:
+            self.y_wind_vel = np.full_like(self.mass, self.ambient_wind_y)
 
     @property
     def num_fuel_types(self) -> int:
@@ -102,6 +118,9 @@ def save_map(path: str | Path, m: MapData) -> Path:
         fuel_temperatures=m.fuel_temperatures,
         temp_eq=m.temp_eq,
         oxygen_eq=m.oxygen_eq,
+        mass_eq=m.mass_eq,
+        x_wind_vel=m.x_wind_vel,
+        y_wind_vel=m.y_wind_vel,
         fuel_type_names=np.array(m.fuel_type_names, dtype="U"),
         grid_size=np.int64(m.grid_size),
         seed=np.int64(-1 if m.seed is None else m.seed),
@@ -129,6 +148,9 @@ def load_map(path: str | Path) -> MapData:
             fuel_temperatures=data["fuel_temperatures"].astype(np.float32),
             temp_eq=data["temp_eq"].astype(np.float32) if "temp_eq" in data else None,
             oxygen_eq=data["oxygen_eq"].astype(np.float32) if "oxygen_eq" in data else None,
+            mass_eq=data["mass_eq"].astype(np.float32) if "mass_eq" in data else None,
+            x_wind_vel=data["x_wind_vel"].astype(np.float32) if "x_wind_vel" in data else None,
+            y_wind_vel=data["y_wind_vel"].astype(np.float32) if "y_wind_vel" in data else None,
             fuel_type_names=[str(n) for n in data["fuel_type_names"]],
             grid_size=int(data["grid_size"]),
             seed=None if seed < 0 else seed,
@@ -206,7 +228,8 @@ def validate_against_config(
         )
 
     expected_2d = (grid_size, grid_size)
-    for field_name in ("terrain", "air_temperatures", "mass", "oxygen", "temp_eq", "oxygen_eq"):
+    for field_name in ("terrain", "air_temperatures", "mass", "oxygen", "temp_eq", "oxygen_eq",
+                       "mass_eq", "x_wind_vel", "y_wind_vel"):
         arr = getattr(m, field_name)
         if arr.shape != expected_2d:
             raise ValueError(
