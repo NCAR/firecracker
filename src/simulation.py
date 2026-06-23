@@ -347,9 +347,10 @@ class Simulation:
         acts as concentration*direction: as |b| grows the deposit focuses ever more sharply forward,
         with every weight >= 0, so wind and slope aligning keeps concentrating the deposit (no
         saturation). |b| is clamped only to keep exp() from overflowing (a numerical ceiling, not a
-        physical limit); at the periodic terrain-wrap edge grad(z) is spuriously huge, and that guard
-        keeps it finite (it sits in the sponge, where there is no fire). Uses periodic rolls, so it
-        wraps at the edges rather than losing off-grid. Rank-agnostic via the trailing axes.
+        physical limit); at the edge grad(z) is spuriously huge, and that guard keeps it finite (it
+        sits in the sponge, where there is no fire). Uses zero-fill shifts, so heat convected past
+        the domain edge leaves the grid rather than wrapping to the far side (the domain is a finite
+        2.5 km patch, not a torus). Rank-agnostic via the trailing axes.
         """
         mag = torch.sqrt(bx ** 2 + by ** 2)
         scale = (self._conv_concentration_max / mag.clamp(min=1e-12)).clamp(max=1.0)
@@ -359,7 +360,24 @@ class Simulation:
         g = source / z.clamp(min=1e-30)
         out = torch.zeros_like(source)
         for (drow, dcol, k0w, _, _), e in zip(self._conv_offsets, exps):
-            out = out + k0w * torch.roll(g * e, shifts=(drow, dcol), dims=(-2, -1))
+            out = out + k0w * self._shift_zero(g * e, drow, dcol)
+        return out
+
+    @staticmethod
+    def _shift_zero(field: torch.Tensor, drow: int, dcol: int) -> torch.Tensor:
+        """Shift the trailing two axes by (drow, dcol) like torch.roll, but fill the vacated band
+        with zeros instead of wrapping. Cells shifted in from beyond the domain edge contribute
+        nothing, so a deposit aimed off-grid is lost rather than reappearing on the opposite side.
+        """
+        out = torch.roll(field, shifts=(drow, dcol), dims=(-2, -1))
+        if drow > 0:
+            out[..., :drow, :] = 0.0
+        elif drow < 0:
+            out[..., drow:, :] = 0.0
+        if dcol > 0:
+            out[..., :, :dcol] = 0.0
+        elif dcol < 0:
+            out[..., :, dcol:] = 0.0
         return out
 
     def _diffuse(self, field: torch.Tensor, sigma: float) -> torch.Tensor:
