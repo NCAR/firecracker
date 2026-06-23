@@ -224,7 +224,11 @@ class BatchedRollout:
     def observe(self) -> torch.Tensor:
         """Current batched observation, B x C x N x N on the sim device."""
         s = self._state
-        return Simulation.build_observation(s.fuel_temperatures, s.fuel, s.terrain)
+        # Same near-surface wind the fire reads for spread (prognostic x channeling gain),
+        # falling back to the prognostic wind when no channeling layer is present.
+        wind_x = s.x_wind_fire if s.x_wind_fire is not None else s.x_wind_vel
+        wind_y = s.y_wind_fire if s.y_wind_fire is not None else s.y_wind_vel
+        return Simulation.build_observation(s.fuel_temperatures, s.fuel, s.terrain, wind_x, wind_y)
 
     def collect(self, steps: int | None = None, stride: int | None = None) -> torch.Tensor:
         """Step the `B` worlds `steps` times, pooling every `stride`-th tick's observation.

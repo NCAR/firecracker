@@ -33,6 +33,7 @@ EMISSIVITY: float = 0.95                    # grey-body emissivity of the surfac
 # --- Domain reference scales -----------------------------------------------
 ELEV_MAX_M:     float = 500.0               # documented terrain elevation ceiling over the domain [m]
 FUEL_REF_KG_M2: float = 20.0                # representative dense-forest areal biomass [kg/m^2]
+WIND_REF_M_S:   float = 30.0                # solver's peak-wind calibration target [m/s] (synoptic x channeling gain)
 
 # --- Observation normalization ---------------------------------------------
 # The world-model observation (Simulation.build_observation) carries SI fields whose
@@ -48,6 +49,9 @@ OBS_NORM: dict[str, tuple[float, float]] = {
     "fuel":             (0.0, FUEL_REF_KG_M2),
     # sea level -> 0; domain ceiling -> 1.
     "terrain":          (0.0, ELEV_MAX_M),
+    # near-surface fire wind components [m/s]: signed, calm -> 0, a ~30 m/s peak -> ~+/-1.
+    "wind_x":           (0.0, WIND_REF_M_S),
+    "wind_y":           (0.0, WIND_REF_M_S),
 }
 
 # --- Default discretisation scales -----------------------------------------

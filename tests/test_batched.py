@@ -118,8 +118,10 @@ def test_build_observation_shape_and_channels():
     fuel_temps = torch.rand(B, len(names), N, N)
     fuel = torch.rand(B, len(names), N, N)
     terrain = torch.rand(B, N, N)
+    wind_x = torch.rand(B, N, N) * 2.0 - 1.0   # signed
+    wind_y = torch.rand(B, N, N) * 2.0 - 1.0
 
-    obs = Simulation.build_observation(fuel_temps, fuel, terrain)
+    obs = Simulation.build_observation(fuel_temps, fuel, terrain, wind_x, wind_y)
 
     def norm(channel, raw):
         offset, scale = pc.OBS_NORM[channel]
@@ -129,6 +131,8 @@ def test_build_observation_shape_and_channels():
     np.testing.assert_allclose(to_numpy(obs[:, 0]), norm("fuel_temperature", fuel_temps.amax(dim=1)))  # hottest type
     np.testing.assert_allclose(to_numpy(obs[:, 1]), norm("fuel", fuel.sum(dim=1)))                     # total fuel
     np.testing.assert_allclose(to_numpy(obs[:, 2]), norm("terrain", terrain))                          # terrain
+    np.testing.assert_allclose(to_numpy(obs[:, 3]), norm("wind_x", wind_x))                            # fire wind u
+    np.testing.assert_allclose(to_numpy(obs[:, 4]), norm("wind_y", wind_y))                            # fire wind v
 
 
 def test_rollout_collects_and_samples(tmp_path):

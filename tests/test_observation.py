@@ -1,9 +1,10 @@
 """
 World-model observation normalization (Phase 7).
 
-Simulation.build_observation stacks three SI fields -- the hottest fuel temperature [K], the
-total fuel mass [kg/m^2], and terrain elevation [m] -- whose raw magnitudes span several orders.
-Each channel is mapped to roughly [0, 1] by the documented affine window in
+Simulation.build_observation stacks five SI fields -- the hottest fuel temperature [K], the
+total fuel mass [kg/m^2], terrain elevation [m], and the two near-surface fire-wind components
+[m/s] -- whose raw magnitudes span several orders. Each channel is mapped to roughly [0, 1] by
+the documented affine window in
 physics_constants.OBS_NORM, (value - offset) / scale, so the world model sees comparable scales.
 These tests call build_observation directly on synthetic tensors and pin that mapping (the
 per-channel reductions, the normalization, and that it is rank-agnostic across a batch axis).
@@ -19,8 +20,12 @@ GRID = 8
 DTYPE = torch.float64
 
 
-def _obs(fuel_temperatures, fuel, terrain):
-    return Simulation.build_observation(fuel_temperatures, fuel, terrain)
+def _obs(fuel_temperatures, fuel, terrain, wind_x=None, wind_y=None):
+    if wind_x is None:
+        wind_x = torch.zeros_like(terrain)
+    if wind_y is None:
+        wind_y = torch.zeros_like(terrain)
+    return Simulation.build_observation(fuel_temperatures, fuel, terrain, wind_x, wind_y)
 
 
 def _const(value, *shape):
@@ -28,9 +33,9 @@ def _const(value, *shape):
 
 
 def test_channel_order_matches_obs_channels():
-    """The stacked channel axis is exactly OBS_CHANNELS, length 3."""
+    """The stacked channel axis is exactly OBS_CHANNELS, length 5."""
     obs = _obs(_const(pc.T_REF, 2, GRID, GRID), _const(0.0, 2, GRID, GRID), _const(0.0, GRID, GRID))
-    assert obs.shape == (len(OBS_CHANNELS), GRID, GRID) == (3, GRID, GRID)
+    assert obs.shape == (len(OBS_CHANNELS), GRID, GRID) == (5, GRID, GRID)
 
 
 def test_rest_state_maps_near_zero():
@@ -43,6 +48,16 @@ def test_terrain_normalized_by_elev_max():
     """Terrain at the documented ceiling maps to 1; the channel is z / ELEV_MAX_M."""
     obs = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID), _const(pc.ELEV_MAX_M, GRID, GRID))
     torch.testing.assert_close(obs[2], torch.ones((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
+
+
+def test_wind_components_signed_and_normalized_by_wind_ref():
+    """The wind channels pass the fire wind through, signed about 0 and scaled by WIND_REF_M_S."""
+    wx = _const(pc.WIND_REF_M_S, GRID, GRID)        # +peak -> +1
+    wy = _const(-pc.WIND_REF_M_S / 2.0, GRID, GRID)  # half the peak, reversed -> -0.5
+    obs = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID),
+               _const(0.0, GRID, GRID), wx, wy)
+    torch.testing.assert_close(obs[3], torch.ones((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
+    torch.testing.assert_close(obs[4], _const(-0.5, GRID, GRID), atol=1e-9, rtol=0.0)
 
 
 def test_fuel_is_summed_then_normalized():
@@ -74,3 +89,27 @@ def test_batched_matches_single_world():
     for b in range(3):
         single = _obs(temps[b], fuel[b], terrain[b])
         torch.testing.assert_close(batched[b], single, atol=1e-12, rtol=0.0)
+
+
+def test_env_observation_matches_world_model(make_env):
+    """The Gymnasium env's reset/step return the same world-model observation (and its space
+    matches), so the agent trains on exactly what the rollout collector pools."""
+    import numpy as np
+    from scenarios import si_ridge
+
+    env = make_env(*si_ridge(grid=24, ambient=(12.0, -4.0), peak_m=300.0))
+
+    obs, _ = env.reset(seed=0)
+    assert obs.shape == (len(OBS_CHANNELS), 24, 24)
+    assert env.observation_space.shape == obs.shape
+    assert env.observation_space.contains(obs)
+    expected = Simulation.build_observation(
+        env._fuel_temperatures, env._fuel, env._terrain, env._x_wind_fire, env._y_wind_fire
+    ).detach().cpu().numpy().astype("float32")
+    np.testing.assert_array_equal(obs, expected)
+
+    step_obs, *_ = env.step(0)
+    step_expected = Simulation.build_observation(
+        env._fuel_temperatures, env._fuel, env._terrain, env._x_wind_fire, env._y_wind_fire
+    ).detach().cpu().numpy().astype("float32")
+    np.testing.assert_array_equal(step_obs, step_expected)

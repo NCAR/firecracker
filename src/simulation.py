@@ -23,7 +23,7 @@ _MAX_DIFFUSION_COEFF: float = 0.2
 # Observation channels, in order, produced by Simulation.build_observation. Each is a
 # single (H, W) field reduced across fuel types. Extend this (and build_observation) to
 # grow the channel count C.
-OBS_CHANNELS: tuple[str, ...] = ("fuel_temperature", "fuel", "terrain")
+OBS_CHANNELS: tuple[str, ...] = ("fuel_temperature", "fuel", "terrain", "wind_x", "wind_y")
 
 
 @dataclass
@@ -1012,21 +1012,28 @@ class Simulation:
         fuel_temperatures: torch.Tensor,  # (..., N_fuel, H, W)
         fuel: torch.Tensor,               # (..., N_fuel, H, W)
         terrain: torch.Tensor,            # (..., H, W)
+        wind_x: torch.Tensor,             # (..., H, W) near-surface fire wind u [m/s]
+        wind_y: torch.Tensor,             # (..., H, W) near-surface fire wind v [m/s]
     ) -> torch.Tensor:
         """Stack the OBS_CHANNELS into a normalized (..., C, H, W) observation.
 
         Each channel is reduced across fuel types: fuel temperature is the hottest type
-        (amax), fuel/vegetation is the total mass (sum), terrain is passed through. With a
-        leading batch axis the result is the B x C x N x N tensor the world model trains on.
+        (amax), fuel/vegetation is the total mass (sum), terrain is passed through, and the
+        two wind components are the same near-surface velocity the fire reads for spread
+        (prognostic wind x channeling gain). With a leading batch axis the result is the
+        B x C x N x N tensor the world model trains on.
 
-        The raw SI fields span very different magnitudes (K vs kg/m^2 vs m), so each channel
-        is mapped to roughly [0, 1] by the documented affine window in physics_constants.OBS_NORM
-        (value - offset) / scale. The high side is not clamped, so flames ride a little above 1.
+        The raw SI fields span very different magnitudes (K vs kg/m^2 vs m vs m/s), so each
+        channel is mapped to roughly [0, 1] by the documented affine window in
+        physics_constants.OBS_NORM (value - offset) / scale. Wind is signed about 0; the high
+        side is not clamped, so flames (and strong gusts) ride a little above 1.
         """
         channels = [
             fuel_temperatures.amax(dim=-3),  # fuel_temperature: hottest fuel type
             fuel.sum(dim=-3),                # fuel: total vegetation mass
             terrain,                         # terrain: elevation
+            wind_x,                          # wind_x: near-surface fire wind u
+            wind_y,                          # wind_y: near-surface fire wind v
         ]
         obs = torch.stack(channels, dim=-3)
         offsets = torch.tensor([pc.OBS_NORM[c][0] for c in OBS_CHANNELS], dtype=obs.dtype, device=obs.device)

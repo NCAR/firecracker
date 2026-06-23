@@ -2,7 +2,8 @@
 firecracker_env.py
 
 Gymnasium environment wrapping the Firecracker heat-diffusion simulation.
-Observation: (grid_size, grid_size) float32 air_temperature field in [0, 1].
+Observation: the world-model observation — a normalized (C, grid_size, grid_size) float32
+             stack of the OBS_CHANNELS (see Simulation.build_observation).
 Action:      Discrete(1) — single no-op placeholder for future RL action spaces.
 """
 
@@ -15,7 +16,7 @@ import pygame
 import gymnasium
 from gymnasium import spaces
 
-from simulation import Simulation, SimState
+from simulation import OBS_CHANNELS, Simulation, SimState
 from map_loader import load_map, resolve_map, validate_against_config
 
 
@@ -355,13 +356,14 @@ class FirecrackerEnv(gymnasium.Env):
         self.render_mode = render_mode
         self._pixel_scale = self.window_size // self.grid_size
 
-        # Placeholder human-facing observation: reset/step return the raw air-temperature
-        # field [K], so the Box spans a physical Kelvin window (not [0, 1]). This is distinct
-        # from the normalized multi-channel world-model observation produced by
-        # Simulation.build_observation (OBS_CHANNELS), which the rollout collector consumes.
-        # Revisit when a real agent / action space is designed.
+        # reset/step return the same world-model observation the rollout collector consumes:
+        # the normalized multi-channel stack produced by Simulation.build_observation
+        # (OBS_CHANNELS). Channels are mapped to roughly [0, 1] by their affine windows, but the
+        # high side is intentionally not clamped (flames/strong gusts ride above 1) and wind is
+        # signed, so the Box is left unbounded rather than asserting a false finite range.
         self.observation_space = spaces.Box(
-            low=0.0, high=3000.0, shape=(self.grid_size, self.grid_size), dtype=np.float32
+            low=-np.inf, high=np.inf,
+            shape=(len(OBS_CHANNELS), self.grid_size, self.grid_size), dtype=np.float32,
         )
         # Single no-op action; replace with the real action space when designing the agent.
         self.action_space = spaces.Discrete(1)
@@ -422,6 +424,17 @@ class FirecrackerEnv(gymnasium.Env):
                 (self.grid_size * self._pixel_scale, self.grid_size * self._pixel_scale)
             )
             self._clock = pygame.time.Clock()
+
+    def _observation(self) -> np.ndarray:
+        """The world-model observation for the current state: a normalized (C, H, W) float32
+        stack of OBS_CHANNELS. Identical to what BatchedRollout.observe collects, including the
+        near-surface fire wind (prognostic wind x channeling gain) used by the spread physics."""
+        obs = Simulation.build_observation(
+            self._fuel_temperatures, self._fuel, self._terrain,
+            self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel,
+            self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel,
+        )
+        return _to_numpy(obs).astype(np.float32)
 
     def reset(
         self,
@@ -500,7 +513,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._step_once = False
         self._surfaces_dirty = True
 
-        return _to_numpy(self._air_temperatures), self._build_info()
+        return self._observation(), self._build_info()
 
     def step(
         self, action: int
@@ -528,7 +541,7 @@ class FirecrackerEnv(gymnasium.Env):
         reward = 0.0
         terminated = False
         truncated = self._step_count >= self.max_steps
-        return _to_numpy(self._air_temperatures), reward, terminated, truncated, self._build_info()
+        return self._observation(), reward, terminated, truncated, self._build_info()
 
     def render(self) -> np.ndarray | None:
         if self.render_mode == "human":
