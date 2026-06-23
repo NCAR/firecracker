@@ -7,7 +7,6 @@
 #
 # The model is fully SI: every stage of the step (boundary-layer wind, radiation, combustion,
 # radiant transfer, terrain channeling) runs in physical units (docs/units.md, phases 0-6).
-# The only non-physical block is the legacy [convection] (see its note).
 
 [units]
 # Physical discretisation. Each cell is cell_size_m on a side; the tick duration is
@@ -69,17 +68,6 @@ cover_fuel_scale     = 1.0      # kappa [kg/m^2]: fuel load at which canopy inte
 # Fresh-air replenishment: relaxes oxygen toward its elevation equilibrium profile.
 enabled     = true   # if false, skip oxygen replenishment
 oxygen_rate = 0.05   # fresh-air replenishment rate; keep below peak burn draw
-
-[convection]
-# LEGACY (pre-SI): the live dynamics no longer use these. They feed only gen_maps' retained
-# reference column-mass profile, which survives for the legacy fixtures/ and tools/visualize.py
-# scenarios. Slated for removal in Phase 8 when those are ported (docs/units.md). The old model:
-# single-layer mass/energy convection down a transport potential
-# Phi = pressure_transport_rate*m + buoyancy_transport_rate*H, H from terrain + thermal expansion.
-thermal_expansion       = 0.5   # alpha: how much temperature expands the column (raises H)
-terrain_height_scale    = 0.5   # gamma: terrain's contribution to column-top height
-buoyancy_transport_rate = 0.1   # c_b: mass/energy flux down the column-height gradient
-pressure_transport_rate = 0.1   # c_p: mass/energy flux down the surface-pressure gradient
 
 [momentum]
 # Shallow boundary-layer orographic wind (see docs/units.md). The wind is prognostic

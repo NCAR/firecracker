@@ -56,14 +56,6 @@ class MapGenerator:
         momentum = (cfg or {}).get("momentum", {})
         self.layer_depth_ref = float(momentum.get("layer_depth_ref", 1000.0))
 
-        # Convection params are dynamics knobs, but the *initial* pressure is the
-        # rest state of those dynamics, so the generator reads them too.
-        convection = (cfg or {}).get("convection", {})
-        self.thermal_expansion    = float(convection.get("thermal_expansion",    0.5))
-        self.terrain_height_scale = float(convection.get("terrain_height_scale", 0.5))
-        self.buoyancy_transport_rate = float(convection.get("buoyancy_transport_rate", 0.1))
-        self.pressure_transport_rate = float(convection.get("pressure_transport_rate", 0.1))
-
         fuel_types_cfg = (cfg or {}).get("fuel_types", {})
         self.fuel_type_names: list[str] = list(fuel_types_cfg.keys())
         self.num_fuel_types: int = len(self.fuel_type_names)
@@ -176,10 +168,6 @@ class MapGenerator:
         base = 1.0 - gamma * elevation_m / pc.T_REF   # = T(z)/T_REF, positive for z < T_REF/Gamma
         return (pc.P_REF * base ** exponent).astype(np.float32)
 
-    def column_mass_profile(self, elevation_m: np.ndarray) -> np.ndarray:
-        """Hydrostatic column mass per area [kg/m^2]: m = p / g (weight of the air column)."""
-        return (self.pressure_profile(elevation_m) / pc.GRAVITY).astype(np.float32)
-
     def boundary_layer_mass(self, elevation_m: np.ndarray) -> np.ndarray:
         """Level-lid boundary-layer mass per area [kg/m^2] -- the shallow-water rest state.
 
@@ -213,25 +201,6 @@ class MapGenerator:
         """
         samples = rng.exponential(np.maximum(density, 0.0))
         return np.minimum(np.floor(samples), self.max_trees_per_cell).astype(np.float32)
-
-    def equilibrium_mass(self, terrain: np.ndarray, air_temperatures: np.ndarray) -> np.ndarray:
-        """Closed-form rest state (mean 1) of the convective transport: the mass that
-        makes the transport potential Phi uniform.
-
-        At rest grad(Phi)=0, i.e. Phi = c_p*m + c_b*H = C with H = gamma*terrain +
-        m*(1+alpha*T). Solving per cell with k = c_p + c_b*(1 + alpha*T):
-            m = (C - c_b*gamma*terrain) / k
-        and C is fixed by total mass = N cells:
-            C = (N + c_b*gamma*sum[terrain/k]) / sum[1/k]
-        """
-        c_p = self.pressure_transport_rate
-        c_b = self.buoyancy_transport_rate
-        gamma = self.terrain_height_scale
-        k = c_p + c_b * (1.0 + self.thermal_expansion * air_temperatures)
-        inv = 1.0 / k
-        n_cells = float(terrain.size)
-        c = (n_cells + c_b * gamma * float((terrain * inv).sum())) / float(inv.sum())
-        return ((c - c_b * gamma * terrain) * inv).astype(np.float32)
 
 
 def generate_map(

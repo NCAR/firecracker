@@ -1,9 +1,8 @@
 # Physical Units Conversion — Design Doc
 
-Status: **in progress** — phases 0–7 done (scaffolding through terrain-channeling wind +
-wind-driven spread, plus observation/config/render polish); phase 8 (test rebaseline +
-numerical hardening) remains. Target: convert Firecracker from a nondimensional, per-tick
-model to a fully physical SI simulation.
+Status: **done** — phases 0–8 complete: Firecracker is converted from a nondimensional, per-tick
+model to a fully physical SI simulation (scaffolding through terrain-channeling wind + wind-driven
+spread, observation/config/render polish, and test rebaseline + numerical hardening).
 
 ## Goal & decisions
 
@@ -377,7 +376,7 @@ Each phase is independently testable; we do not change everything at once.
    `test_heat_exchange` rebaselined to `cp_air`/`cp_fuel`/`dt`; `test_radiant_heat` rebaselined
    for the `specific_heat` repoint. *Known:* at flame temps `k·dt ≫ 1`, so a hot cell burns its
    fuel out in one tick (explicit-Euler saturation, capped at the fuel present — finite, but
-   sharp); revisit with sub-tick consumption in Phase 8. **Fire spread still awaits Phase 5**
+   sharp); resolved in Phase 5.5a (surface-area combustion). **Fire spread still awaits Phase 5**
    (`apply_radiant_heat` is the propagation mechanism and is still pre-SI; burnt cells have
    `C_fuel=0` and emit nothing).
 5. **Fire radiant transfer** ✅ *done* — `apply_radiant_heat` rewritten to a grey-body
@@ -542,16 +541,27 @@ Each phase is independently testable; we do not change everything at once.
    (600 → 1600 K) so the flame ramp resolves the real ~573–2400 K band. Config: rewrote the stale
    "pre-SI" header, dropped dead knobs (`[simulation].blur_sigma`, `[wind].smooth_sigma`/
    `temporal_smoothing`), added unit annotations, and relabelled `[convection]` as **legacy**
-   (it now feeds only `gen_maps`' retained reference mass profile; removal is Phase 8). `main.py`
+   (it fed only `gen_maps`' retained reference mass profile; removed in Phase 8). `main.py`
    printouts gained units and a `[channeling]` section. No `units_version` bump, no map regen.
    *Tests:* `tests/test_observation.py` (per-channel normalisation, hottest-type reduction, batched
    == single); `test_batched.py` obs assertion rebaselined to the normalised channels.
-8. **Test rebaseline + numerical hardening** — consolidate SI tests; split conservation into
-   **closed** (exact) vs **open** (inflow/outflow budget). Regenerate `fixtures/` + port
-   `tools/visualize.py` (legacy nondimensional, would fail `units_version`); remove the legacy
-   `[convection]` block + its `gen_maps` reference-mass path once those are ported. Re-verify CFL/
-   stability at 256² with all subsystems on; check float64 throughput (~15.7 steps/s CPU at
-   256² with fire+radiation+channeling on; device-agnostic GPU path untested).
+8. **Test rebaseline + numerical hardening** ✅ *done* — conservation split into **closed** vs
+   **open**: `tests/test_conservation.py` keeps the closed (sponge/friction off) exact mass/energy/
+   oxygen tests and adds open-domain throughflow tests (a warm anomaly is flushed out by the sponge
+   while the closed core conserves it; a blob released upwind drifts downwind), with
+   `test_radiation.py::test_quiescent_world_holds_station` as the open baseline. The pre-SI scenario
+   builders in `tests/scenarios.py` were rewritten to SI (`uniform`/`hot_blob`/`corner_blob`/
+   `oxygen_saturation`/`mass_gradient` over the flat rest state; `equilibrium`/`off_equilibrium` as
+   SI level-lid rest / off-rest states), and `tools/visualize.py`'s `write_fixtures_toml` emits an SI
+   config — `fixtures/` regenerated (`units_version=3`, reload cleanly). The legacy `[convection]`
+   block and its `gen_maps` reference-mass methods (`equilibrium_mass`, `column_mass_profile`) were
+   deleted. New `tests/test_stability.py::test_full_model_stable_at_production_grid` steps a burning
+   256² hill under a strong wind with **every subsystem on** (wind + radiation + combustion + radiant
+   transfer + channeling) and stays finite/positive/bounded — the configuration the radiation
+   broadcast fix unblocked. Throughput measured by `tools/bench.py`: **~15 steps/s CPU (float64) at
+   256² with all subsystems on** (~65 ms/step). The device-agnostic GPU path is written but
+   **unverified** (no CUDA on the development machine). No `units_version` bump, no map regen.
+   *Suite:* 66 passed, 1 xfailed (the gap-wind prognostic xfail, kept on purpose).
 
 ## Implementation conventions (for any continuation)
 
@@ -636,5 +646,5 @@ Each phase is independently testable; we do not change everything at once.
   entry (item 6 under Phased delivery) and `compute_channel_gain` in `src/simulation.py`. (The
   *prognostic* gap jet — Option 1 — remains deferred on `phase6-two-layer`.)
 - **Lee separation/turbulence** regime not modelled (hydraulic/foehn regime instead).
-- `column_mass_profile` (full barometric column) kept in `gen_maps` for reference but unused
-  by dynamics; `equilibrium_mass` kept only for the legacy `fixtures/`/visualizer scenarios.
+- **GPU path unverified** — the code is device-agnostic (`Simulation.device`), but only the CPU
+  (float64) path has been exercised; the development machine has no CUDA.

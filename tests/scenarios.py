@@ -159,44 +159,67 @@ def ramp_terrain(grid: int) -> np.ndarray:
 # Scenario builders -> (config, MapData)
 # ---------------------------------------------------------------------------
 
+def _air_blob(m: MapData, row: int, col: int, radius: int, delta_k: float) -> MapData:
+    """Add a warm air anomaly (+delta_k) inside a disc, leaving temp_eq at the rest profile."""
+    rows, cols = np.ogrid[:m.grid_size, :m.grid_size]
+    mask = (rows - row) ** 2 + (cols - col) ** 2 <= radius ** 2
+    air = m.air_temperatures.copy()
+    air[mask] += delta_k
+    m.air_temperatures = air.astype(np.float32)
+    return m
+
+
 def uniform():
-    return make_config(), build_map(air=0.5, mass=1.0, oxygen=0.5)
+    """Uniform flat SI rest state: a fixed point (identical at t=0 and t=5, no source/sink)."""
+    return si_flat()
 
 
 def hot_blob():
-    air = disc(DEFAULT_GRID, 8, 8, 3, value=5.0, base=0.5)
-    return make_config(), build_map(air=air, mass=1.0)
+    """Flat SI rest state with a warm air blob that convects and is carried out by the sponge."""
+    cfg, m = si_flat()
+    return cfg, _air_blob(m, 8, 8, 3, delta_k=150.0)
 
 
 def corner_blob():
-    air = disc(DEFAULT_GRID, 1, 1, 3, value=8.0, base=0.5)
-    return make_config(), build_map(air=air, mass=1.0)
+    """Warm blob against the corner: tests the open edges, totals are not pinned."""
+    cfg, m = si_flat()
+    return cfg, _air_blob(m, 1, 1, 3, delta_k=200.0)
 
 
 def oxygen_saturation():
-    mass = np.tile(np.linspace(1.2, 0.8, DEFAULT_GRID, dtype=np.float32), (DEFAULT_GRID, 1))
-    oxygen = np.full((DEFAULT_GRID, DEFAULT_GRID), 0.4, dtype=np.float32)
-    oxygen[:, DEFAULT_GRID // 2:] = 1.0
-    return make_config(), build_map(mass=mass, oxygen=oxygen)
+    """Flat SI world with an oxygen step (low left / high right) that advects and conserves."""
+    cfg, m = si_flat()
+    o_rest = float(m.oxygen.mean())
+    oxygen = np.full((DEFAULT_GRID, DEFAULT_GRID), 0.7 * o_rest, dtype=np.float32)
+    oxygen[:, DEFAULT_GRID // 2:] = 1.1 * o_rest
+    m.oxygen = oxygen
+    return cfg, m
 
 
 def mass_gradient():
-    """Flat terrain with a left-high / right-low mass ramp; should equalize smoothly."""
-    mass = np.tile(np.linspace(1.3, 0.7, DEFAULT_GRID, dtype=np.float32), (DEFAULT_GRID, 1))
-    return make_config(), build_map(mass=mass)
+    """Flat terrain with a left-high / right-low mass ramp around the SI rest mass."""
+    cfg, m = si_flat()
+    m_rest = float(m.mass.mean())
+    ramp = np.linspace(1.15, 0.85, DEFAULT_GRID, dtype=np.float32) * m_rest
+    m.mass = np.tile(ramp, (DEFAULT_GRID, 1)).astype(np.float32)
+    return cfg, m
 
 
 def equilibrium():
-    config = make_config()
-    terrain = ramp_terrain(DEFAULT_GRID)
-    air = np.full((DEFAULT_GRID, DEFAULT_GRID), 0.5, dtype=np.float32)
-    mass = MapGenerator(config).equilibrium_mass(terrain, air)
-    return config, build_map(terrain=terrain, air=air, mass=mass)
+    """SI rest state over a terrain ramp (level-lid mass): pressure at t=1 matches t=0."""
+    grid = DEFAULT_GRID
+    terrain = (ramp_terrain(grid) * 300.0).astype(np.float32)   # 0..300 m elevation ramp
+    air, mass, oxygen = _si_state(terrain)
+    return make_config(grid), build_map(grid, terrain=terrain, air=air, mass=mass, oxygen=oxygen)
 
 
 def off_equilibrium():
-    terrain = ramp_terrain(DEFAULT_GRID)
-    return make_config(), build_map(terrain=terrain, air=0.5, mass=1.0)
+    """Uniform (flat-ground) mass over a slope: not a rest state, so the pressure drifts."""
+    grid = DEFAULT_GRID
+    terrain = (ramp_terrain(grid) * 300.0).astype(np.float32)
+    air, _, oxygen = _si_state(terrain)
+    _, flat_mass, _ = _si_state(np.zeros((grid, grid), dtype=np.float32))
+    return make_config(grid), build_map(grid, terrain=terrain, air=air, mass=flat_mass, oxygen=oxygen)
 
 
 # ---------------------------------------------------------------------------
@@ -271,27 +294,27 @@ def si_channel(grid: int = DEFAULT_GRID, ambient: tuple[float, float] = (15.0, 0
 VISUALS = {
     "uniform": (
         uniform, [ViewMode.TEMPERATURE], [0, 5],
-        "Uniform field: must be identical at t=0 and t=5 (no spurious source/sink).",
+        "Uniform SI rest state: identical at t=0 and t=5 (no spurious source/sink).",
     ),
     "hot_blob": (
         hot_blob, [ViewMode.TEMPERATURE, ViewMode.PRESSURE], [0, 8, 25],
-        "Hot blob convects + diffuses; total mass and energy stay conserved.",
+        "Warm blob lifts the layer and convects; the open sponge carries it out.",
     ),
     "mass_gradient": (
         mass_gradient, [ViewMode.PRESSURE], [0, 100, 400],
-        "Pressure ramp must equalize smoothly toward uniform (no checkerboard stripes).",
+        "Mass ramp equalizes smoothly toward the rest state (no checkerboard stripes).",
     ),
     "corner_blob": (
         corner_blob, [ViewMode.TEMPERATURE], [0, 20, 40],
-        "Blob against the corner: no-flux walls, totals must not drop.",
+        "Warm blob against the corner: open edges, the anomaly drifts and flushes.",
     ),
     "oxygen_saturation": (
         oxygen_saturation, [ViewMode.OXYGEN, ViewMode.PRESSURE], [0, 10, 20],
-        "Oxygen advects into full cells; total conserved and capped at 1.0.",
+        "Oxygen step advects across the domain; transport stays smooth and finite.",
     ),
     "equilibrium": (
         equilibrium, [ViewMode.PRESSURE, ViewMode.TERRAIN], [0, 1],
-        "Convective rest state: pressure at t=1 should match t=0 (stationary).",
+        "SI level-lid rest state over terrain: pressure at t=1 should match t=0.",
     ),
     "off_equilibrium": (
         off_equilibrium, [ViewMode.PRESSURE, ViewMode.TERRAIN], [0, 1],
