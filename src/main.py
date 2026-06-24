@@ -133,7 +133,7 @@ def run_headless(config: dict, map_name: str | None = None, maps_dir: str | None
     window_start, window_steps = start, 0
     try:
         while True:
-            obs, reward, terminated, truncated, info = env.step(env.noop_action)
+            obs, reward, terminated, truncated, info = env.step(None)
             window_steps += 1
             if info["step"] % log_interval == 0:
                 now = time.monotonic()
@@ -179,7 +179,7 @@ def run(config: dict, map_name: str | None = None, maps_dir: str | None = None) 
 
         if env._step_once:
             env._step_once = False
-            obs, reward, terminated, truncated, info = env.step(env.noop_action)
+            obs, reward, terminated, truncated, info = env.step(None)
             last_step_time = now
             if terminated or truncated:
                 if log_episodes:
@@ -189,7 +189,7 @@ def run(config: dict, map_name: str | None = None, maps_dir: str | None = None) 
 
         if not env._paused and now - last_step_time >= step_interval:
             step_start = time.monotonic()
-            obs, reward, terminated, truncated, info = env.step(env.noop_action)
+            obs, reward, terminated, truncated, info = env.step(None)
             last_step_time = now
             step_elapsed_ms = int((time.monotonic() - step_start) * 1000)
             if step_elapsed_ms > ms_per_step:

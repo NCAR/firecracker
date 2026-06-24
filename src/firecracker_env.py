@@ -4,12 +4,14 @@ firecracker_env.py
 Gymnasium environment wrapping the Firecracker heat-diffusion simulation.
 Observation: the world-model observation — a normalized (C, grid_size, grid_size) float32
              stack of the OBS_CHANNELS (see Simulation.build_observation).
-Action:      Discrete(action_grid_size**2 + 1) — each timestep the agent selects one
-             action-cell of the coarse action grid (decoded row-major to (arow, acol)) or
-             the final index, the no-op (do nothing this tick).
+Action:      Discrete(action_grid_size) — an action-cell is selected over two steps (first a
+             row, then a column). A completed selection goes through only when the cell or one
+             of its 8 neighbour action-cells contains fire; over a fire-free neighbourhood it is
+             a no-op (nothing selected).
 """
 
 import math
+import time
 from enum import Enum
 
 import numpy as np
@@ -76,6 +78,11 @@ FIRE_SPAWN_RADIUS: int = 5
 # Alpha of the white rectangle blended over the action-cell under the mouse (0-255):
 # subtle enough that the underlying view still reads clearly.
 ACTION_HIGHLIGHT_ALPHA: int = 80
+
+# A valid action (one that goes through) flashes the selected square white: this is the peak
+# alpha (0-255) and how long, in seconds, the flash fades back to nothing.
+ACTION_FLASH_ALPHA: int = 230
+ACTION_FLASH_SECONDS: float = 0.35
 
 # ---------------------------------------------------------------------------
 # View modes
@@ -386,8 +393,12 @@ class FirecrackerEnv(gymnasium.Env):
         # Action-cell (arow, acol) currently under the mouse, or None when the cursor is
         # outside the window. Drawn as a brightening overlay each frame (render).
         self._hovered_action_cell: tuple[int, int] | None = None
-        # Action-cell (arow, acol) the agent selected on the last step (None before the first
-        # step). Decoded from the Discrete action; the world effect of selecting it is TBD.
+        # Two-step action state. _pending_action_row holds the row chosen on a row step while the
+        # env waits for the column step (None means the next action is read as a row). On the
+        # completing column step _selected_action_cell is the chosen (arow, acol) if the action goes
+        # through (the cell or a neighbour is on fire), else None (the fire-free no-op). It is also
+        # None on row steps and before the first selection. The world effect of a cell is TBD.
+        self._pending_action_row: int | None = None
         self._selected_action_cell: tuple[int, int] | None = None
 
         # reset/step return the same world-model observation the rollout collector consumes:
@@ -399,13 +410,12 @@ class FirecrackerEnv(gymnasium.Env):
             low=-np.inf, high=np.inf,
             shape=(len(OBS_CHANNELS), self.grid_size, self.grid_size), dtype=np.float32,
         )
-        # Each timestep the agent either selects one action-cell of the coarse action grid or
-        # does nothing: a single Discrete index in [0, action_grid_size**2]. Indices
-        # [0, action_grid_size**2) decode row-major to a cell (arow, acol) via _action_to_cell
-        # (index = arow * action_grid_size + acol) -- the same 8x8 sim-cell blocks the hover
-        # overlay highlights -- and the final index (noop_action) is the no-op (do nothing).
-        self.noop_action = self.action_grid_size ** 2
-        self.action_space = spaces.Discrete(self.noop_action + 1)
+        # An action-cell is selected over two consecutive steps (first a row, then a column), each a
+        # Discrete index in [0, action_grid_size) -- no dedicated no-op action, so the space is
+        # action_grid_size (= 32). A completed selection only "goes through" when the chosen cell or
+        # one of its 8 neighbouring action-cells contains fire (_action_cell_near_fire); over a
+        # fire-free neighbourhood it is implicitly a no-op (nothing selected). See _select_action.
+        self.action_space = spaces.Discrete(self.action_grid_size)
 
         # Simulation state (populated by reset)
         self._air_temperatures: np.ndarray | None = None
@@ -447,8 +457,13 @@ class FirecrackerEnv(gymnasium.Env):
         self._radiant_flux_surface: pygame.Surface | None = None
         self._terrain_surface: pygame.Surface | None = None
         self._column_height_surface: pygame.Surface | None = None
-        # Reusable translucent white square blitted over the hovered action-cell (built lazily).
-        self._action_highlight_surface: pygame.Surface | None = None
+        # Reusable translucent white fills for the action highlight, cached by (w, h) pixel size.
+        self._alpha_rect_cache: dict[tuple[int, int], pygame.Surface] = {}
+        # White-flash feedback for a valid action: the flashed action-cell and the monotonic time
+        # the flash fades out at, plus a cached solid-white square reused (via set_alpha) each frame.
+        self._action_flash_cell: tuple[int, int] | None = None
+        self._action_flash_until: float = 0.0
+        self._flash_square: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
         self._show_wind_overlay: bool = False
@@ -548,7 +563,9 @@ class FirecrackerEnv(gymnasium.Env):
             self._fuel_temp_display_scale = float(self._fuel_temperatures.max())
             self._radiant_flux_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._last_radiant_flux.max())
         self._step_count = 0
+        self._pending_action_row = None
         self._selected_action_cell = None
+        self._action_flash_cell = None
         self._running = True
         self._paused = False
         self._reset_requested = False
@@ -557,30 +574,70 @@ class FirecrackerEnv(gymnasium.Env):
 
         return self._observation(), self._build_info()
 
-    def _action_to_cell(self, action: int) -> tuple[int, int] | None:
-        """Decode a Discrete action index into the (arow, acol) action-cell it selects.
+    def _select_action(self, action: int) -> None:
+        """Advance the two-step row-then-column selection with this tick's Discrete action.
 
-        Indices in [0, action_grid_size**2) map row-major to a cell (index = arow *
-        action_grid_size + acol); the final index (noop_action) is the no-op and returns None.
-        Raises if the index is outside the action space (not in [0, noop_action]).
+        Each action is a row/column index in [0, action_grid_size). With no row pending the action
+        is the row and is stashed; with a row pending it is the column that completes the cell. A
+        completed selection only goes through when the cell or one of its 8 neighbouring action-cells
+        is on fire (_action_cell_near_fire) -- then _selected_action_cell is set and, when rendering,
+        the cell is flashed white; over a fire-free neighbourhood it is a no-op (nothing selected).
+        Raises if the index is outside the action space.
         """
         action = int(action)
-        if not 0 <= action <= self.noop_action:
+        if not 0 <= action < self.action_grid_size:
             raise ValueError(
                 f"action {action} is out of range for action_space "
-                f"Discrete({self.noop_action + 1})."
+                f"Discrete({self.action_grid_size})."
             )
-        if action == self.noop_action:
-            return None
-        return divmod(action, self.action_grid_size)
+        self._selected_action_cell = None
+        if self._pending_action_row is None:
+            self._pending_action_row = action          # row step: stash the row, await the column
+        else:
+            arow, acol = self._pending_action_row, action
+            self._pending_action_row = None             # column step completes the cell
+            if self._action_cell_near_fire(arow, acol):
+                # Fire in the cell or a neighbour -> the action goes through.
+                self._selected_action_cell = (arow, acol)
+                if self.render_mode is not None:
+                    self._action_flash_cell = (arow, acol)
+                    self._action_flash_until = time.monotonic() + ACTION_FLASH_SECONDS
+            # else: fire-free neighbourhood -> implicit no-op (nothing selected, no flash).
+
+    def _burning_per_type(self) -> torch.Tensor:
+        """(N, H, W) boolean mask of cells currently burning: hot enough to pyrolyse, with fuel and
+        oxygen present. All-False when fire is disabled. Shared by _build_info and the action gate."""
+        if not self._sim.fire_enabled:
+            return torch.zeros_like(self._fuel, dtype=torch.bool)
+        ign = self._sim.ignition_thresholds   # (N, 1, 1)
+        return (
+            (self._fuel_temperatures >= ign)
+            & (self._fuel > self._sim.fuel_burnt_threshold)
+            & (self._oxygen[None] > 0.0)
+        )
+
+    def _action_cell_near_fire(self, arow: int, acol: int) -> bool:
+        """True if the action-cell (arow, acol) or any of its 8 neighbours contains a burning sim
+        cell. An action goes through only when this holds; a fire-free neighbourhood is a no-op."""
+        G, c = self.action_grid_size, self._action_cell_cells
+        burning = self._burning_per_type().any(dim=0)          # (H, W) any-type burning
+        box = burning.reshape(G, c, G, c).any(dim=(1, 3))      # (G, G) burning per action-cell
+        r0, r1 = max(0, arow - 1), min(G, arow + 2)            # 3x3 Moore neighbourhood, clamped
+        c0, c1 = max(0, acol - 1), min(G, acol + 2)
+        return bool(box[r0:r1, c0:c1].any())
 
     def step(
-        self, action: int
+        self, action: int | None
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
-        # Decode the agent's chosen action-cell for this tick (None = the no-op action). The
-        # selection's world effect is not wired in yet, so it is recorded for reward/intervention
-        # logic to read later but does not alter the physics.
-        self._selected_action_cell = self._action_to_cell(action)
+        # Apply the action to the two-step (row, then column) selection, then advance the physics.
+        # action is a Discrete index (row / column / no-op). The interactive runner passes None on
+        # ticks where the user issued nothing, so the world keeps advancing while an in-progress
+        # selection is *held* untouched -- a no-op would instead abort a pending row. There, the
+        # selection is driven live by clicks / the 'n' key (see _handle_events); the agent drives it
+        # through this argument. The selection's world effect is not wired in yet, so the chosen cell
+        # is just recorded for reward/intervention logic to read later.
+        if action is not None:
+            self._select_action(action)
 
         # Advance every field one tick via the shared physics step (the same routine the
         # batched rollout collector uses). The convective transport carries mass and energy
@@ -621,6 +678,7 @@ class FirecrackerEnv(gymnasium.Env):
             if self._show_wind_overlay and self._current_mode in (ViewMode.TEMPERATURE, ViewMode.PRESSURE):
                 self._screen.blit(self._wind_surface, (0, 0))
             self._blit_action_highlight()
+            self._blit_action_flash()
             pygame.display.flip()
             self._clock.tick(TARGET_FPS)
             return None
@@ -645,25 +703,59 @@ class FirecrackerEnv(gymnasium.Env):
     # Internal helpers
     # ---------------------------------------------------------------------------
 
-    def _blit_action_highlight(self) -> None:
-        """Brighten the action-cell currently under the mouse, on top of the active view.
+    def _alpha_rect(self, w: int, h: int) -> pygame.Surface:
+        """A translucent white w x h fill (cached by size) for the action highlight."""
+        surf = self._alpha_rect_cache.get((w, h))
+        if surf is None:
+            surf = pygame.Surface((w, h), pygame.SRCALPHA)
+            surf.fill((255, 255, 255, ACTION_HIGHLIGHT_ALPHA))
+            self._alpha_rect_cache[(w, h)] = surf
+        return surf
 
-        A translucent white square is alpha-blended over the action-cell's pixel block, so the
-        underlying field still reads through but the selected 8x8-cell region stands out. View-mode
-        agnostic and cheap (one cached surface, one blit). No-op when the cursor is off the window.
+    def _blit_action_highlight(self) -> None:
+        """Show what the next left-click will commit in the two-step action selection.
+
+        The two halves of a cell are chosen on separate steps, so the highlight is phase-aware: in
+        the row phase a horizontal band marks the hovered row (a click commits that row), and in the
+        column phase a vertical band marks the hovered column while the already-committed row stays
+        lit (their brighter intersection previews the resulting cell). Translucent white over the
+        active view, so the field still reads through. No-op when the cursor is off the window.
         """
         # get_focused() is true only while the cursor is over the focused window, so this clears
         # the highlight the moment the mouse leaves — more reliable than a WINDOWLEAVE event, which
         # can be missed (leaving a stale cell lit, or jumping to a stray last-motion position).
         if self._hovered_action_cell is None or not pygame.mouse.get_focused():
             return
-        side = self._action_cell_px
-        if self._action_highlight_surface is None:
-            surf = pygame.Surface((side, side), pygame.SRCALPHA)
-            surf.fill((255, 255, 255, ACTION_HIGHLIGHT_ALPHA))
-            self._action_highlight_surface = surf
         arow, acol = self._hovered_action_cell
-        self._screen.blit(self._action_highlight_surface, (acol * side, arow * side))
+        side = self._action_cell_px
+        win = self.grid_size * self._pixel_scale
+        if self._pending_action_row is None:
+            # Row phase: a click commits the hovered row, so band the whole row.
+            self._screen.blit(self._alpha_rect(win, side), (0, arow * side))
+        else:
+            # Column phase: the row is locked; band it plus the hovered column (overlap = the cell).
+            self._screen.blit(self._alpha_rect(win, side), (0, self._pending_action_row * side))
+            self._screen.blit(self._alpha_rect(side, win), (acol * side, 0))
+
+    def _blit_action_flash(self) -> None:
+        """Flash the selected square white for a moment after a valid action goes through.
+
+        Brightest on the tick the action lands, fading to nothing over ACTION_FLASH_SECONDS, so the
+        user sees which selections were valid (near fire) versus a no-op (fire-free neighbourhood).
+        """
+        if self._action_flash_cell is None:
+            return
+        remaining = self._action_flash_until - time.monotonic()
+        if remaining <= 0.0:
+            self._action_flash_cell = None
+            return
+        side = self._action_cell_px
+        if self._flash_square is None:
+            self._flash_square = pygame.Surface((side, side))
+            self._flash_square.fill((255, 255, 255))
+        self._flash_square.set_alpha(int(ACTION_FLASH_ALPHA * remaining / ACTION_FLASH_SECONDS))
+        arow, acol = self._action_flash_cell
+        self._screen.blit(self._flash_square, (acol * side, arow * side))
 
     def _surface_for_mode(self) -> pygame.Surface:
         if self._current_mode == ViewMode.TEMPERATURE:
@@ -799,8 +891,18 @@ class FirecrackerEnv(gymnasium.Env):
                 acol = min(px // self._action_cell_px, self.action_grid_size - 1)
                 self._hovered_action_cell = (arow, acol)
             elif event.type == pygame.MOUSEBUTTONDOWN:
+                px, py = event.pos
                 if event.button == 1:
-                    px, py = event.pos
+                    # Left-click drives the action space live: commit this phase's index from the
+                    # hovered action-cell (its row in the row phase, its column in the column phase),
+                    # walking the same Discrete(action_grid_size + 1) selection the agent does.
+                    # Applied at once so the phase flips on the click itself (works even while
+                    # paused); the physics ticks pass None to hold it between clicks.
+                    arow = min(py // self._action_cell_px, self.action_grid_size - 1)
+                    acol = min(px // self._action_cell_px, self.action_grid_size - 1)
+                    self._select_action(arow if self._pending_action_row is None else acol)
+                elif event.button == 3:
+                    # Right-click ignites a fire patch (sim-cell resolution), as left-click used to.
                     row = min(py // self._pixel_scale, self.grid_size - 1)
                     col = min(px // self._pixel_scale, self.grid_size - 1)
                     fire_click = (row, col)
@@ -824,12 +926,7 @@ class FirecrackerEnv(gymnasium.Env):
 
     def _build_info(self) -> dict:
         wind_speeds = torch.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2)
-        ign = self._sim.ignition_thresholds   # already (N, 1, 1)
-        burning_per_type = (
-            (self._fuel_temperatures >= ign) &
-            (self._fuel > self._sim.fuel_burnt_threshold) &
-            (self._oxygen[None] > 0.0)
-        ) if self._sim.fire_enabled else torch.zeros_like(self._fuel, dtype=torch.bool)
+        burning_per_type = self._burning_per_type()
 
         # Reduce every metric on-device, then pull the whole batch back in a SINGLE
         # host transfer (.tolist()). Doing per-scalar float() instead would force a
@@ -879,6 +976,11 @@ class FirecrackerEnv(gymnasium.Env):
             "terrain_max":     terrain_max,
             "map":             self._current_map,
             "step":            self._step_count,
+            # Two-step action phase: with a row pending the next action is read as the column
+            # (awaiting_column True), otherwise as a row. pending_action_row is that stashed row
+            # (None on a row step). The policy must condition its action on this.
+            "awaiting_column":    self._pending_action_row is not None,
+            "pending_action_row": self._pending_action_row,
         }
         for i, name in enumerate(self._sim.fuel_type_names):
             info[f"fuel_{name}_mean"]      = block[i]
