@@ -675,7 +675,9 @@ class FirecrackerEnv(gymnasium.Env):
             surface = self._surface_for_mode()
             self._screen.fill((0, 0, 0))
             self._screen.blit(surface, (0, 0))
-            if self._show_wind_overlay and self._current_mode in (ViewMode.TEMPERATURE, ViewMode.PRESSURE):
+            # The wind surface is transparent (black colorkey) except for the arrows, so it
+            # overlays any view. Skip WIND, where the arrows are already the primary view.
+            if self._show_wind_overlay and self._current_mode is not ViewMode.WIND:
                 self._screen.blit(self._wind_surface, (0, 0))
             self._blit_action_highlight()
             self._blit_action_flash()
