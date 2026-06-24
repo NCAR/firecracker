@@ -71,6 +71,10 @@ WIND_ARROW_HEAD_ANGLE: float = math.pi / 6  # 30 degrees
 
 FIRE_SPAWN_RADIUS: int = 5
 
+# Alpha of the white rectangle blended over the action-cell under the mouse (0-255):
+# subtle enough that the underlying view still reads clearly.
+ACTION_HIGHLIGHT_ALPHA: int = 80
+
 # ---------------------------------------------------------------------------
 # View modes
 # ---------------------------------------------------------------------------
@@ -356,6 +360,31 @@ class FirecrackerEnv(gymnasium.Env):
         self.render_mode = render_mode
         self._pixel_scale = self.window_size // self.grid_size
 
+        # Coarse action grid: the sim grid is divided into action_grid_size x action_grid_size
+        # action-cells, each a square block of (grid_size / action_grid_size) sim cells. Used for
+        # the hover-highlight overlay (and a future grid action space), so it must tile the grid
+        # evenly. Precompute the action-cell side in sim cells and in display pixels.
+        action_cfg = (config or {}).get("action", {})
+        specified_action_grid = action_cfg.get("grid_size")
+        if specified_action_grid is not None:
+            # An explicit value must tile the grid evenly — surface a clear error if it doesn't.
+            self.action_grid_size = int(specified_action_grid)
+            if self.action_grid_size < 1 or self.grid_size % self.action_grid_size != 0:
+                raise ValueError(
+                    f"action.grid_size ({self.action_grid_size}) must be a positive divisor of "
+                    f"environment.grid_size ({self.grid_size})."
+                )
+        else:
+            # Unspecified: use the default unless it doesn't divide this grid (e.g. small test
+            # grids), in which case fall back to a per-cell action grid so any grid_size works.
+            default = 32
+            self.action_grid_size = default if self.grid_size % default == 0 else self.grid_size
+        self._action_cell_cells = self.grid_size // self.action_grid_size
+        self._action_cell_px = self._action_cell_cells * self._pixel_scale
+        # Action-cell (arow, acol) currently under the mouse, or None when the cursor is
+        # outside the window. Drawn as a brightening overlay each frame (render).
+        self._hovered_action_cell: tuple[int, int] | None = None
+
         # reset/step return the same world-model observation the rollout collector consumes:
         # the normalized multi-channel stack produced by Simulation.build_observation
         # (OBS_CHANNELS). Channels are mapped to roughly [0, 1] by their affine windows, but the
@@ -408,6 +437,8 @@ class FirecrackerEnv(gymnasium.Env):
         self._radiant_flux_surface: pygame.Surface | None = None
         self._terrain_surface: pygame.Surface | None = None
         self._column_height_surface: pygame.Surface | None = None
+        # Reusable translucent white square blitted over the hovered action-cell (built lazily).
+        self._action_highlight_surface: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
         self._show_wind_overlay: bool = False
@@ -556,6 +587,7 @@ class FirecrackerEnv(gymnasium.Env):
             self._screen.blit(surface, (0, 0))
             if self._show_wind_overlay and self._current_mode in (ViewMode.TEMPERATURE, ViewMode.PRESSURE):
                 self._screen.blit(self._wind_surface, (0, 0))
+            self._blit_action_highlight()
             pygame.display.flip()
             self._clock.tick(TARGET_FPS)
             return None
@@ -579,6 +611,26 @@ class FirecrackerEnv(gymnasium.Env):
     # ---------------------------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------------------------
+
+    def _blit_action_highlight(self) -> None:
+        """Brighten the action-cell currently under the mouse, on top of the active view.
+
+        A translucent white square is alpha-blended over the action-cell's pixel block, so the
+        underlying field still reads through but the selected 8x8-cell region stands out. View-mode
+        agnostic and cheap (one cached surface, one blit). No-op when the cursor is off the window.
+        """
+        # get_focused() is true only while the cursor is over the focused window, so this clears
+        # the highlight the moment the mouse leaves — more reliable than a WINDOWLEAVE event, which
+        # can be missed (leaving a stale cell lit, or jumping to a stray last-motion position).
+        if self._hovered_action_cell is None or not pygame.mouse.get_focused():
+            return
+        side = self._action_cell_px
+        if self._action_highlight_surface is None:
+            surf = pygame.Surface((side, side), pygame.SRCALPHA)
+            surf.fill((255, 255, 255, ACTION_HIGHLIGHT_ALPHA))
+            self._action_highlight_surface = surf
+        arow, acol = self._hovered_action_cell
+        self._screen.blit(self._action_highlight_surface, (acol * side, arow * side))
 
     def _surface_for_mode(self) -> pygame.Surface:
         if self._current_mode == ViewMode.TEMPERATURE:
@@ -707,6 +759,12 @@ class FirecrackerEnv(gymnasium.Env):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.MOUSEMOTION:
+                # Track which coarse action-cell the cursor sits over (for the hover overlay).
+                px, py = event.pos
+                arow = min(py // self._action_cell_px, self.action_grid_size - 1)
+                acol = min(px // self._action_cell_px, self.action_grid_size - 1)
+                self._hovered_action_cell = (arow, acol)
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     px, py = event.pos

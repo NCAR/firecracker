@@ -220,6 +220,14 @@ minibatch_size = 256       # samples per sample_minibatch() draw
 buffer_device  = "cpu"     # where the sample pool lives ("cpu" or "cuda")
 buffer_dtype   = "float32" # pool storage dtype ("float32" or "float16")
 
+[action]
+# Coarse action grid overlaid on the simulation grid: the map is divided into
+# grid_size x grid_size action-cells, each spanning ([environment].grid_size /
+# action.grid_size) sim cells per side. Hovering the mouse over an action-cell
+# brightens it in the display so the current selection is visible. grid_size must
+# divide [environment].grid_size evenly.
+grid_size = 32   # action-grid cells per side (256 sim cells / 32 -> 8x8 cells each)
+
 [environment]
 # device selects where the simulation tensors live: "cuda" for an NVIDIA GPU,
 # "cpu" to force the CPU. Omit (or leave commented) to auto-select cuda when
