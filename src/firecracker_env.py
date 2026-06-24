@@ -4,7 +4,9 @@ firecracker_env.py
 Gymnasium environment wrapping the Firecracker heat-diffusion simulation.
 Observation: the world-model observation — a normalized (C, grid_size, grid_size) float32
              stack of the OBS_CHANNELS (see Simulation.build_observation).
-Action:      Discrete(1) — single no-op placeholder for future RL action spaces.
+Action:      Discrete(action_grid_size**2 + 1) — each timestep the agent selects one
+             action-cell of the coarse action grid (decoded row-major to (arow, acol)) or
+             the final index, the no-op (do nothing this tick).
 """
 
 import math
@@ -384,6 +386,9 @@ class FirecrackerEnv(gymnasium.Env):
         # Action-cell (arow, acol) currently under the mouse, or None when the cursor is
         # outside the window. Drawn as a brightening overlay each frame (render).
         self._hovered_action_cell: tuple[int, int] | None = None
+        # Action-cell (arow, acol) the agent selected on the last step (None before the first
+        # step). Decoded from the Discrete action; the world effect of selecting it is TBD.
+        self._selected_action_cell: tuple[int, int] | None = None
 
         # reset/step return the same world-model observation the rollout collector consumes:
         # the normalized multi-channel stack produced by Simulation.build_observation
@@ -394,8 +399,13 @@ class FirecrackerEnv(gymnasium.Env):
             low=-np.inf, high=np.inf,
             shape=(len(OBS_CHANNELS), self.grid_size, self.grid_size), dtype=np.float32,
         )
-        # Single no-op action; replace with the real action space when designing the agent.
-        self.action_space = spaces.Discrete(1)
+        # Each timestep the agent either selects one action-cell of the coarse action grid or
+        # does nothing: a single Discrete index in [0, action_grid_size**2]. Indices
+        # [0, action_grid_size**2) decode row-major to a cell (arow, acol) via _action_to_cell
+        # (index = arow * action_grid_size + acol) -- the same 8x8 sim-cell blocks the hover
+        # overlay highlights -- and the final index (noop_action) is the no-op (do nothing).
+        self.noop_action = self.action_grid_size ** 2
+        self.action_space = spaces.Discrete(self.noop_action + 1)
 
         # Simulation state (populated by reset)
         self._air_temperatures: np.ndarray | None = None
@@ -538,6 +548,7 @@ class FirecrackerEnv(gymnasium.Env):
             self._fuel_temp_display_scale = float(self._fuel_temperatures.max())
             self._radiant_flux_display_scale = _DISPLAY_SCALE_MAX_FRACTION * float(self._last_radiant_flux.max())
         self._step_count = 0
+        self._selected_action_cell = None
         self._running = True
         self._paused = False
         self._reset_requested = False
@@ -546,9 +557,31 @@ class FirecrackerEnv(gymnasium.Env):
 
         return self._observation(), self._build_info()
 
+    def _action_to_cell(self, action: int) -> tuple[int, int] | None:
+        """Decode a Discrete action index into the (arow, acol) action-cell it selects.
+
+        Indices in [0, action_grid_size**2) map row-major to a cell (index = arow *
+        action_grid_size + acol); the final index (noop_action) is the no-op and returns None.
+        Raises if the index is outside the action space (not in [0, noop_action]).
+        """
+        action = int(action)
+        if not 0 <= action <= self.noop_action:
+            raise ValueError(
+                f"action {action} is out of range for action_space "
+                f"Discrete({self.noop_action + 1})."
+            )
+        if action == self.noop_action:
+            return None
+        return divmod(action, self.action_grid_size)
+
     def step(
         self, action: int
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
+        # Decode the agent's chosen action-cell for this tick (None = the no-op action). The
+        # selection's world effect is not wired in yet, so it is recorded for reward/intervention
+        # logic to read later but does not alter the physics.
+        self._selected_action_cell = self._action_to_cell(action)
+
         # Advance every field one tick via the shared physics step (the same routine the
         # batched rollout collector uses). The convective transport carries mass and energy
         # (E = m*T) together down the transport potential, fire/radiant/relaxation forcings
