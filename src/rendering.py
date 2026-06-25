@@ -69,8 +69,8 @@ WIND_ARROW_HEAD_ANGLE: float = math.pi / 6  # 30 degrees
 # The legend lives in a fixed-width panel reserved on the right of the window, so the window
 # is permanently this much wider than the simulation. Modes without a colorbar leave it empty.
 # The panel holds up to LEGEND_PANEL_BARS bars side by side (= GUTTER + BARS * COLUMN_WIDTH).
-LEGEND_PANEL_BARS:    int = 2
-LEGEND_COLUMN_WIDTH:  int = 84    # one bar + its tick labels
+LEGEND_PANEL_BARS:    int = 1
+LEGEND_COLUMN_WIDTH:  int = 96    # one bar + its tick labels (room for ~7-char "1.0e+05" mass ticks)
 LEGEND_GUTTER:        int = 8     # left pad inside the panel
 LEGEND_PANEL_WIDTH:   int = LEGEND_GUTTER + LEGEND_PANEL_BARS * LEGEND_COLUMN_WIDTH
 
