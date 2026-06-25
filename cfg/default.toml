@@ -210,12 +210,16 @@ name = ""       # specific map filename to load; empty = pick a random map each 
 # small and decorrelated.
 #
 # Pool memory = (steps // stride) * num_envs * C * N * N * bytes(buffer_dtype). With the
-# defaults below at N=256, C=3: (1024//16) * 64 * 3 * 256*256 * 4 B ~= 3.2 GB. The pool
-# defaults to the CPU; shrink steps/num_envs, raise stride, or set buffer_dtype = "float16"
-# (halves it) to fit your hardware; stepping always runs on the simulation device.
+# defaults below at N=256, C=5: (4096//64) * 64 * 5 * 256*256 * 4 B ~= 5.4 GB per shard. The
+# pool defaults to the CPU; shrink steps/num_envs, raise stride, or set buffer_dtype =
+# "float16" (halves it) to fit your hardware; stepping always runs on the simulation device.
+#
+# Autoencoder pretraining (src/train_autoencoder.py): one "rollout" is a single env's 4096-step
+# trajectory sampled every 64 steps (= 64 observations). Stepping num_envs=64 worlds in parallel
+# for 16 rounds yields 16 * 64 * 64 = 65,536 observations (1024 rollouts) across 16 shards.
 num_envs       = 64        # B: worlds stepped in parallel (sampled with replacement from the maps dir)
-steps          = 1024      # ticks stepped per collect()
-stride         = 16        # store every stride-th frame; pool holds (steps // stride) * num_envs samples
+steps          = 4096      # ticks stepped per collect()
+stride         = 64        # store every stride-th frame; pool holds (steps // stride) * num_envs samples
 minibatch_size = 256       # samples per sample_minibatch() draw
 buffer_device  = "cpu"     # where the sample pool lives ("cpu" or "cuda")
 buffer_dtype   = "float32" # pool storage dtype ("float32" or "float16")
