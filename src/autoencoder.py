@@ -11,22 +11,26 @@ convs do all the learning:
     DownBlock : 3x3 (same) conv -> PixelUnshuffle(2) -> 1x1 conv   (H/W halve, channels set)
     UpBlock   : 1x1 conv -> PixelShuffle(2) -> 3x3 (same) conv     (H/W double, channels set)
 
-The encoder is a stack of DownBlocks feeding a linear bottleneck (the latent code); the
+The encoder is a stack of DownBlocks that halve H/W and fold detail into channels at every
+stage, ending at a fully-convolutional spatial latent (no flatten, no dense bottleneck); the
 decoder mirrors it with a stack of UpBlocks back to the original `C x N x N` shape. This is a
 baseline for compressing the world-model observation stack (see
 `Simulation.build_observation` / `OBS_CHANNELS`).
 
-The grid size `N` must be divisible by `2 ** len(channels)` so every shuffle stage lands on
-an integer spatial size.
+With the default eight stages on a 256x256 input the latent is a 1x1x1024 feature map, fed
+straight into the decoder. The grid size `N` must be divisible by `2 ** len(channels)` so every
+shuffle stage lands on an integer spatial size; choose `channels` so the final spatial size is
+whatever latent footprint you want (1x1 for a pure vector latent).
 
 Quick use:
 
     import torch
     from autoencoder import ConvAutoencoder
 
-    model = ConvAutoencoder(in_channels=3, grid_size=256, channels=(32, 64, 128), latent_dim=256)
-    x = torch.randn(8, 3, 256, 256)       # a B x C x N x N batch
-    x_hat, z = model(x)                   # reconstruction and latent code
+    model = ConvAutoencoder(in_channels=5, grid_size=256,
+                            channels=(8, 16, 32, 64, 128, 256, 512, 1024))
+    x = torch.randn(8, 5, 256, 256)       # a B x C x N x N batch
+    x_hat, z = model(x)                   # reconstruction and B x 1024 x 1 x 1 latent map
     loss = torch.nn.functional.mse_loss(x_hat, x)
 """
 
@@ -82,14 +86,12 @@ class UpBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """Stack of DownBlocks followed by a flatten + linear projection to the latent code."""
+    """Stack of DownBlocks producing a spatial latent feature map (no flatten/projection)."""
 
     def __init__(
         self,
         in_channels: int,
         channels: Sequence[int],
-        bottleneck_numel: int,
-        latent_dim: int,
         activation: type[nn.Module] = nn.ReLU,
     ) -> None:
         super().__init__()
@@ -97,31 +99,21 @@ class Encoder(nn.Module):
         self.blocks = nn.Sequential(
             *(DownBlock(widths[i], widths[i + 1], activation) for i in range(len(channels)))
         )
-        self.to_latent = nn.Sequential(nn.Flatten(), nn.Linear(bottleneck_numel, latent_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.to_latent(self.blocks(x))
+        return self.blocks(x)
 
 
 class Decoder(nn.Module):
-    """Linear projection from the latent code, reshaped to the bottleneck feature map, then a
-    stack of UpBlocks back to the original image."""
+    """Stack of UpBlocks mapping the spatial latent feature map back to the original image."""
 
     def __init__(
         self,
         in_channels: int,
         channels: Sequence[int],
-        bottleneck_ch: int,
-        bottleneck_size: int,
-        latent_dim: int,
         activation: type[nn.Module] = nn.ReLU,
     ) -> None:
         super().__init__()
-        self._bottleneck_ch = bottleneck_ch
-        self._bottleneck_size = bottleneck_size
-
-        self.from_latent = nn.Linear(latent_dim, bottleneck_ch * bottleneck_size * bottleneck_size)
-
         rev = list(reversed(channels))
         out_widths = [*rev[1:], in_channels]
         self.blocks = nn.Sequential(
@@ -132,9 +124,7 @@ class Decoder(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.from_latent(z)
-        h = h.view(-1, self._bottleneck_ch, self._bottleneck_size, self._bottleneck_size)
-        return self.blocks(h)
+        return self.blocks(z)
 
 
 class ConvAutoencoder(nn.Module):
@@ -143,17 +133,20 @@ class ConvAutoencoder(nn.Module):
     Args:
         in_channels: number of input channels (e.g. len(OBS_CHANNELS)).
         grid_size:   spatial size N of the square input; must be divisible by 2**len(channels).
-        channels:    encoder channel widths, one per downsampling stage.
-        latent_dim:  size of the bottleneck (the latent code).
+        channels:    encoder channel widths, one per downsampling stage. The last entry is the
+                     latent channel count; len(channels) sets how far H/W are halved.
         activation:  activation module class used between conv layers.
+
+    The latent is the encoder's output feature map, of shape
+    `(channels[-1], N // 2**len(channels), N // 2**len(channels))`. With the defaults
+    (N=256, eight stages) that is `1024 x 1 x 1`, fed straight into the decoder.
     """
 
     def __init__(
         self,
         in_channels: int = 5,
         grid_size: int = 256,
-        channels: Sequence[int] = (32, 64, 128),
-        latent_dim: int = 256,
+        channels: Sequence[int] = (8, 16, 32, 64, 128, 256, 512, 1024),
         activation: type[nn.Module] = nn.ReLU,
     ) -> None:
         super().__init__()
@@ -165,22 +158,19 @@ class ConvAutoencoder(nn.Module):
 
         self.in_channels = in_channels
         self.grid_size = grid_size
-        self.latent_dim = latent_dim
-        bottleneck_size = grid_size // (2 ** n_stages)
-        bottleneck_ch = channels[-1]
-        bottleneck_numel = bottleneck_ch * bottleneck_size * bottleneck_size
+        self.latent_channels = channels[-1]
+        self.latent_size = grid_size // (2 ** n_stages)
+        self.latent_dim = self.latent_channels * self.latent_size * self.latent_size
 
-        self.encoder = Encoder(in_channels, channels, bottleneck_numel, latent_dim, activation)
-        self.decoder = Decoder(
-            in_channels, channels, bottleneck_ch, bottleneck_size, latent_dim, activation
-        )
+        self.encoder = Encoder(in_channels, channels, activation)
+        self.decoder = Decoder(in_channels, channels, activation)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Map a B x C x N x N batch to its B x latent_dim code."""
+        """Map a B x C x N x N batch to its B x latent_channels x h x w latent feature map."""
         return self.encoder(x)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Map a B x latent_dim code back to a B x C x N x N reconstruction."""
+        """Map a B x latent_channels x h x w latent map back to a B x C x N x N reconstruction."""
         return self.decoder(z)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

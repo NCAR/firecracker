@@ -182,9 +182,10 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true",
                         help="use mixed-precision autocast + GradScaler (CUDA only)")
     # Model
-    parser.add_argument("--latent-dim", type=int, default=256, help="bottleneck latent size")
-    parser.add_argument("--channels", type=_parse_channels, default=(32, 64, 128),
-                        help="encoder channel widths per downsample stage, e.g. 32,64,128")
+    parser.add_argument("--channels", type=_parse_channels,
+                        default=(8, 16, 32, 64, 128, 256, 512, 1024),
+                        help="encoder channel widths per downsample stage; the last is the "
+                             "latent channel count, e.g. 8,16,32,64,128,256,512,1024")
     # Bookkeeping
     parser.add_argument("--out", default="checkpoints", help="dir to write checkpoints into")
     parser.add_argument("--save-interval", type=int, default=5,
@@ -232,10 +233,10 @@ def main() -> None:
         in_channels=in_channels,
         grid_size=grid_size,
         channels=args.channels,
-        latent_dim=args.latent_dim,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model: channels={args.channels} latent_dim={args.latent_dim} params={n_params:,}")
+    latent_shape = f"{model.latent_channels}x{model.latent_size}x{model.latent_size}"
+    print(f"model: channels={args.channels} latent={latent_shape} params={n_params:,}")
 
     loss_fn = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -248,7 +249,6 @@ def main() -> None:
         "in_channels": in_channels,
         "grid_size": grid_size,
         "channels": list(args.channels),
-        "latent_dim": args.latent_dim,
     }
 
     def save_checkpoint(path: Path, epoch: int, val_loss: float) -> None:
