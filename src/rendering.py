@@ -49,6 +49,13 @@ DISPLAY_MIN_TEMP_SPAN_K: float = 50.0
 # so the ramp resolves flame structure instead of saturating just above ignition.
 FIRE_COLOR_TEMP_SPAN_K:  float = 1600.0
 
+# Oxygen views map a fixed window [floor, ceiling] of O2 partial density [kg/m^3] onto the
+# grayscale ramp: at/below the floor renders fully scarce (white), at/above the ceiling fully
+# plentiful (black). Fixed bounds keep the scale stable frame-to-frame instead of tracking the
+# live max, so the same gray always means the same O2 density.
+DISPLAY_OXYGEN_FLOOR:   float = 0.20
+DISPLAY_OXYGEN_CEILING: float = 0.28
+
 WIND_ARROW_STRIDE: int = 16
 WIND_ARROW_LENGTH: int = 24
 WIND_ARROW_LINE_WIDTH: int = 1
@@ -257,13 +264,12 @@ def build_wind_surface(
     return surface
 
 
-def build_oxygen_surface(
-    oxygen: np.ndarray, scale: int, display_max: float | None = None
-) -> pygame.Surface:
-    # O2 is a partial density [kg/m^3]; normalise against the current max so the
-    # grayscale ramp reads black = most oxygen, white = least (see oxygen_colormap).
-    o_max = float(oxygen.max()) if display_max is None else display_max
-    normalized = oxygen / o_max if o_max > 0.0 else np.zeros_like(oxygen)
+def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
+    # O2 is a partial density [kg/m^3]; map the fixed window [floor, ceiling] onto the
+    # grayscale ramp, so it reads black = most oxygen, white = least (see oxygen_colormap)
+    # with O2 at/below the floor rendering as fully scarce.
+    span = DISPLAY_OXYGEN_CEILING - DISPLAY_OXYGEN_FLOOR
+    normalized = (oxygen - DISPLAY_OXYGEN_FLOOR) / span
     return _render_field(normalized, scale, oxygen_colormap)
 
 

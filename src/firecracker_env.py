@@ -31,6 +31,8 @@ from rendering import (
     LEGEND_PANEL_WIDTH,
     LEGEND_FONT_SIZE,
     LEGEND_TITLE_FONT_SIZE,
+    DISPLAY_OXYGEN_FLOOR,
+    DISPLAY_OXYGEN_CEILING,
     ColorbarSpec,
     heat_colormap,
     oxygen_colormap,
@@ -221,7 +223,6 @@ class FirecrackerEnv(gymnasium.Env):
         self._air_temp_display_max: float = DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
         self._fuel_temp_display_max: float = 0.0
         self._radiant_flux_display_max: float = 0.0
-        self._oxygen_display_max: float = 0.0
         self._pressure_display_max: float = 0.0
         self._terrain_display_max: float = 0.0
         self._column_height_display_max: float = 0.0
@@ -555,7 +556,7 @@ class FirecrackerEnv(gymnasium.Env):
                                  min_ign, min_ign + FIRE_COLOR_TEMP_SPAN_K, celsius)]
         if mode == ViewMode.OXYGEN:
             return [ColorbarSpec("Oxygen", oxygen_colormap,
-                                 0.0, self._oxygen_display_max, lambda v: f"{v:.2f}")]
+                                 DISPLAY_OXYGEN_FLOOR, DISPLAY_OXYGEN_CEILING, lambda v: f"{v:.2f}")]
         if mode == ViewMode.PRESSURE:
             return [ColorbarSpec("Mass", pressure_colormap,
                                  0.0, self._pressure_display_max, lambda v: f"{v:.2g}")]
@@ -636,7 +637,6 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._fuel_temp_display_max = float(fuel_temps.max())
         self._radiant_flux_display_max = float(radiant_flux.max())
-        self._oxygen_display_max = float(oxygen.max())
         self._pressure_display_max = float(pressure_field.max())
         self._terrain_display_max = float(terrain.max())
         self._column_height_display_max = float(column_height.max())
@@ -653,9 +653,7 @@ class FirecrackerEnv(gymnasium.Env):
             ignition_thresholds, self._sim.fuel_burnt_threshold,
             self._show_fire_overlay and self._sim.fire_enabled,
         )
-        self._oxygen_surface = build_oxygen_surface(
-            oxygen, self._pixel_scale, self._oxygen_display_max
-        )
+        self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(
             pressure_field, self._pixel_scale, self._pressure_display_max
         )
