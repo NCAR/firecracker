@@ -39,24 +39,15 @@ GREEN_CHANNEL: int = 1
 
 _WIND_DISPLAY_THRESHOLD:       float = 1e-4
 
-# Temperature views map a Kelvin window onto the color ramp. The air-temperature view
-# uses a fixed ambient fire-weather window (fire pushes air above the ceiling and simply
-# saturates to the hot color); the fuel-temperature view shares the floor but tracks its
-# ceiling to the (EMA-smoothed) peak so flame structure stays visible.
+# Temperature views map a Kelvin window onto the color ramp: a shared ambient floor up to a
+# ceiling that tracks the live peak over all cells (clamped to a minimum span so a near-uniform
+# field doesn't over-stretch the ramp).
 DISPLAY_TEMP_FLOOR_K:    float = 290.0
-DISPLAY_AIR_TEMP_CEIL_K: float = 330.0
 DISPLAY_MIN_TEMP_SPAN_K: float = 50.0
 # Kelvin above ignition that spans the fire-overlay color ramp (ignition -> +span). Sized to
 # the SI flame band: ignition ~550-600 K up through a sustained ~1540 K front to ~2400 K peaks,
 # so the ramp resolves flame structure instead of saturating just above ignition.
 FIRE_COLOR_TEMP_SPAN_K:  float = 1600.0
-
-# EMA weight for the upper bound of the fuel-temperature and radiant-heat color
-# scales. Smaller = steadier (slower to track the peak); larger = more responsive.
-DISPLAY_SCALE_EMA_ALPHA: float = 0.1
-# Fraction of the frame max the radiant-heat EMA tracks toward, so cells at/above this
-# fraction of the smoothed peak saturate to the top color.
-DISPLAY_SCALE_MAX_FRACTION: float = 0.5
 
 WIND_ARROW_STRIDE: int = 16
 WIND_ARROW_LENGTH: int = 24

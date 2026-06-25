@@ -25,10 +25,7 @@ from map_loader import load_map, resolve_map, validate_against_config
 # constants. This module orchestrates them against env state; it never draws a pixel itself.
 from rendering import (
     DISPLAY_TEMP_FLOOR_K,
-    DISPLAY_AIR_TEMP_CEIL_K,
     DISPLAY_MIN_TEMP_SPAN_K,
-    DISPLAY_SCALE_EMA_ALPHA,
-    DISPLAY_SCALE_MAX_FRACTION,
     FIRE_COLOR_TEMP_SPAN_K,
     KELVIN_TO_CELSIUS,
     LEGEND_PANEL_WIDTH,
@@ -217,17 +214,20 @@ class FirecrackerEnv(gymnasium.Env):
         self._terrain_stats: list[float] = [0.0, 0.0, 0.0]   # (mean, min, max), set at reset
         self._last_radiant_flux: np.ndarray | None = None
         self._current_map: str | None = None   # filename of the loaded map
-        # EMA-smoothed upper bounds for the mode 6 / mode 7 color scales.
-        self._fuel_temp_display_scale: float = 0.0
-        self._radiant_flux_display_scale: float = 0.0
         # Per-mode color-scale windows captured while building the surfaces, so each colorbar
-        # labels the exact range its (cached) field was normalised over. Set in
-        # _rebuild_surfaces_if_dirty; the defaults keep a legend valid before the first build.
+        # labels the exact range its (cached) field was normalised over. Each is the live max
+        # over all cells. Set in _rebuild_surfaces_if_dirty; the defaults keep a legend valid
+        # before the first build.
+        self._air_temp_display_max: float = DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
+        self._fuel_temp_display_max: float = 0.0
+        self._radiant_flux_display_max: float = 0.0
         self._oxygen_display_max: float = 0.0
         self._pressure_display_max: float = 0.0
         self._terrain_display_max: float = 0.0
         self._column_height_display_max: float = 0.0
-        self._wind_temp_window: tuple[float, float] = (DISPLAY_TEMP_FLOOR_K, DISPLAY_AIR_TEMP_CEIL_K)
+        self._wind_temp_window: tuple[float, float] = (
+            DISPLAY_TEMP_FLOOR_K, DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
+        )
         self._step_count: int = 0
 
         # Rendering state
@@ -346,14 +346,6 @@ class FirecrackerEnv(gymnasium.Env):
         self._last_radiant_flux = torch.zeros(
             (self.grid_size, self.grid_size), dtype=self._sim.dtype, device=self._sim.device
         )
-        # Seed the display scales from the initial state so the first frames are scaled
-        # sanely. These drive the mode 6/7 color scales only, so they (and their host
-        # syncs) are skipped entirely on the headless training path (render_mode=None).
-        if self.render_mode is not None:
-            # Fuel-temp scale tracks the actual peak (it is used as the color ceiling);
-            # radiant flux is anchored at 0, so it tracks a fraction of its peak.
-            self._fuel_temp_display_scale = float(self._fuel_temperatures.max())
-            self._radiant_flux_display_scale = DISPLAY_SCALE_MAX_FRACTION * float(self._last_radiant_flux.max())
         self._step_count = 0
         self._pending_action_row = None
         self._selected_action_cell = None
@@ -436,18 +428,6 @@ class FirecrackerEnv(gymnasium.Env):
         # (E = m*T) together down the transport potential, fire/radiant/relaxation forcings
         # follow, and the diagnostic wind is refreshed for the next tick's oxygen advection.
         self._store_field_state(self._sim.step_fields(self._field_state()))
-        # Track EMA-smoothed peaks (toward a fraction of the max) so the mode 6 / mode 7
-        # color scales don't flicker. Display-only, so the host syncs are skipped on the
-        # headless training path (render_mode=None).
-        if self.render_mode is not None:
-            a = DISPLAY_SCALE_EMA_ALPHA
-            f = DISPLAY_SCALE_MAX_FRACTION
-            self._fuel_temp_display_scale = (
-                a * float(self._fuel_temperatures.max()) + (1.0 - a) * self._fuel_temp_display_scale
-            )
-            self._radiant_flux_display_scale = (
-                a * f * float(self._last_radiant_flux.max()) + (1.0 - a) * self._radiant_flux_display_scale
-            )
         self._step_count += 1
         self._surfaces_dirty = True
 
@@ -563,7 +543,7 @@ class FirecrackerEnv(gymnasium.Env):
         mode = self._current_mode
         if mode == ViewMode.TEMPERATURE:
             return [ColorbarSpec("Air temp", heat_colormap,
-                                 DISPLAY_TEMP_FLOOR_K, DISPLAY_AIR_TEMP_CEIL_K, celsius)]
+                                 DISPLAY_TEMP_FLOOR_K, self._air_temp_display_max, celsius)]
         if mode == ViewMode.WIND:
             # The arrows are tinted by air temperature; the bar shows that same window.
             lo, hi = self._wind_temp_window
@@ -581,10 +561,10 @@ class FirecrackerEnv(gymnasium.Env):
                                  0.0, self._pressure_display_max, lambda v: f"{v:.2g}")]
         if mode == ViewMode.RADIANT_HEAT:
             return [ColorbarSpec("Radiant", radiant_heat_colormap,
-                                 0.0, self._radiant_flux_display_scale, lambda v: f"{v:.0f}")]
+                                 0.0, self._radiant_flux_display_max, lambda v: f"{v:.0f}")]
         if mode == ViewMode.FUEL_TEMPERATURE:
             # Matches build_color_surface's ceiling in _rebuild_surfaces_if_dirty.
-            ceil = max(DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_scale)
+            ceil = max(DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_max)
             return [ColorbarSpec("Fuel temp", heat_colormap,
                                  DISPLAY_TEMP_FLOOR_K, ceil, celsius)]
         if mode == ViewMode.TERRAIN:
@@ -645,10 +625,17 @@ class FirecrackerEnv(gymnasium.Env):
         )
         ignition_thresholds = _to_numpy(self._sim.ignition_thresholds).reshape(-1)
         terrain = _to_numpy(self._terrain)
+        radiant_flux = _to_numpy(self._last_radiant_flux)
         wind_ref = float(np.sqrt(wx ** 2 + wy ** 2).max())
 
-        # Capture each mode's color-scale window once, then feed the same value to the surface
-        # and (via _legend_specs) its colorbar, so the bar's labels match the rendered field.
+        # Capture each mode's color-scale ceiling (the live max over all cells) once, then feed
+        # the same value to the surface and (via _legend_specs) its colorbar, so the bar's labels
+        # match the rendered field.
+        self._air_temp_display_max = max(
+            DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, float(temp.max())
+        )
+        self._fuel_temp_display_max = float(fuel_temps.max())
+        self._radiant_flux_display_max = float(radiant_flux.max())
         self._oxygen_display_max = float(oxygen.max())
         self._pressure_display_max = float(pressure_field.max())
         self._terrain_display_max = float(terrain.max())
@@ -656,7 +643,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._wind_temp_window = wind_temp_window(wx, wy, temp, wind_ref)
 
         self._color_surface = build_color_surface(
-            temp, self._pixel_scale, DISPLAY_TEMP_FLOOR_K, DISPLAY_AIR_TEMP_CEIL_K,
+            temp, self._pixel_scale, DISPLAY_TEMP_FLOOR_K, self._air_temp_display_max,
         )
         self._wind_surface = build_wind_surface(
             wx, wy, temp, self._pixel_scale, wind_ref,
@@ -672,17 +659,16 @@ class FirecrackerEnv(gymnasium.Env):
         self._pressure_surface = build_pressure_surface(
             pressure_field, self._pixel_scale, self._pressure_display_max
         )
-        # Fuel-temperature view: floor at ambient, ceiling tracks the smoothed peak
-        # (clamped to a minimum span so a cold map doesn't over-stretch the ramp).
+        # Fuel-temperature view: floor at ambient, ceiling at the live peak (clamped to a
+        # minimum span so a cold map doesn't over-stretch the ramp).
         fuel_temp_ceil = max(
-            DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_scale
+            DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_max
         )
         self._fuel_temperature_surface = build_color_surface(
             fuel_temps.max(axis=0), self._pixel_scale, DISPLAY_TEMP_FLOOR_K, fuel_temp_ceil,
         )
         self._radiant_flux_surface = build_radiant_heat_surface(
-            _to_numpy(self._last_radiant_flux), self._pixel_scale,
-            upper_bound=self._radiant_flux_display_scale,
+            radiant_flux, self._pixel_scale, upper_bound=self._radiant_flux_display_max,
         )
         # Static after reset, but rebuilt with the batch for consistency (cost is negligible).
         self._terrain_surface = build_terrain_surface(
