@@ -12,13 +12,20 @@ Action:      Discrete(action_grid_size) — an action-cell is selected over two 
 
 import math
 import time
+from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 import numpy as np
 import torch
 import pygame
 import gymnasium
 from gymnasium import spaces
+
+# A colormap maps an array of normalized values in [0, 1] (any shape) to RGB along a new
+# trailing axis, returning uint8 (..., 3). The same callable drives a view's pixel surface
+# and its colorbar legend, so the bar always matches the field. See heat_colormap.
+Colormap = Callable[[np.ndarray], np.ndarray]
 
 from simulation import OBS_CHANNELS, Simulation, SimState
 from map_loader import load_map, resolve_map, validate_against_config
@@ -40,7 +47,6 @@ TARGET_FPS: int = 60
 MAX_CHANNEL_VALUE: int = 255
 RED_CHANNEL: int = 0
 GREEN_CHANNEL: int = 1
-BLUE_CHANNEL: int = 2
 
 # ---------------------------------------------------------------------------
 # Wind arrow visualization parameters
@@ -85,6 +91,36 @@ ACTION_FLASH_ALPHA: int = 230
 ACTION_FLASH_SECONDS: float = 0.35
 
 # ---------------------------------------------------------------------------
+# Colorbar legend (right-side panel)
+# ---------------------------------------------------------------------------
+
+# The legend lives in a fixed-width panel reserved on the right of the window, so the window
+# is permanently this much wider than the simulation. Modes without a colorbar leave it empty.
+# The panel holds up to LEGEND_PANEL_BARS bars side by side (= GUTTER + BARS * COLUMN_WIDTH).
+LEGEND_PANEL_BARS:    int = 2
+LEGEND_COLUMN_WIDTH:  int = 84    # one bar + its tick labels
+LEGEND_GUTTER:        int = 8     # left pad inside the panel
+LEGEND_PANEL_WIDTH:   int = LEGEND_GUTTER + LEGEND_PANEL_BARS * LEGEND_COLUMN_WIDTH
+
+LEGEND_BAR_X:          int = 8    # gradient left edge within a column
+LEGEND_BAR_WIDTH:      int = 22
+LEGEND_BAR_PAD_TOP:    int = 26   # room above the bar for the title
+LEGEND_BAR_PAD_BOTTOM: int = 14
+LEGEND_TITLE_Y:        int = 6
+LEGEND_TICKS:          int = 5    # numeric labels along each bar (top, bottom, and 3 between)
+LEGEND_TICK_LEN:       int = 5    # tick mark length in px
+LEGEND_LABEL_GAP:      int = 3    # gap between tick mark and its text
+LEGEND_FONT_SIZE:      int = 18
+LEGEND_TITLE_FONT_SIZE: int = 19
+
+LEGEND_BG:     tuple[int, int, int] = (0, 0, 0)
+LEGEND_BORDER: tuple[int, int, int] = (90, 90, 90)
+LEGEND_TEXT:   tuple[int, int, int] = (220, 220, 220)
+
+# Kelvin -> Celsius offset, for temperature tick labels.
+KELVIN_TO_CELSIUS: float = 273.15
+
+# ---------------------------------------------------------------------------
 # View modes
 # ---------------------------------------------------------------------------
 
@@ -110,30 +146,88 @@ MODE_KEYS: dict[int, ViewMode] = {
 # Surface builders
 # ---------------------------------------------------------------------------
 
-def build_color_surface(
-    field: np.ndarray, scale: int, lo: float, hi: float
-) -> pygame.Surface:
-    """Map a temperature field [K] linearly over the window [lo, hi] onto the heat ramp.
+# ---------------------------------------------------------------------------
+# Colormaps
+#
+# A Colormap maps normalized values in [0, 1] (any shape) to (..., 3) uint8 RGB. Every
+# field-fill view (all modes except FIRE, which paints fuel/flames directly) owns one and
+# uses it for both its pixel surface and its colorbar legend, so the bar can never disagree
+# with the field. Each builder does its own normalization (fixed window, min-max, or anchored
+# at zero) and hands the result to its colormap.
+# ---------------------------------------------------------------------------
 
-    Values at/below lo render dark; at/above hi saturate to the hot color.
+def heat_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Temperature ramp: near-black at 0, saturated red at 1 (TEMPERATURE / FUEL_TEMPERATURE)."""
+    n = np.clip(normalized, 0.0, 1.0)
+    return np.stack([n * 255, (1.0 - n) * 15, (1.0 - n) * 31], axis=-1).astype(np.uint8)
+
+
+def oxygen_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Oxygen ramp (grayscale): white where O2 is scarce (0), black where it is plentiful (1)."""
+    n = np.clip(normalized, 0.0, 1.0)
+    v = (1.0 - n) * MAX_CHANNEL_VALUE
+    return np.stack([v, v, v], axis=-1).astype(np.uint8)
+
+
+def pressure_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Pressure/mass ramp: black at 0 up to saturated blue at 1."""
+    n = np.clip(normalized, 0.0, 1.0)
+    zeros = np.zeros_like(n)
+    return np.stack([zeros, zeros, n * MAX_CHANNEL_VALUE], axis=-1).astype(np.uint8)
+
+
+def radiant_heat_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Radiant-heat ramp: black at 0 up to magenta at 1."""
+    n = np.clip(normalized, 0.0, 1.0)
+    return np.stack([n * MAX_CHANNEL_VALUE, n * 80, n * MAX_CHANNEL_VALUE], axis=-1).astype(np.uint8)
+
+
+def terrain_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Elevation relief: dark green valleys (0) up to white peaks (1)."""
+    n = np.clip(normalized, 0.0, 1.0)
+    return np.stack(
+        [n * MAX_CHANNEL_VALUE, 60.0 + n * (MAX_CHANNEL_VALUE - 60.0), n * MAX_CHANNEL_VALUE], axis=-1
+    ).astype(np.uint8)
+
+
+def column_height_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Column-top height ramp: dark (short columns, 0) up to bright cyan (tall columns, 1)."""
+    n = np.clip(normalized, 0.0, 1.0)
+    return np.stack([n * 40, n * MAX_CHANNEL_VALUE, n * MAX_CHANNEL_VALUE], axis=-1).astype(np.uint8)
+
+
+def wind_temp_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Wind-arrow color ramp by air temperature: cool blue (0) through to warm red (1)."""
+    n = np.clip(normalized, 0.0, 1.0)
+    return np.stack([n * MAX_CHANNEL_VALUE, (1.0 - n) * 127, (1.0 - n) * MAX_CHANNEL_VALUE], axis=-1).astype(np.uint8)
+
+
+def _render_field(normalized: np.ndarray, scale: int, cmap: Colormap) -> pygame.Surface:
+    """Map a pre-normalized (H, W) field in [0, 1] through a colormap to a scaled pygame surface.
+
+    The single place field-fill views turn normalized values into pixels, so every mode shares
+    one normalize -> colormap -> blit path (and thus the exact colors its colorbar draws).
     """
-    rows, cols = field.shape
-    span = hi - lo
-    normalized = (
-        np.clip((field - lo) / span, 0.0, 1.0) if span > 0.0 else np.zeros_like(field)
-    )
-    r = (normalized * 255).astype(np.uint8)
-    g = ((1.0 - normalized) * 15).astype(np.uint8)
-    b = ((1.0 - normalized) * 31).astype(np.uint8)
-    rgb = np.stack([
-        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
-    ], axis=-1)
+    rows, cols = normalized.shape
+    rgb = cmap(np.clip(normalized, 0.0, 1.0))             # (rows, cols, 3) uint8
+    rgb_scaled = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     surface = pygame.Surface((cols * scale, rows * scale))
     # surfarray expects (width, height, 3); numpy is (height, width, 3)
-    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
+    pygame.surfarray.blit_array(surface, rgb_scaled.transpose(1, 0, 2))
     return surface
+
+
+def build_color_surface(
+    field: np.ndarray, scale: int, lo: float, hi: float, cmap: Colormap = heat_colormap,
+) -> pygame.Surface:
+    """Map a temperature field [K] linearly over the window [lo, hi] onto a color ramp.
+
+    Values at/below lo render dark; at/above hi saturate to the hot color. The ramp is the
+    colormap cmap (default the heat ramp) — the same callable its colorbar legend uses.
+    """
+    span = hi - lo
+    normalized = (field - lo) / span if span > 0.0 else np.zeros_like(field)
+    return _render_field(normalized, scale, cmap)
 
 
 def build_wind_surface(
@@ -178,7 +272,7 @@ def build_wind_surface(
             cy = (row + 0.5) * scale
 
             heat = (float(air_temperatures[row, col]) - temp_min) / temp_range if temp_range > 0.0 else 0.0
-            color = (int(heat * MAX_CHANNEL_VALUE), int((1.0 - heat) * 127), int((1.0 - heat) * MAX_CHANNEL_VALUE))
+            color = tuple(int(c) for c in wind_temp_colormap(np.asarray(heat)))
 
             start = (int(cx - ux * half_len), int(cy - uy * half_len))
             tip = (int(cx + ux * half_len), int(cy + uy * half_len))
@@ -196,92 +290,44 @@ def build_wind_surface(
 
 
 def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
-    rows, cols = oxygen.shape
-    # O2 is now a partial density [kg/m^3], so normalise against the current max:
-    # black = most oxygen, white = least.
+    # O2 is a partial density [kg/m^3]; normalise against the current max so the
+    # grayscale ramp reads black = most oxygen, white = least (see oxygen_colormap).
     o_max = float(oxygen.max())
-    fraction = oxygen / o_max if o_max > 0.0 else np.zeros_like(oxygen)
-    brightness = ((1.0 - np.clip(fraction, 0.0, 1.0)) * MAX_CHANNEL_VALUE).astype(np.uint8)
-    brightness_scaled = np.repeat(np.repeat(brightness, scale, axis=0), scale, axis=1)
-    rgb = np.stack([brightness_scaled] * 3, axis=-1)
-    surface = pygame.Surface((cols * scale, rows * scale))
-    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
-    return surface
+    normalized = oxygen / o_max if o_max > 0.0 else np.zeros_like(oxygen)
+    return _render_field(normalized, scale, oxygen_colormap)
 
 
 def build_pressure_surface(pressure: np.ndarray, scale: int) -> pygame.Surface:
-    rows, cols = pressure.shape
     # Anchored at zero, normalised by the current max (like the temperature view): a
     # uniform field renders uniformly bright, and a gradient's spread visibly shrinks as
     # it equalises — unlike a min-max scale, which re-stretches the residual every frame.
     p_max = float(pressure.max())
-    normalized = np.clip(pressure / p_max, 0.0, 1.0) if p_max > 0.0 else np.zeros_like(pressure)
-    blue = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
-    blue_scaled = np.repeat(np.repeat(blue, scale, axis=0), scale, axis=1)
-    rgb = np.zeros((rows * scale, cols * scale, 3), dtype=np.uint8)
-    rgb[:, :, BLUE_CHANNEL] = blue_scaled
-    surface = pygame.Surface((cols * scale, rows * scale))
-    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
-    return surface
+    normalized = pressure / p_max if p_max > 0.0 else np.zeros_like(pressure)
+    return _render_field(normalized, scale, pressure_colormap)
 
 
 def build_radiant_heat_surface(
     radiant_flux: np.ndarray, scale: int, upper_bound: float | None = None
 ) -> pygame.Surface:
-    rows, cols = radiant_flux.shape
     # EMA-smoothed upper bound when provided; otherwise fall back to the frame max.
     bound = upper_bound if upper_bound is not None else float(radiant_flux.max())
-    normalized = (np.clip(radiant_flux / bound, 0.0, 1.0) if bound > 0.0 else np.zeros_like(radiant_flux))
-    r = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
-    g = (normalized * 80).astype(np.uint8)
-    b = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
-    rgb = np.stack([
-        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
-    ], axis=-1)
-    surface = pygame.Surface((cols * scale, rows * scale))
-    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
-    return surface
+    normalized = radiant_flux / bound if bound > 0.0 else np.zeros_like(radiant_flux)
+    return _render_field(normalized, scale, radiant_heat_colormap)
 
 
 def build_terrain_surface(terrain: np.ndarray, scale: int) -> pygame.Surface:
-    rows, cols = terrain.shape
     # Terrain is elevation in metres; normalise against the current max for the relief.
     t_max = float(terrain.max())
-    h = np.clip(terrain / t_max, 0.0, 1.0) if t_max > 0.0 else np.zeros_like(terrain)
-    # Elevation relief: dark green valleys -> white peaks.
-    r = (h * MAX_CHANNEL_VALUE).astype(np.uint8)
-    g = (60.0 + h * (MAX_CHANNEL_VALUE - 60.0)).astype(np.uint8)
-    b = (h * MAX_CHANNEL_VALUE).astype(np.uint8)
-    rgb = np.stack([
-        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
-    ], axis=-1)
-    surface = pygame.Surface((cols * scale, rows * scale))
-    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
-    return surface
+    normalized = terrain / t_max if t_max > 0.0 else np.zeros_like(terrain)
+    return _render_field(normalized, scale, terrain_colormap)
 
 
 def build_column_height_surface(height: np.ndarray, scale: int) -> pygame.Surface:
-    rows, cols = height.shape
     # Relief of the air-column top, anchored at zero and normalised by the current max
-    # (like the temperature view): dark = short columns (cold/low terrain), bright cyan =
-    # tall columns (warm/high terrain). Column height is always non-negative.
+    # (like the temperature view). Column height is always non-negative.
     h_max = float(height.max())
-    normalized = np.clip(height / h_max, 0.0, 1.0) if h_max > 0.0 else np.zeros_like(height)
-    r = (normalized * 40).astype(np.uint8)
-    g = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
-    b = (normalized * MAX_CHANNEL_VALUE).astype(np.uint8)
-    rgb = np.stack([
-        np.repeat(np.repeat(r, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(g, scale, axis=0), scale, axis=1),
-        np.repeat(np.repeat(b, scale, axis=0), scale, axis=1),
-    ], axis=-1)
-    surface = pygame.Surface((cols * scale, rows * scale))
-    pygame.surfarray.blit_array(surface, rgb.transpose(1, 0, 2))
-    return surface
+    normalized = height / h_max if h_max > 0.0 else np.zeros_like(height)
+    return _render_field(normalized, scale, column_height_colormap)
 
 
 def build_fire_surface(
@@ -327,6 +373,71 @@ def build_fire_surface(
     surface = pygame.Surface((cols * scale, rows * scale))
     pygame.surfarray.blit_array(surface, rgb_scaled.transpose(1, 0, 2))
     return surface
+
+
+# ---------------------------------------------------------------------------
+# Colorbar legend
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ColorbarSpec:
+    """One scale bar in the legend: a colormap, the value window it spans, a title and a tick
+    formatter. lo/hi are in the field's native units (the same window the surface normalizes
+    over), so the bar and the field share one colormap; tick_label turns a native value into
+    its display string (e.g. Kelvin -> "57°C"). Any view mode supplies a list of these."""
+    title:      str
+    cmap:       Colormap
+    lo:         float
+    hi:         float
+    tick_label: Callable[[float], str]
+
+
+def build_colorbar_column(
+    spec: ColorbarSpec, height: int, bar_font: pygame.font.Font, title_font: pygame.font.Font,
+) -> pygame.Surface:
+    """Render one legend column: a title, a vertical gradient bar (lo at the bottom, hi at the
+    top) and LEGEND_TICKS numeric labels along its right edge."""
+    col = pygame.Surface((LEGEND_COLUMN_WIDTH, height))
+    col.fill(LEGEND_BG)
+
+    bar_x, bar_w = LEGEND_BAR_X, LEGEND_BAR_WIDTH
+    bar_top = LEGEND_BAR_PAD_TOP
+    bar_h = max(1, height - LEGEND_BAR_PAD_TOP - LEGEND_BAR_PAD_BOTTOM)
+
+    # Vertical gradient: row 0 (top) = hi (norm 1), last row (bottom) = lo (norm 0).
+    norm_col = np.linspace(1.0, 0.0, bar_h)            # (bar_h,)
+    rgb = spec.cmap(norm_col)                          # (bar_h, 3) uint8
+    grad = np.repeat(rgb[:, None, :], bar_w, axis=1)   # (bar_h, bar_w, 3)
+    bar_surf = pygame.Surface((bar_w, bar_h))
+    pygame.surfarray.blit_array(bar_surf, grad.transpose(1, 0, 2))
+    col.blit(bar_surf, (bar_x, bar_top))
+    pygame.draw.rect(col, LEGEND_BORDER, (bar_x, bar_top, bar_w, bar_h), 1)
+
+    col.blit(title_font.render(spec.title, True, LEGEND_TEXT), (bar_x, LEGEND_TITLE_Y))
+
+    for i in range(LEGEND_TICKS):
+        frac = i / (LEGEND_TICKS - 1)                  # 0 at the bottom, 1 at the top
+        y = int(bar_top + (1.0 - frac) * (bar_h - 1))
+        value = spec.lo + frac * (spec.hi - spec.lo)
+        pygame.draw.line(col, LEGEND_TEXT, (bar_x + bar_w, y), (bar_x + bar_w + LEGEND_TICK_LEN, y))
+        label = bar_font.render(spec.tick_label(value), True, LEGEND_TEXT)
+        col.blit(label, (bar_x + bar_w + LEGEND_TICK_LEN + LEGEND_LABEL_GAP, y - label.get_height() // 2))
+
+    return col
+
+
+def build_legend_panel(
+    specs: list[ColorbarSpec], height: int,
+    bar_font: pygame.font.Font, title_font: pygame.font.Font,
+) -> pygame.Surface:
+    """The full right-side legend panel: each spec drawn as an adjacent column, left to right."""
+    panel = pygame.Surface((LEGEND_PANEL_WIDTH, height))
+    panel.fill(LEGEND_BG)
+    x = LEGEND_GUTTER
+    for spec in specs:
+        panel.blit(build_colorbar_column(spec, height, bar_font, title_font), (x, 0))
+        x += LEGEND_COLUMN_WIDTH
+    return panel
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +559,9 @@ class FirecrackerEnv(gymnasium.Env):
         # Rendering state
         self._screen: pygame.Surface | None = None
         self._clock: pygame.time.Clock | None = None
+        # Legend fonts: created only in human render mode (None otherwise -> no legend drawn).
+        self._legend_font: pygame.font.Font | None = None
+        self._legend_title_font: pygame.font.Font | None = None
         self._color_surface: pygame.Surface | None = None
         self._wind_surface: pygame.Surface | None = None
         self._fire_surface: pygame.Surface | None = None
@@ -475,11 +589,15 @@ class FirecrackerEnv(gymnasium.Env):
 
         if render_mode == "human":
             pygame.init()
+            pygame.font.init()
             pygame.display.set_caption(WINDOW_TITLE)
-            self._screen = pygame.display.set_mode(
-                (self.grid_size * self._pixel_scale, self.grid_size * self._pixel_scale)
-            )
+            sim_px = self.grid_size * self._pixel_scale
+            # Reserve a fixed legend panel on the right, so the window is permanently wider than
+            # the simulation and the colorbar never overlaps the field.
+            self._screen = pygame.display.set_mode((sim_px + LEGEND_PANEL_WIDTH, sim_px))
             self._clock = pygame.time.Clock()
+            self._legend_font = pygame.font.Font(None, LEGEND_FONT_SIZE)
+            self._legend_title_font = pygame.font.Font(None, LEGEND_TITLE_FONT_SIZE)
 
     def _observation(self) -> np.ndarray:
         """The world-model observation for the current state: a normalized (C, H, W) float32
@@ -681,6 +799,7 @@ class FirecrackerEnv(gymnasium.Env):
                 self._screen.blit(self._wind_surface, (0, 0))
             self._blit_action_highlight()
             self._blit_action_flash()
+            self._blit_legend()
             pygame.display.flip()
             self._clock.tick(TARGET_FPS)
             return None
@@ -758,6 +877,33 @@ class FirecrackerEnv(gymnasium.Env):
         self._flash_square.set_alpha(int(ACTION_FLASH_ALPHA * remaining / ACTION_FLASH_SECONDS))
         arow, acol = self._action_flash_cell
         self._screen.blit(self._flash_square, (acol * side, arow * side))
+
+    def _legend_specs(self) -> list[ColorbarSpec]:
+        """Colorbar specs for the active view mode, drawn left to right. Empty for modes without
+        a legend yet; returning several renders adjacent bars (e.g. a future multi-scale view).
+        Built fresh each frame so a dynamic scale (the fuel-temp ceiling tracks the live peak)
+        and mode switches are always reflected, even while paused."""
+        celsius = lambda k: f"{k - KELVIN_TO_CELSIUS:.0f}°C"
+        if self._current_mode == ViewMode.TEMPERATURE:
+            return [ColorbarSpec("Air temp", heat_colormap,
+                                 DISPLAY_TEMP_FLOOR_K, DISPLAY_AIR_TEMP_CEIL_K, celsius)]
+        if self._current_mode == ViewMode.FUEL_TEMPERATURE:
+            # Matches build_color_surface's ceiling in _rebuild_surfaces_if_dirty.
+            ceil = max(DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_scale)
+            return [ColorbarSpec("Fuel temp", heat_colormap,
+                                 DISPLAY_TEMP_FLOOR_K, ceil, celsius)]
+        return []
+
+    def _blit_legend(self) -> None:
+        """Draw the right-side colorbar panel for the active mode. The panel space is always
+        reserved (the window is wider than the sim); modes with no spec just leave it black."""
+        if self._legend_font is None:
+            return
+        sim_px = self.grid_size * self._pixel_scale
+        panel = build_legend_panel(
+            self._legend_specs(), sim_px, self._legend_font, self._legend_title_font
+        )
+        self._screen.blit(panel, (sim_px, 0))
 
     def _surface_for_mode(self) -> pygame.Surface:
         if self._current_mode == ViewMode.TEMPERATURE:
@@ -883,17 +1029,24 @@ class FirecrackerEnv(gymnasium.Env):
         running = self._running
         mode = self._current_mode
         fire_click: tuple[int, int] | None = None
+        sim_w = self.grid_size * self._pixel_scale   # the simulation occupies [0, sim_w); the legend is to its right
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.MOUSEMOTION:
                 # Track which coarse action-cell the cursor sits over (for the hover overlay).
+                # Over the legend panel there is no cell to hover, so clear the highlight.
                 px, py = event.pos
+                if px >= sim_w:
+                    self._hovered_action_cell = None
+                    continue
                 arow = min(py // self._action_cell_px, self.action_grid_size - 1)
                 acol = min(px // self._action_cell_px, self.action_grid_size - 1)
                 self._hovered_action_cell = (arow, acol)
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 px, py = event.pos
+                if px >= sim_w:
+                    continue   # clicks on the legend panel are inert
                 if event.button == 1:
                     # Left-click drives the action space live: commit this phase's index from the
                     # hovered action-cell (its row in the row phase, its column in the column phase),
