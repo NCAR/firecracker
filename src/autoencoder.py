@@ -42,15 +42,18 @@ from torch import nn
 
 class DownBlock(nn.Module):
     """3x3 (same) conv, then PixelUnshuffle(2) to halve H/W (folding detail into channels),
-    then a 1x1 conv to set the output width."""
+    then a 1x1 conv to set the output width. Each conv is followed by a BatchNorm2d
+    (conv -> norm -> activation)."""
 
     def __init__(self, in_ch: int, out_ch: int, activation: type[nn.Module] = nn.ReLU) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(out_ch),
             activation(),
             nn.PixelUnshuffle(2),  # out_ch -> out_ch * 4, H/W halved
             nn.Conv2d(out_ch * 4, out_ch, kernel_size=1),
+            nn.BatchNorm2d(out_ch),
             activation(),
         )
 
@@ -60,8 +63,9 @@ class DownBlock(nn.Module):
 
 class UpBlock(nn.Module):
     """1x1 conv that expands to out_ch*4 channels, then PixelShuffle(2) to double H/W
-    (unfolding channels into space), then a 3x3 (same) conv. The final block omits its
-    trailing activation."""
+    (unfolding channels into space), then a 3x3 (same) conv. Each conv is followed by a
+    BatchNorm2d (conv -> norm -> activation). The final block omits its trailing norm and
+    activation so it emits the raw reconstruction."""
 
     def __init__(
         self,
@@ -73,12 +77,13 @@ class UpBlock(nn.Module):
         super().__init__()
         layers: list[nn.Module] = [
             nn.Conv2d(in_ch, out_ch * 4, kernel_size=1),
+            nn.BatchNorm2d(out_ch * 4),
             activation(),
             nn.PixelShuffle(2),  # out_ch * 4 -> out_ch, H/W doubled
             nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
         ]
         if not final:
-            layers.append(activation())
+            layers += [nn.BatchNorm2d(out_ch), activation()]
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
