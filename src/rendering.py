@@ -31,7 +31,6 @@ Colormap = Callable[[np.ndarray], np.ndarray]
 # ---------------------------------------------------------------------------
 
 MAX_CHANNEL_VALUE: int = 255
-RED_CHANNEL: int = 0
 GREEN_CHANNEL: int = 1
 
 # ---------------------------------------------------------------------------
@@ -151,6 +150,14 @@ def wind_temp_colormap(normalized: np.ndarray) -> np.ndarray:
     return np.stack([n * MAX_CHANNEL_VALUE, (1.0 - n) * 127, (1.0 - n) * MAX_CHANNEL_VALUE], axis=-1).astype(np.uint8)
 
 
+def fire_overlay_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Burning-cell ramp by fuel temperature: red at the ignition floor (0) warming to
+    yellow at the top of the span (1). Shared by the fire overlay and its colorbar."""
+    n = np.clip(normalized, 0.0, 1.0)
+    full = np.full_like(n, MAX_CHANNEL_VALUE)
+    return np.stack([full, n * MAX_CHANNEL_VALUE, np.zeros_like(n)], axis=-1).astype(np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Surface builders
 # ---------------------------------------------------------------------------
@@ -183,6 +190,25 @@ def build_color_surface(
     return _render_field(normalized, scale, cmap)
 
 
+def wind_temp_window(
+    x_wind_vel: np.ndarray,
+    y_wind_vel: np.ndarray,
+    air_temperatures: np.ndarray,
+    reference_magnitude: float,
+) -> tuple[float, float]:
+    """Air-temperature window the wind arrows are colored over: the min/max temperature across
+    the cells with a visible arrow (wind >= 10% of the reference magnitude), falling back to the
+    whole field when none are visible. The wind surface and its colorbar both read this, so the
+    arrows and the bar share one window."""
+    if reference_magnitude == 0.0:
+        return float(air_temperatures.min()), float(air_temperatures.max())
+    magnitudes = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
+    visible_temps = air_temperatures[magnitudes >= 0.1 * reference_magnitude]
+    if visible_temps.size == 0:
+        return float(air_temperatures.min()), float(air_temperatures.max())
+    return float(visible_temps.min()), float(visible_temps.max())
+
+
 def build_wind_surface(
     x_wind_vel: np.ndarray,
     y_wind_vel: np.ndarray,
@@ -202,9 +228,7 @@ def build_wind_surface(
     max_half_len = WIND_ARROW_LENGTH / 2.0
     grid_offset = WIND_ARROW_STRIDE // 2
 
-    visible_temps = air_temperatures[magnitudes >= 0.1 * reference_magnitude]
-    temp_min = float(visible_temps.min()) if visible_temps.size > 0 else float(air_temperatures.min())
-    temp_max = float(visible_temps.max()) if visible_temps.size > 0 else float(air_temperatures.max())
+    temp_min, temp_max = wind_temp_window(x_wind_vel, y_wind_vel, air_temperatures, reference_magnitude)
     temp_range = temp_max - temp_min
 
     for row in range(grid_offset, rows, WIND_ARROW_STRIDE):
@@ -242,19 +266,23 @@ def build_wind_surface(
     return surface
 
 
-def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
+def build_oxygen_surface(
+    oxygen: np.ndarray, scale: int, display_max: float | None = None
+) -> pygame.Surface:
     # O2 is a partial density [kg/m^3]; normalise against the current max so the
     # grayscale ramp reads black = most oxygen, white = least (see oxygen_colormap).
-    o_max = float(oxygen.max())
+    o_max = float(oxygen.max()) if display_max is None else display_max
     normalized = oxygen / o_max if o_max > 0.0 else np.zeros_like(oxygen)
     return _render_field(normalized, scale, oxygen_colormap)
 
 
-def build_pressure_surface(pressure: np.ndarray, scale: int) -> pygame.Surface:
+def build_pressure_surface(
+    pressure: np.ndarray, scale: int, display_max: float | None = None
+) -> pygame.Surface:
     # Anchored at zero, normalised by the current max (like the temperature view): a
     # uniform field renders uniformly bright, and a gradient's spread visibly shrinks as
     # it equalises — unlike a min-max scale, which re-stretches the residual every frame.
-    p_max = float(pressure.max())
+    p_max = float(pressure.max()) if display_max is None else display_max
     normalized = pressure / p_max if p_max > 0.0 else np.zeros_like(pressure)
     return _render_field(normalized, scale, pressure_colormap)
 
@@ -268,17 +296,21 @@ def build_radiant_heat_surface(
     return _render_field(normalized, scale, radiant_heat_colormap)
 
 
-def build_terrain_surface(terrain: np.ndarray, scale: int) -> pygame.Surface:
+def build_terrain_surface(
+    terrain: np.ndarray, scale: int, display_max: float | None = None
+) -> pygame.Surface:
     # Terrain is elevation in metres; normalise against the current max for the relief.
-    t_max = float(terrain.max())
+    t_max = float(terrain.max()) if display_max is None else display_max
     normalized = terrain / t_max if t_max > 0.0 else np.zeros_like(terrain)
     return _render_field(normalized, scale, terrain_colormap)
 
 
-def build_column_height_surface(height: np.ndarray, scale: int) -> pygame.Surface:
+def build_column_height_surface(
+    height: np.ndarray, scale: int, display_max: float | None = None
+) -> pygame.Surface:
     # Relief of the air-column top, anchored at zero and normalised by the current max
     # (like the temperature view). Column height is always non-negative.
-    h_max = float(height.max())
+    h_max = float(height.max()) if display_max is None else display_max
     normalized = height / h_max if h_max > 0.0 else np.zeros_like(height)
     return _render_field(normalized, scale, column_height_colormap)
 
@@ -318,9 +350,8 @@ def build_fire_surface(
         # minimum ignition temperature spans the ramp.
         max_fuel_temp = fuel_temperatures.max(axis=0)
         min_ign = float(ignition_thresholds.min())
-        t = np.clip((max_fuel_temp - min_ign) / FIRE_COLOR_TEMP_SPAN_K, 0.0, 1.0)
-        rgb[any_burning, RED_CHANNEL]   = MAX_CHANNEL_VALUE
-        rgb[any_burning, GREEN_CHANNEL] = (t[any_burning] * MAX_CHANNEL_VALUE).astype(np.uint8)
+        t = (max_fuel_temp - min_ign) / FIRE_COLOR_TEMP_SPAN_K
+        rgb[any_burning] = fire_overlay_colormap(t[any_burning])
 
     rgb_scaled = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     surface = pygame.Surface((cols * scale, rows * scale))
