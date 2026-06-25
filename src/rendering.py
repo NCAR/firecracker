@@ -115,6 +115,13 @@ def oxygen_colormap(normalized: np.ndarray) -> np.ndarray:
     return np.stack([v, v, v], axis=-1).astype(np.uint8)
 
 
+def wind_speed_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Wind-speed ramp (grayscale): black at rest (0), white at the fastest cell (1)."""
+    n = np.clip(normalized, 0.0, 1.0)
+    v = n * MAX_CHANNEL_VALUE
+    return np.stack([v, v, v], axis=-1).astype(np.uint8)
+
+
 def pressure_colormap(normalized: np.ndarray) -> np.ndarray:
     """Pressure/mass ramp: black at 0 up to saturated blue at 1."""
     n = np.clip(normalized, 0.0, 1.0)
@@ -207,6 +214,52 @@ def wind_temp_window(
     return float(visible_temps.min()), float(visible_temps.max())
 
 
+def wind_arrow_color(
+    air_temperature: float, temp_min: float, temp_max: float,
+) -> tuple[int, int, int]:
+    """Color for a wind arrow: its cell's air temperature mapped over [temp_min, temp_max] (the
+    window from wind_temp_window) onto the wind-temp ramp. Shared by the field and the cursor probe
+    so both tint arrows identically."""
+    temp_range = temp_max - temp_min
+    heat = (air_temperature - temp_min) / temp_range if temp_range > 0.0 else 0.0
+    return tuple(int(c) for c in wind_temp_colormap(np.asarray(heat)))
+
+
+def draw_wind_arrow(
+    surface: pygame.Surface, cx: float, cy: float, vx: float, vy: float,
+    magnitude: float, reference_magnitude: float, color: tuple[int, int, int],
+    from_base: bool = False,
+) -> None:
+    """Draw one wind arrow scaled by the cell's wind magnitude (against reference_magnitude, the
+    live peak) with a two-barb head. By default it is centered on (cx, cy); with from_base it
+    starts at (cx, cy) and points outward (so a probe sits its base on the measured cell). Shared
+    by the wind-arrow field and the cursor probe. No-op for a zero/short wind or an unset reference."""
+    if magnitude <= 0.0 or reference_magnitude <= 0.0:
+        return
+    t = min(reference_magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
+    relative = min(magnitude / reference_magnitude, 1.0)
+    absolute = min(magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
+    half_len = (t * relative + (1.0 - t) * absolute) * (WIND_ARROW_LENGTH / 2.0)
+    if half_len < 1.0:
+        return
+    ux, uy = vx / magnitude, vy / magnitude
+    if from_base:
+        start = (int(cx), int(cy))
+        tip = (int(cx + ux * 2.0 * half_len), int(cy + uy * 2.0 * half_len))
+    else:
+        start = (int(cx - ux * half_len), int(cy - uy * half_len))
+        tip = (int(cx + ux * half_len), int(cy + uy * half_len))
+    pygame.draw.line(surface, color, start, tip, WIND_ARROW_LINE_WIDTH)
+
+    angle = math.atan2(uy, ux)
+    for sign in (+1, -1):
+        barb = (
+            int(tip[0] - WIND_ARROW_HEAD_SIZE * math.cos(angle + sign * WIND_ARROW_HEAD_ANGLE)),
+            int(tip[1] - WIND_ARROW_HEAD_SIZE * math.sin(angle + sign * WIND_ARROW_HEAD_ANGLE)),
+        )
+        pygame.draw.line(surface, color, tip, barb, WIND_ARROW_LINE_WIDTH)
+
+
 def build_wind_surface(
     x_wind_vel: np.ndarray,
     y_wind_vel: np.ndarray,
@@ -221,45 +274,22 @@ def build_wind_surface(
     if reference_magnitude == 0.0:
         return surface
 
-    t = min(reference_magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
     magnitudes = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
-    max_half_len = WIND_ARROW_LENGTH / 2.0
     grid_offset = WIND_ARROW_STRIDE // 2
 
     temp_min, temp_max = wind_temp_window(x_wind_vel, y_wind_vel, air_temperatures, reference_magnitude)
-    temp_range = temp_max - temp_min
 
     for row in range(grid_offset, rows, WIND_ARROW_STRIDE):
         for col in range(grid_offset, cols, WIND_ARROW_STRIDE):
-            vx = float(x_wind_vel[row, col])
-            vy = float(y_wind_vel[row, col])
             magnitude = float(magnitudes[row, col])
-            if magnitude < 0.1 * reference_magnitude:
+            if magnitude < 0.1 * reference_magnitude:   # declutter: hide near-calm cells
                 continue
-
-            relative = min(magnitude / reference_magnitude, 1.0)
-            absolute = min(magnitude / _WIND_DISPLAY_THRESHOLD, 1.0)
-            half_len = (t * relative + (1.0 - t) * absolute) * max_half_len
-            if half_len < 1.0:
-                continue
-            ux, uy = vx / magnitude, vy / magnitude
-            cx = (col + 0.5) * scale
-            cy = (row + 0.5) * scale
-
-            heat = (float(air_temperatures[row, col]) - temp_min) / temp_range if temp_range > 0.0 else 0.0
-            color = tuple(int(c) for c in wind_temp_colormap(np.asarray(heat)))
-
-            start = (int(cx - ux * half_len), int(cy - uy * half_len))
-            tip = (int(cx + ux * half_len), int(cy + uy * half_len))
-            pygame.draw.line(surface, color, start, tip, WIND_ARROW_LINE_WIDTH)
-
-            angle = math.atan2(uy, ux)
-            for sign in (+1, -1):
-                barb = (
-                    int(tip[0] - WIND_ARROW_HEAD_SIZE * math.cos(angle + sign * WIND_ARROW_HEAD_ANGLE)),
-                    int(tip[1] - WIND_ARROW_HEAD_SIZE * math.sin(angle + sign * WIND_ARROW_HEAD_ANGLE)),
-                )
-                pygame.draw.line(surface, color, tip, barb, WIND_ARROW_LINE_WIDTH)
+            color = wind_arrow_color(float(air_temperatures[row, col]), temp_min, temp_max)
+            draw_wind_arrow(
+                surface, (col + 0.5) * scale, (row + 0.5) * scale,
+                float(x_wind_vel[row, col]), float(y_wind_vel[row, col]),
+                magnitude, reference_magnitude, color,
+            )
 
     return surface
 
@@ -271,6 +301,17 @@ def build_oxygen_surface(oxygen: np.ndarray, scale: int) -> pygame.Surface:
     span = DISPLAY_OXYGEN_CEILING - DISPLAY_OXYGEN_FLOOR
     normalized = (oxygen - DISPLAY_OXYGEN_FLOOR) / span
     return _render_field(normalized, scale, oxygen_colormap)
+
+
+def build_wind_speed_surface(
+    x_wind_vel: np.ndarray, y_wind_vel: np.ndarray, scale: int, display_max: float | None = None
+) -> pygame.Surface:
+    # Wind speed [m/s] as a grayscale field: each cell's brightness tracks its wind magnitude,
+    # anchored at zero (black = calm) and normalised by the current max (white = fastest cell).
+    magnitude = np.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)
+    v_max = float(magnitude.max()) if display_max is None else display_max
+    normalized = magnitude / v_max if v_max > 0.0 else np.zeros_like(magnitude)
+    return _render_field(normalized, scale, wind_speed_colormap)
 
 
 def build_pressure_surface(

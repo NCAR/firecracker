@@ -10,6 +10,7 @@ Action:      Discrete(action_grid_size) — an action-cell is selected over two 
              a no-op (nothing selected).
 """
 
+import math
 import time
 from enum import Enum
 
@@ -36,6 +37,7 @@ from rendering import (
     ColorbarSpec,
     heat_colormap,
     oxygen_colormap,
+    wind_speed_colormap,
     pressure_colormap,
     radiant_heat_colormap,
     terrain_colormap,
@@ -43,8 +45,11 @@ from rendering import (
     wind_temp_colormap,
     fire_overlay_colormap,
     wind_temp_window,
+    wind_arrow_color,
+    draw_wind_arrow,
     build_color_surface,
     build_wind_surface,
+    build_wind_speed_surface,
     build_oxygen_surface,
     build_pressure_surface,
     build_radiant_heat_surface,
@@ -88,6 +93,7 @@ ACTION_FLASH_SECONDS: float = 0.35
 # ---------------------------------------------------------------------------
 
 class ViewMode(Enum):
+    WIND_SPEED = 0
     TEMPERATURE = 1
     WIND = 2
     FIRE = 3
@@ -226,6 +232,12 @@ class FirecrackerEnv(gymnasium.Env):
         self._pressure_display_max: float = 0.0
         self._terrain_display_max: float = 0.0
         self._column_height_display_max: float = 0.0
+        self._wind_speed_display_max: float = 0.0
+        # The wind/temperature fields the last surfaces were built from, kept on the host so the
+        # cursor wind-vector probe can read the hovered cell without another device transfer.
+        self._render_wind_x: np.ndarray | None = None
+        self._render_wind_y: np.ndarray | None = None
+        self._render_air_temp: np.ndarray | None = None
         self._wind_temp_window: tuple[float, float] = (
             DISPLAY_TEMP_FLOOR_K, DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
         )
@@ -239,6 +251,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._legend_title_font: pygame.font.Font | None = None
         self._color_surface: pygame.Surface | None = None
         self._wind_surface: pygame.Surface | None = None
+        self._wind_speed_surface: pygame.Surface | None = None
         self._fire_surface: pygame.Surface | None = None
         self._oxygen_surface: pygame.Surface | None = None
         self._pressure_surface: pygame.Surface | None = None
@@ -452,6 +465,8 @@ class FirecrackerEnv(gymnasium.Env):
             # overlays any view. Skip WIND, where the arrows are already the primary view.
             if self._show_wind_overlay and self._current_mode is not ViewMode.WIND:
                 self._screen.blit(self._wind_surface, (0, 0))
+            if self._current_mode in (ViewMode.WIND, ViewMode.WIND_SPEED):
+                self._blit_cursor_wind_vector()
             self._blit_action_highlight()
             self._blit_action_flash()
             self._blit_legend()
@@ -542,6 +557,9 @@ class FirecrackerEnv(gymnasium.Env):
         celsius = lambda k: f"{k - KELVIN_TO_CELSIUS:.0f}°C"
         meters  = lambda v: f"{v:.0f} m"
         mode = self._current_mode
+        if mode == ViewMode.WIND_SPEED:
+            return [ColorbarSpec("Wind spd", wind_speed_colormap,
+                                 0.0, self._wind_speed_display_max, lambda v: f"{v:.1f} m/s")]
         if mode == ViewMode.TEMPERATURE:
             return [ColorbarSpec("Air temp", heat_colormap,
                                  DISPLAY_TEMP_FLOOR_K, self._air_temp_display_max, celsius)]
@@ -587,7 +605,31 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._screen.blit(panel, (sim_px, 0))
 
+    def _blit_cursor_wind_vector(self) -> None:
+        """In the wind views, draw one wind arrow — styled exactly like the field arrows — at the
+        sim cell under the mouse, so a specific point can be probed/compared. No-op when the cursor
+        is off the map or the wind data isn't ready yet."""
+        if self._render_wind_x is None or self._wind_speed_display_max <= 0.0:
+            return
+        sim_w = self.grid_size * self._pixel_scale
+        px, py = pygame.mouse.get_pos()
+        if not (0 <= px < sim_w and 0 <= py < sim_w):
+            return
+        col = min(px // self._pixel_scale, self.grid_size - 1)
+        row = min(py // self._pixel_scale, self.grid_size - 1)
+        vx = float(self._render_wind_x[row, col])
+        vy = float(self._render_wind_y[row, col])
+        temp_min, temp_max = self._wind_temp_window
+        color = wind_arrow_color(float(self._render_air_temp[row, col]), temp_min, temp_max)
+        # Base the arrow at the cursor (the measured cell) so it points outward from the pointer tip.
+        draw_wind_arrow(
+            self._screen, px, py, vx, vy,
+            math.hypot(vx, vy), self._wind_speed_display_max, color, from_base=True,
+        )
+
     def _surface_for_mode(self) -> pygame.Surface:
+        if self._current_mode == ViewMode.WIND_SPEED:
+            return self._wind_speed_surface
         if self._current_mode == ViewMode.TEMPERATURE:
             return self._color_surface
         if self._current_mode == ViewMode.WIND:
@@ -640,13 +682,18 @@ class FirecrackerEnv(gymnasium.Env):
         self._pressure_display_max = float(pressure_field.max())
         self._terrain_display_max = float(terrain.max())
         self._column_height_display_max = float(column_height.max())
+        self._wind_speed_display_max = wind_ref
         self._wind_temp_window = wind_temp_window(wx, wy, temp, wind_ref)
+        self._render_wind_x, self._render_wind_y, self._render_air_temp = wx, wy, temp
 
         self._color_surface = build_color_surface(
             temp, self._pixel_scale, DISPLAY_TEMP_FLOOR_K, self._air_temp_display_max,
         )
         self._wind_surface = build_wind_surface(
             wx, wy, temp, self._pixel_scale, wind_ref,
+        )
+        self._wind_speed_surface = build_wind_speed_surface(
+            wx, wy, self._pixel_scale, self._wind_speed_display_max
         )
         self._fire_surface = build_fire_surface(
             fuel_temps, fuel, oxygen, self._pixel_scale,
