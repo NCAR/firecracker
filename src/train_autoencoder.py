@@ -37,6 +37,7 @@ Checkpoints (model weights + the config needed to rebuild the architecture) are 
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 from pathlib import Path
 
@@ -263,6 +264,13 @@ def main() -> None:
             path,
         )
 
+    # A machine-readable per-epoch log so replicate runs (e.g. tools/sweep.py) can be
+    # aggregated/averaged after the fact. Flushed each epoch to survive interruptions.
+    metrics_path = out_dir / "metrics.csv"
+    metrics_file = metrics_path.open("w", newline="")
+    metrics_writer = csv.writer(metrics_file)
+    metrics_writer.writerow(["epoch", "train_loss", "val_loss", "seconds"])
+
     # 3. Train ----------------------------------------------------------------
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
@@ -275,6 +283,8 @@ def main() -> None:
             f"epoch {epoch:3d}/{args.epochs}  train {train_loss:.6f}  "
             f"val {val_loss:.6f}  ({dt:.1f}s)"
         )
+        metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{dt:.2f}"])
+        metrics_file.flush()
 
         if val_loss < best_val:
             best_val = val_loss
@@ -283,6 +293,7 @@ def main() -> None:
         if args.save_interval and epoch % args.save_interval == 0:
             save_checkpoint(out_dir / f"epoch_{epoch:03d}.pt", epoch, val_loss)
 
+    metrics_file.close()
     save_checkpoint(out_dir / "last.pt", args.epochs, best_val)
     print(f"done. best val loss {best_val:.6f}; checkpoints in '{out_dir}/'.")
 
