@@ -114,6 +114,18 @@ class Simulation:
         self.relaxation_enabled: bool  = bool(relaxation.get("enabled", True))
         self.oxygen_rate:        float = float(relaxation.get("oxygen_rate", 0.05))
 
+        # Plume vertical venting (the air-temperature sink). The combustion air-share heat injects
+        # into the shallow plume slab (update_fire), but the air field otherwise has no vertical
+        # export -- it is radiatively transparent and only loses heat by weak ground exchange and
+        # horizontal advection -- so over a large or sustained fire the plume heat accumulates without
+        # bound and conducts back into the fuel, a temperature runaway. A real plume rises buoyantly
+        # and carries that heat up and out of the modelled slab while fresh air entrains; we model that
+        # as an exact-exponential relaxation of the super-ambient air toward the rest profile at rate
+        # lambda ~ updraft / d_plume (the inverse plume-residence time). See vent_plume_heat.
+        venting = (cfg or {}).get("venting", {})
+        self.venting_enabled: bool  = bool(venting.get("enabled", True))
+        self.plume_vent_rate: float = float(venting.get("rate",    0.05))
+
         # Phase 2 shallow-water momentum core. Wind is prognostic [m/s]; drag relaxes it
         # toward the per-map synoptic ambient wind, the column-top height gradient
         # (H = terrain + eta, eta = m*R_d*T/p_ref) forces it, eddy viscosity smooths it.
@@ -688,6 +700,24 @@ class Simulation:
         decay = torch.exp(-rate) if torch.is_tensor(rate) else math.exp(-rate)
         return target + (field - target) * decay
 
+    def vent_plume_heat(self, air_temperatures: torch.Tensor, temp_eq: torch.Tensor) -> torch.Tensor:
+        """Vertical venting of plume heat out of the shallow near-surface slab (the air-temp sink).
+
+        update_fire injects the combustion air-share heat into a shallow plume slab, but the air
+        field has no vertical export -- it is radiatively transparent and only loses heat by weak
+        ground exchange and horizontal advection -- so over a large or sustained fire that heat
+        accumulates without bound and conducts back into the fuel (a temperature runaway). A real
+        plume rises buoyantly and carries the heat up and out of the modelled slab while fresh air
+        entrains. Model that as an exact-exponential relaxation of the *super-ambient* air toward the
+        rest profile temp_eq at the plume-venting rate (~ updraft / d_plume, the inverse residence
+        time). One-directional: it only cools air hotter than temp_eq, so it is strictly a heat sink
+        (never injects energy) and is a no-op on a quiescent world (air = temp_eq). Rank-agnostic.
+        """
+        if self.plume_vent_rate <= 0.0:
+            return air_temperatures
+        excess = (air_temperatures - temp_eq).clamp(min=0.0)
+        return air_temperatures - excess * (1.0 - math.exp(-self.plume_vent_rate * self.dt))
+
     def diffuse_and_advect_oxygen(
         self,
         oxygen: torch.Tensor,
@@ -1004,6 +1034,13 @@ class Simulation:
                 s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
                     s.fuel_temperatures, s.fuel, s.temp_eq
                 )
+
+        # Vent the plume air-share heat upward out of the shallow slab (the air-temperature sink):
+        # without it the radiatively-transparent air has no vertical escape and a large fire's plume
+        # heat accumulates without bound. Gated by its own toggle (independent of fire), so the closed
+        # conservation core can switch it off; one-directional, so on a quiescent world it is a no-op.
+        if self.venting_enabled:
+            s.air_temperatures = self.vent_plume_heat(s.air_temperatures, s.temp_eq)
 
         return s
 

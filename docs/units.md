@@ -241,6 +241,35 @@ Fuel↔air conduction (`exchange_fuel_air_heat`) keeps its exact two-body expone
 heat capacities `C_air = m·c_p,air`, `C_fuel = fuel·c_p,fuel`, a conductance `k` in W/(m²·K), and the
 decay exponent carrying `·dt`.
 
+### Plume venting — the air-temperature sink (`vent_plume_heat`)
+
+The air-share heat injects into the shallow plume slab, but `air_temperatures` otherwise has **no
+vertical heat export** — air is radiatively transparent and only loses heat by weak ground exchange
+and horizontal advection. For an *isolated* cell or a thin front the `T⁴` fuel sink and advection
+keep the flame near ~1500 K, but for a **large or sustained fire** the overlapping plumes accumulate
+heat in the slab without bound (the interior is far from the advective edge sink), and that
+superheated air conducts back into the fuel — a temperature runaway (fuel and air both ran to
+~5000–6000 K on the 256² grid, and tens of thousands of K with the burn sustained). A real plume
+rises buoyantly and carries that heat up and out of the modelled slab while fresh air entrains; we
+model that vertical export as an exact-exponential relaxation of the **super-ambient** air toward
+the rest profile:
+
+```
+T_a ← T_a − (T_a − temp_eq)₊ · (1 − exp(−λ·dt))           [K]
+```
+
+`λ ~ updraft / d_plume` is the inverse plume-residence time (`rate ≈ 0.05 s⁻¹` for a ~5 m/s updraft
+through the 100 m slab). It is **one-directional** (only the part above `temp_eq` is relaxed), so it
+is strictly a heat *sink* — it never injects energy, is a no-op on a quiescent world (`T_a = temp_eq`),
+and leaves the closed conservation core untouched when off. It is gated by its own toggle
+(`[venting].enabled`, independent of `fire`), so the conservation tests recover the exact periodic
+core. Because the convective spread deposit is sourced from the *instantaneous* burn heat (not the
+persistent `air_temperatures` field), venting bounds the large-fire air without perturbing the
+calibrated small-front spread (front temperature and burnt-cell counts are unchanged). With venting
+on, the 256² large fire's air holds ~1450 K (was ~6000 K). *Tests:* `tests/test_venting.py` (the
+exact operator form — one-directional, quiescent-safe, rate-0 identity — plus a sustained-fire
+integration test that venting holds the air in a physical band while the unvented model runs hotter).
+
 ### Fire radiant transfer (replaces `apply_radiant_heat`)
 
 Real grey-body emission with inverse-square neighbour redistribution (kernel radius in

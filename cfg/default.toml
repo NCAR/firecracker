@@ -75,6 +75,19 @@ cover_fuel_scale     = 1.0      # kappa [kg/m^2]: fuel load at which canopy inte
 enabled     = true   # if false, skip oxygen replenishment
 oxygen_rate = 0.05   # fresh-air replenishment rate; keep below peak burn draw
 
+[venting]
+# Plume vertical venting -- the air-temperature sink (see docs/units.md). The combustion air-share
+# heat is injected into the shallow plume slab ([fire].plume_mixing_depth), but the air field is
+# radiatively transparent and otherwise loses heat only by weak ground exchange and horizontal
+# advection, so over a large or sustained fire that heat accumulates without bound and conducts back
+# into the fuel -- a temperature runaway. A real plume rises buoyantly and carries the heat up and
+# out of the modelled slab while fresh air entrains; this relaxes the super-ambient air toward the
+# rest profile at rate lambda ~ updraft / plume depth (the inverse plume-residence time). It is
+# one-directional (a heat sink only -- never warms air below the rest profile), so a quiescent world
+# is unaffected and the closed conservation core is recovered with enabled = false.
+enabled = true    # if false, the plume air-share heat has no vertical sink (pre-fix runaway behavior)
+rate    = 0.05    # lambda [1/s]: venting rate (~ updraft / plume depth; ~5 m/s through a 100 m slab)
+
 [momentum]
 # Shallow boundary-layer orographic wind (see docs/units.md). The wind is prognostic
 # [m/s], forced by the free-surface gradient -g'*grad(s), s = terrain + eta with the layer
