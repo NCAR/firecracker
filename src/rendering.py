@@ -33,6 +33,17 @@ Colormap = Callable[[np.ndarray], np.ndarray]
 MAX_CHANNEL_VALUE: int = 255
 GREEN_CHANNEL: int = 1
 
+# Per-fuel-type base colors (RGB fractions in [0, 1]) for the fire view's vegetation.
+# A cell's hue is its fuel mass blended across these by type: trees read pure green, while
+# grass reads yellow-green (extra red). Brightness still tracks total fuel (see
+# build_fire_surface), so these only set the hue each fuel type contributes. Unknown fuel
+# types fall back to plain green.
+VEGETATION_COLORS: dict[str, tuple[float, float, float]] = {
+    "tree":  (0.0,  1.0, 0.0),   # green
+    "grass": (0.75, 1.0, 0.0),   # yellow-green
+}
+DEFAULT_VEGETATION_COLOR: tuple[float, float, float] = (0.0, 1.0, 0.0)
+
 # ---------------------------------------------------------------------------
 # Wind arrow visualization parameters
 # ---------------------------------------------------------------------------
@@ -360,6 +371,7 @@ def build_fire_surface(
     scale: int,
     ignition_thresholds: np.ndarray,     # (N,)
     fuel_burnt_threshold: float,
+    fuel_type_names: list[str],          # (N,) names, aligned with fuel/ignition axis 0
     show_fire_overlay: bool = True,
 ) -> pygame.Surface:
     rows, cols = fuel_temperatures.shape[1], fuel_temperatures.shape[2]
@@ -375,13 +387,20 @@ def build_fire_surface(
     )
     any_burning = burning_per_type.any(axis=0)  # (H, W)
 
-    # Green brightness tracks total fuel, normalised so the cell with the most fuel
-    # on the map is full brightness. This keeps the image scale-invariant: uniformly
-    # scaling all fuel leaves the ratios (and thus the rendered intensities) unchanged.
-    total_fuel = fuel.sum(axis=0)
-    max_fuel = float(total_fuel.max())
-    normalized_fuel = total_fuel / max_fuel if max_fuel > 0.0 else total_fuel
-    rgb[:, :, GREEN_CHANNEL] = (normalized_fuel * MAX_CHANNEL_VALUE).astype(np.uint8)
+    # Each fuel type contributes its base color (trees green, grass yellow-green) weighted by
+    # its mass, so a cell's color is the mass-weighted blend of the fuels present. Mass is
+    # normalised per type by that type's own peak on the map, not by a shared total: grass tops
+    # out at a far lower loading than trees, so a shared scale would render grass near-black.
+    # Per-type normalisation lets each vegetation type use its full brightness range (and keeps
+    # the image scale-invariant: uniformly scaling one type's fuel leaves its colors unchanged).
+    type_colors = np.array(
+        [VEGETATION_COLORS.get(name, DEFAULT_VEGETATION_COLOR) for name in fuel_type_names],
+        dtype=np.float32,
+    )  # (N, 3)
+    type_max = fuel.max(axis=(1, 2), keepdims=True)            # (N, 1, 1) per-type peak
+    normalized = np.divide(fuel, type_max, out=np.zeros_like(fuel), where=type_max > 0.0)
+    color_accum = np.tensordot(normalized, type_colors, axes=([0], [0]))  # (H, W, 3) in [0, ~]
+    rgb[:] = (np.clip(color_accum, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
 
     if show_fire_overlay:
         # Color gradient based on the hottest fuel type; a fixed Kelvin span above the

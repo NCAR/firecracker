@@ -698,6 +698,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._fire_surface = build_fire_surface(
             fuel_temps, fuel, oxygen, self._pixel_scale,
             ignition_thresholds, self._sim.fuel_burnt_threshold,
+            self._sim.fuel_type_names,
             self._show_fire_overlay and self._sim.fire_enabled,
         )
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
