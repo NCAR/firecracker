@@ -548,7 +548,7 @@ Each phase is independently testable; we do not change everything at once.
    gain (speedup only — direction preserved, since the core already deflects), leaving the
    **prognostic field untouched** (so the xfail stays honest). New `SimState.channel_gain
    /x_wind_fire/y_wind_fire` (optional — hand-built states are unaffected), `[channeling]` config
-   (`enabled` **on by default**, `radius_m=300`, `height_scale_m=100`, `gain_max=3`, `smooth_sigma=1`).
+   (`enabled` **on by default**, `radius_m=300`, `height_scale_m=100`, `gain_max=2`, `smooth_sigma=1`).
    **Wind speed now drives rate-of-spread** (Phase 6's second half): the convective deposit's wind
    bias was the *unit* wind (direction only); it is now `convective_wind_bias·(wind/convective_wind_ref)`
    (`u_ref=10 m/s`), so a faster wind grows the forward concentration and throws the ignition heat
@@ -656,11 +656,13 @@ Each phase is independently testable; we do not change everything at once.
 - **Phase 6 (Option 2)** *(done)*: `convective_wind_ref=10 m/s` with `convective_wind_bias=1.0` gives a
   clean wind-driven story (head reach ~3→6→9→11 cells over 0→15 m/s, flanks pinching) without the
   thin-finger runaway that `convective_wind_bias≈2` produces at high wind. Channeling
-  `radius_m=300`, `height_scale_m=100`, `gain_max=3`, `smooth_sigma=1` give a gap gain ~3 on the
-  `si_channel` walls; on real maps the gain saturates at 3 in tight valleys with a mean ~1.1, and
+  `radius_m=300`, `height_scale_m=100`, `gain_max=2`, `smooth_sigma=1` give a gap gain ~2 on the
+  `si_channel` walls; on real maps the gain saturates at 2 in tight valleys with a mean ~1.1, and
   low ground (valleys) reads a higher mean gain than ridges while cross-wind ridges stay exactly 1.
-  Tune `height_scale_m` (the rise that fully closes a channel; smaller → more bumps boost) and
-  `gain_max` if real maps over- or under-channel. Going past the ~R11 head
+  `gain_max` was lowered from 3→2 because the gain stacks multiplicatively on the prognostic
+  lee/foehn overshoot (~1.3× synoptic), so a 3× cap drove ~45 m/s fire winds from a 15 m/s synoptic;
+  2× holds the fire-wind max near ~27 m/s. Tune `height_scale_m` (the rise that fully closes a
+  channel; smaller → more bumps boost) and `gain_max` if real maps over- or under-channel. Going past the ~R11 head
   ceiling at extreme winds needs wind-scaled reach (spotting), deferred.
 
 ## Known limitations / deferred

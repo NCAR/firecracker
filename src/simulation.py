@@ -151,7 +151,7 @@ class Simulation:
         chan_radius_m                     = float(channeling.get("radius_m", 300.0))
         self.channel_radius:        int   = max(1, round(chan_radius_m / self.cell_size_m))
         self.channel_height_scale_m: float = float(channeling.get("height_scale_m", 100.0))
-        self.channel_gain_max:      float = float(channeling.get("gain_max", 3.0))
+        self.channel_gain_max:      float = float(channeling.get("gain_max", 2.0))
         self.channel_smooth_sigma:  float = float(channeling.get("smooth_sigma", 1.0))
 
         # Combustion (Phase 4). The reaction rate is a smooth Arrhenius law limited by oxygen,
