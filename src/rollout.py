@@ -42,6 +42,17 @@ Static dataset for pretraining (sharded to disk, then memory-mapped):
 Or from the command line:
 
     python src/rollout.py --out data/fire --rounds 8 --spawn-fire
+
+Multi-GPU generation -- run one process per GPU, each writing into its own subdirectory of a
+shared dataset dir (distinct --seed so the workers draw different worlds, not copies):
+
+    CUDA_VISIBLE_DEVICES=0 python src/rollout.py --out data/fire/w0 --num-envs 16 --seed 0 --spawn-fire &
+    CUDA_VISIBLE_DEVICES=1 python src/rollout.py --out data/fire/w1 --num-envs 16 --seed 1 --spawn-fire &
+    CUDA_VISIBLE_DEVICES=2 python src/rollout.py --out data/fire/w2 --num-envs 16 --seed 2 --spawn-fire &
+    CUDA_VISIBLE_DEVICES=3 python src/rollout.py --out data/fire/w3 --num-envs 16 --seed 3 --spawn-fire &
+    wait
+
+    ds = FireDataset("data/fire")                 # unions the w0..w3 subdirs into one dataset
 """
 
 from __future__ import annotations
@@ -329,19 +340,54 @@ class BatchedRollout:
 class FireDataset(Dataset):
     """Memory-mapped torch Dataset over a sharded dataset built by BatchedRollout.build_dataset.
 
+    Two on-disk layouts are accepted, transparently:
+
+    * Flat -- `root` itself holds the shards and a `meta.json` (a single build_dataset run).
+    * Nested -- `root` holds one subdirectory per source, each a flat dataset with its own
+      `meta.json`. This is what several workers produce when each writes into its own subdir
+      (e.g. one per GPU); pointing FireDataset at the parent unions them into one dataset.
+      All sources must agree on channels / grid_size / dtype / samples_per_shard, since they
+      are interleaved into one flat, uniformly-sized shard list.
+
     Shards are opened lazily with np.load(mmap_mode='r') on first access (and per DataLoader
     worker after fork), so the OS pages samples in on demand and the dataset can far exceed
     RAM. Each item is one C x N x N observation. Samples are stored grouped by world within a
-    shard, so shuffle in the DataLoader for I.I.D. minibatches.
+    shard (and by source across subdirs), so shuffle in the DataLoader for I.I.D. minibatches.
     """
 
     def __init__(self, root: str | Path):
         self.root = Path(root)
-        self.meta = json.loads((self.root / _META_NAME).read_text())
-        self.shard_paths = sorted(self.root.glob(self.meta.get("shard_glob", _SHARD_GLOB)))
-        if not self.shard_paths:
-            raise FileNotFoundError(f"No shards found in {self.root}.")
+        # A meta.json directly under root marks a flat dataset; otherwise treat root as a
+        # parent holding one subdirectory per source (multi-worker layout).
+        source_dirs = (
+            [self.root]
+            if (self.root / _META_NAME).is_file()
+            else [p.parent for p in sorted(self.root.glob(f"*/{_META_NAME}"))]
+        )
+        if not source_dirs:
+            raise FileNotFoundError(
+                f"No dataset found at {self.root}: neither a {_META_NAME} nor any "
+                f"*/{_META_NAME} subdirectory."
+            )
+
+        self.meta = json.loads((source_dirs[0] / _META_NAME).read_text())
         self.per_shard = int(self.meta["samples_per_shard"])
+        # Fields every source must share for the flat, uniformly-sized shard list to be valid.
+        keys = ("samples_per_shard", "num_channels", "grid_size", "dtype")
+        ref = {k: self.meta.get(k) for k in keys}
+
+        self.shard_paths: list[Path] = []
+        for d in source_dirs:
+            meta = json.loads((d / _META_NAME).read_text())
+            mism = {k: meta.get(k) for k in keys if meta.get(k) != ref[k]}
+            if mism:
+                raise ValueError(
+                    f"Dataset source {d} is incompatible with {source_dirs[0]}: "
+                    f"{mism} != {{{', '.join(f'{k}: {ref[k]!r}' for k in mism)}}}."
+                )
+            self.shard_paths.extend(sorted(d.glob(meta.get("shard_glob", _SHARD_GLOB))))
+        if not self.shard_paths:
+            raise FileNotFoundError(f"No shards found under {self.root}.")
         self._mmaps: list[np.ndarray | None] = [None] * len(self.shard_paths)
 
     def __len__(self) -> int:

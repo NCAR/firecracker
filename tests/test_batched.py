@@ -205,6 +205,46 @@ def test_build_dataset_and_load(tmp_path):
     np.testing.assert_allclose(to_numpy(ds[len(ds) - 1]), last_shard[-1])
 
 
+def test_firedataset_unions_worker_subdirs(tmp_path):
+    """Pointing FireDataset at a parent dir unions per-worker subdir datasets into one."""
+    grid = 16
+    config = make_config(grid_size=grid)
+    maps_dir = tmp_path / "maps"
+    maps_dir.mkdir()
+    save_map(maps_dir / "m.npz", build_map(grid_size=grid))
+
+    parent = tmp_path / "data"
+    rounds = 2
+    for w in range(3):                                  # three "workers", own subdir + seed
+        roll = BatchedRollout(
+            config, maps_dir=str(maps_dir), grid_size=grid,
+            num_envs=2, steps=4, stride=2, buffer_device="cpu", seed=w,
+        )
+        roll.build_dataset(parent / f"w{w}", rounds=rounds)
+
+    per_shard = (4 // 2) * 2
+    ds = FireDataset(parent)                            # parent has no meta.json -> nested
+    assert len(ds) == per_shard * rounds * 3
+    assert ds[0].shape == (len(OBS_CHANNELS), grid, grid)
+
+
+def test_firedataset_rejects_incompatible_sources(tmp_path):
+    """A subdir whose meta disagrees on a structural field fails fast at load."""
+    import pytest
+    parent = tmp_path / "data"
+    for grid in (16, 24):                               # different grid_size between workers
+        maps_dir = tmp_path / f"maps{grid}"
+        maps_dir.mkdir()
+        save_map(maps_dir / "m.npz", build_map(grid_size=grid))
+        roll = BatchedRollout(
+            make_config(grid_size=grid), maps_dir=str(maps_dir), grid_size=grid,
+            num_envs=2, steps=2, stride=1, buffer_device="cpu", seed=0,
+        )
+        roll.build_dataset(parent / f"g{grid}", rounds=1)
+    with pytest.raises(ValueError):
+        FireDataset(parent)
+
+
 def test_build_dataset_refuses_overwrite(tmp_path):
     """Existing shards are protected unless overwrite=True."""
     import pytest
