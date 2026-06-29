@@ -39,8 +39,10 @@ GREEN_CHANNEL: int = 1
 # build_fire_surface), so these only set the hue each fuel type contributes. Unknown fuel
 # types fall back to plain green.
 VEGETATION_COLORS: dict[str, tuple[float, float, float]] = {
-    "tree":  (0.0,  1.0, 0.0),   # green
-    "grass": (0.75, 1.0, 0.0),   # yellow-green
+    "tree":        (0.0,  1.0, 0.0),   # green
+    "tree_canopy": (0.0,  1.0, 0.0),   # green (a tree's fine fuel)
+    "tree_bole":   (0.0,  1.0, 0.0),   # green (a tree's coarse fuel)
+    "grass":       (0.75, 1.0, 0.0),   # yellow-green
 }
 DEFAULT_VEGETATION_COLOR: tuple[float, float, float] = (0.0, 1.0, 0.0)
 

@@ -86,7 +86,11 @@ oxygen_rate = 0.05   # fresh-air replenishment rate; keep below peak burn draw
 # one-directional (a heat sink only -- never warms air below the rest profile), so a quiescent world
 # is unaffected and the closed conservation core is recovered with enabled = false.
 enabled = true    # if false, the plume air-share heat has no vertical sink (pre-fix runaway behavior)
-rate    = 0.05    # lambda [1/s]: venting rate (~ updraft / plume depth; ~5 m/s through a 100 m slab)
+rate    = 0.2     # lambda [1/s]: venting rate (~ updraft / plume depth). Raised from 0.05 once trees
+                  # actually burn (Phase 6b): a fully-involved dense tree cell (~20 kg/m^2) releases far
+                  # more heat than the old rate could shed, so the air ran away (~40000 K) in 3-4 tree
+                  # cells; 0.2 bounds the plume to a physical ~2200 K flame. Real intense fires drive
+                  # stronger updrafts, so a higher sink for higher intensity is physically consistent.
 
 [momentum]
 # Shallow boundary-layer orographic wind (see docs/units.md). The wind is prognostic
@@ -153,7 +157,7 @@ burn_heat_fuel_fraction  = 0.05   # fraction of burn heat deposited into fuel (s
 combustion_mixing_depth  = 30.0   # d_mix [m]: depth of the near-surface layer the fire draws O2 from
 surface_mass_transfer    = 0.02   # h [kg/(m^2*s)]: O2 film-transport flux to a fuel surface (the hot-burn cap)
 plume_mixing_depth       = 100.0  # d_plume [m]: shallow plume the air-share burn heat is injected into
-convective_fraction      = 0.12   # share of the air-share heat convected to nearby fuel (spread driver)
+convective_fraction      = 0.24   # share of the air-share heat convected to nearby fuel (spread driver)
 flame_gate_temperature   = 700.0  # K: convection ignites only fuel below this (flaming fuel is combustion-set)
 convective_radius_m      = 10.0   # reach [m] of the convective ignition onto neighbouring fuel
 convective_wind_bias     = 1.0    # downwind skew of the convective ignition (concentration on wind/u_ref)
@@ -181,21 +185,45 @@ noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
 altitude_falloff       = 0.5    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
 spawn_density          = 1.5    # peak grass loading [kg/m^2] (scales the [0,1] noise)
 
-[fuel_types.tree]
+# A tree is modelled as two co-located fuel types (Phase 6b): a light, high-SAV CANOPY (foliage,
+# twigs, bark) that ignites readily from a passing front and carries the flame, and a heavy, low-SAV
+# BOLE (trunk, big limbs) that holds most of the mass and burns slowly for minutes once the canopy
+# heat lights it. Both spawn from the same per-cell tree count (gen_maps), so they always share a
+# cell; the spatial params (noise_scale/spawn_density/altitude_falloff/max_trees_per_cell) are read
+# from the first tree component (tree_canopy) and must match. fuel_per_tree splits the per-tree
+# biomass between them (0.7 + 4.3 = 5.0 kg/m^2 per tree, same total as the old single tree type).
+
+[fuel_types.tree_canopy]
+specific_heat          = 2300.0  # SI specific heat [J/(kg*K)] (wood)
+ignition_threshold     = 573.0   # pyrolysis onset temperature [K]: fine fuel lights readily
+heat_of_combustion     = 1.8e7   # HHV [J/kg]
+stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]
+arrhenius_pre          = 1.0e8   # B [kg/(m^2*s)]: eager kinetics, like grass
+activation_energy      = 1.0e5   # E_a [J/mol]: low -> ignites readily
+surface_area_to_volume = 5000.0  # sigma [1/m]: fine canopy fuel -> high surface -> fast ignite/burn (a_s = 10)
+particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
+fuel_air_transfer_rate = 12.0    # k [W/(m^2*K)]: well-coupled fine fuel
+noise_scale            = 32.0    # (tree spatial distribution; read from this first tree component)
+altitude_falloff       = 3.0     # steep: trees thin out quickly with elevation
+spawn_density          = 2.0     # mean trees per cell per unit elevation-thinned noise (exponential mean scale)
+fuel_per_tree          = 0.7     # fine-fuel loading per tree [kg/m^2] (4 trees -> 2.8 kg/m^2)
+max_trees_per_cell     = 4       # hard cap on the per-cell tree count
+
+[fuel_types.tree_bole]
 specific_heat          = 2300.0  # SI specific heat [J/(kg*K)] (wood)
 ignition_threshold     = 600.0   # pyrolysis onset temperature [K]
 heat_of_combustion     = 1.8e7   # HHV [J/kg]
 stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]
 arrhenius_pre          = 5.0e7   # B [kg/(m^2*s)]: surface kinetic-flux pre-exponential
-activation_energy      = 1.1e5   # E_a [J/mol]: higher than grass -> ignites less readily
-surface_area_to_volume = 40.0    # sigma [1/m]: coarse wood (~10 cm) -> low surface area -> slow burn
+activation_energy      = 1.1e5   # E_a [J/mol]: higher than the canopy -> ignites less readily
+surface_area_to_volume = 500.0   # sigma [1/m]: coarse branch/limb wood (a_s=1). Tuned: below ~500 the bole never catches before the canopy burns out; above ~1000 its reactive surface re-hogs the ignition deposit and re-quenches the grass front. 500 -> bole lights and burns ~slowly (~1-2 min) over its heavy load
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 8.0     # k [W/(m^2*K)]
 noise_scale            = 32.0
-altitude_falloff       = 3.0    # steep: trees thin out quickly with elevation
-spawn_density          = 2.0    # mean trees per cell per unit elevation-thinned noise (exponential mean scale)
-fuel_per_tree          = 5.0    # fuel loading contributed by each tree [kg/m^2] (up to 4 trees -> 20 kg/m^2)
-max_trees_per_cell     = 4      # hard cap on the per-cell tree count
+altitude_falloff       = 3.0
+spawn_density          = 2.0
+fuel_per_tree          = 4.3     # coarse-fuel loading per tree [kg/m^2] (4 trees -> 17.2 kg/m^2)
+max_trees_per_cell     = 4
 
 [radiant_heat]
 # Flame radiant transfer: the fire-spread mechanism. The fuel's grey-body longwave

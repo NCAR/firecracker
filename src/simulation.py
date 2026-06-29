@@ -910,9 +910,16 @@ class Simulation:
 
         C_floor    = (cp_fuel * 10.0 * self.fuel_burnt_threshold).expand_as(C_fuel)  # ~burnt-mass floor
         C_dep      = torch.maximum(C_fuel, C_floor)
-        fuel_frac  = fuel / fuel.sum(dim=-3).clamp(min=1e-12).unsqueeze(-3)
+        # Split the convected ignition heat between the cell's fuel types by reactive surface area
+        # (a_s*fuel), not bulk mass: the flame heat is intercepted at the fuel surface, so fine
+        # high-SAV fuel (grass) takes a share set by its exposed area rather than its weight. The old
+        # `fuel/total` mass split gave a co-located heavy low-SAV tree most of the heat and divided
+        # every type's rise by the cell's *total* fuel, so one tree sharing a grass cell starved the
+        # grass's own ignition and quenched the front.
+        surface    = a_s * fuel
+        surf_frac  = surface / surface.sum(dim=-3).clamp(min=1e-30).unsqueeze(-3)
         gate       = present & (fuel_temperatures < self.flame_gate_temperature)
-        dT_conv    = torch.where(gate, delivered.unsqueeze(-3) * fuel_frac / C_dep, torch.zeros_like(C_fuel))
+        dT_conv    = torch.where(gate, delivered.unsqueeze(-3) * surf_frac / C_dep, torch.zeros_like(C_fuel))
         capped     = torch.minimum(fuel_temperatures + dT_conv,
                                    torch.full_like(fuel_temperatures, self.flame_gate_temperature))
         dT_conv    = (capped - fuel_temperatures).clamp(min=0.0)
@@ -965,7 +972,11 @@ class Simulation:
         radiant_flux = self._radiant_convolve(to_neighbours).clamp(min=0.0)     # (..., H, W) absorbed
 
         # Deposit the absorbed flux into each present type proportional to its mass fraction,
-        # divided by thermal mass C_fuel = fuel*c_p,fuel to get the temperature rise.
+        # divided by thermal mass C_fuel = fuel*c_p,fuel to get the temperature rise. Unlike the
+        # convective ignition deposit (update_fire), this redistribution is NOT surface-weighted and
+        # has no gate/cap: surface-weighting would funnel the flux into the high-SAV, low-mass fuel
+        # (grass) sharing a dense cell and let its T^4 emission run away. Mass-weighting keeps the
+        # redistribution bounded; the convective deposit alone carries the surface-aware ignition.
         C_fuel = self.fuel_specific_heat * fuel                  # (..., N, H, W) [J/(m^2*K)]
         safe_C = torch.where(present, C_fuel, torch.ones_like(C_fuel))
         total_fuel = fuel.sum(dim=-3)                            # (..., H, W)

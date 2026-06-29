@@ -81,9 +81,16 @@ class MapGenerator:
         self.altitude_falloffs = np.array([_ft(n, "altitude_falloff", 1.0)  for n in self.fuel_type_names], dtype=np.float32)
         self.spawn_densities   = np.array([_ft(n, "spawn_density",     0.5)  for n in self.fuel_type_names], dtype=np.float32)
 
-        tree_cfg = fuel_types_cfg.get("tree", {})
-        self.fuel_per_tree      = float(tree_cfg.get("fuel_per_tree",      0.33))
-        self.max_trees_per_cell = int(tree_cfg.get("max_trees_per_cell",   3))
+        # Tree components: any fuel type whose name starts with "tree" (e.g. tree_canopy, tree_bole)
+        # is part of the same physical trees, so they share one per-cell count and spatial
+        # distribution. fuel_per_tree is per type (the biomass each tree contributes to that
+        # component); the count/distribution params are read from the first tree component.
+        self.fuel_per_tree = np.array(
+            [_ft(n, "fuel_per_tree", 0.0) for n in self.fuel_type_names], dtype=np.float32
+        )
+        self.tree_indices = [i for i, n in enumerate(self.fuel_type_names) if n.startswith("tree")]
+        first_tree = self.fuel_type_names[self.tree_indices[0]] if self.tree_indices else "tree"
+        self.max_trees_per_cell = int(_ft(first_tree, "max_trees_per_cell", 3))
 
     # -----------------------------------------------------------------------
     # Field builders
@@ -243,20 +250,26 @@ def generate_map(
     N = gen.num_fuel_types
     fuel = np.zeros((N, grid_size, grid_size), dtype=np.float32)
 
-    if N > 0:
-        # Grass (type 0): continuous Perlin density [kg/m^2], thinned by altitude.
-        grass_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[0]), rng=rng)
-        grass_alt = gen.altitude_vegetation_multiplier(relief, 0)
-        fuel[0] = (grass_noise * float(gen.spawn_densities[0]) * grass_alt).astype(np.float32)
+    names = gen.fuel_type_names
+    if "grass" in names:
+        # Grass: continuous Perlin density [kg/m^2], thinned by altitude.
+        gi = names.index("grass")
+        grass_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), rng=rng)
+        grass_alt = gen.altitude_vegetation_multiplier(relief, gi)
+        fuel[gi] = (grass_noise * float(gen.spawn_densities[gi]) * grass_alt).astype(np.float32)
 
-    if N > 1:
-        # Trees (type 1): per-cell counts from an exponential whose mean is the
-        # altitude-thinned noise density, capped, then scaled to fuel mass [kg/m^2].
-        tree_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[1]), rng=rng)
-        tree_alt = gen.altitude_vegetation_multiplier(relief, 1)
-        density = tree_noise * float(gen.spawn_densities[1]) * tree_alt
+    if gen.tree_indices:
+        # Trees: one stochastic per-cell count (exponential mean = altitude-thinned noise density,
+        # capped) drives every co-located tree component (canopy + bole), each scaled by its own
+        # fuel_per_tree -- so the canopy and bole of the same trees always share a cell. The count's
+        # spatial params are taken from the first tree component.
+        t0 = gen.tree_indices[0]
+        tree_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[t0]), rng=rng)
+        tree_alt = gen.altitude_vegetation_multiplier(relief, t0)
+        density = tree_noise * float(gen.spawn_densities[t0]) * tree_alt
         tree_counts = gen.sample_tree_counts(density, rng)
-        fuel[1] = (tree_counts * gen.fuel_per_tree).astype(np.float32)
+        for ti in gen.tree_indices:
+            fuel[ti] = (tree_counts * float(gen.fuel_per_tree[ti])).astype(np.float32)
 
     # Each fuel type starts at ambient air temperature.
     fuel_temperatures = np.tile(air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)
