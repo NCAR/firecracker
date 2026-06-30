@@ -1,6 +1,5 @@
 numpy
 torch
 pygame
-noise
 gymnasium
 pytest

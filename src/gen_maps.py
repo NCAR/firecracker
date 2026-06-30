@@ -9,6 +9,14 @@ profiles, the convective rest-state pressure, and the grass/tree fuel layers.
 `MapGenerator` reads what it needs straight from the config dict and emits a
 `MapData`, the same contract a future real-data importer would target.
 
+The whole rest state is built as torch tensors on `MapGenerator.device` (CUDA when
+available, else CPU -- set [environment].device or pass --device to force one), using
+the vectorized torch Perlin kernel in perlin.py instead of a per-cell scalar loop. So
+both the noise and the field math run on the GPU; only the per-map random scalars
+(noise bases, wind, tree draws) are drawn from the numpy rng, which keeps output
+reproducible and identical across devices. Fields move back to numpy at the MapData
+boundary, then the chunk is spun up on the same device.
+
 After the rest state is built, `spin_up_maps` runs the shallow-water wind solver
 to its developed orographic state and bakes the result (mass, air temperature, and
 the prognostic wind) back into each map, so a loaded map already shows the terrain-
@@ -22,15 +30,14 @@ Run as a script to bake a batch of maps to disk:
 """
 
 import argparse
-import os
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
-import noise
+import torch
 
 import physics_constants as pc
 from config import load_config
 from map_loader import MapData, save_map
+from perlin import perlin_noise
 
 DEFAULT_GRID_SIZE = 256
 
@@ -155,31 +162,36 @@ class MapGenerator:
     def sample_perlin_grid(
         self,
         size: int,
-        base: int,
+        base,
         scale: float | None = None,
         octaves: int | None = None,
         persistence: float | None = None,
         lacunarity: float | None = None,
-    ) -> np.ndarray:
+    ) -> torch.Tensor:
+        """Raw octave Perlin field(s) on self.device via the vectorized torch kernel.
+
+        `base` is an int (-> (size, size)) or a sequence of ints (-> (B, size, size),
+        one field per base), so a whole chunk of maps can be sampled in one call.
+        """
         scale       = self.noise_scale       if scale is None else scale
         octaves     = self.noise_octaves     if octaves is None else octaves
         persistence = self.noise_persistence if persistence is None else persistence
         lacunarity  = self.noise_lacunarity  if lacunarity is None else lacunarity
-        grid = np.empty((size, size), dtype=np.float32)
-        for row in range(size):
-            for col in range(size):
-                grid[row, col] = noise.pnoise2(
-                    col / scale,
-                    row / scale,
-                    octaves=octaves,
-                    persistence=persistence,
-                    lacunarity=lacunarity,
-                    base=base,
-                )
-        return grid
+        return perlin_noise(
+            size, size,
+            scale=scale, octaves=octaves, persistence=persistence, lacunarity=lacunarity,
+            base=base, device=self.device, dtype=torch.float64,
+        )
 
     @staticmethod
     def normalize_grid(grid):
+        """Min/max-normalise to [0, 1]. For a batched (B, H, W) tensor each map is
+        normalised independently (over its own H, W); a flat map maps to all zeros."""
+        if _is_torch(grid) and grid.ndim == 3:
+            lo = grid.amin(dim=(-2, -1), keepdim=True)
+            hi = grid.amax(dim=(-2, -1), keepdim=True)
+            span = hi - lo
+            return _store(torch.where(span > 0, (grid - lo) / span, torch.zeros_like(grid)))
         lo = grid.min()
         hi = grid.max()
         if hi == lo:
@@ -190,12 +202,13 @@ class MapGenerator:
         self,
         size: int,
         scale: float | None = None,
-        base: int | None = None,
+        base=None,
         octaves: int | None = None,
         persistence: float | None = None,
         lacunarity: float | None = None,
         rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
+    ) -> torch.Tensor:
+        """Normalised [0, 1] Perlin field on self.device. A None base is drawn from rng."""
         if base is None:
             base = int((rng or np.random.default_rng()).integers(0, 256))
         raw = self.sample_perlin_grid(
@@ -205,8 +218,8 @@ class MapGenerator:
         return self.normalize_grid(raw)
 
     def create_terrain(
-        self, size: int, base: int | None = None, rng: np.random.Generator | None = None
-    ) -> np.ndarray:
+        self, size: int, base=None, rng: np.random.Generator | None = None
+    ) -> torch.Tensor:
         """Normalised [0, 1] elevation height map from octave Perlin noise.
 
         The normalised map is squared to bias toward flat low-elevation terrain
@@ -221,7 +234,7 @@ class MapGenerator:
             lacunarity=self.terrain_lacunarity,
             rng=rng,
         )
-        return (height ** 2).astype(np.float32)
+        return height ** 2
 
     def air_temperature_profile(self, elevation_m):
         """Air temperature [K] from the environmental lapse rate: T = T_REF - Gamma*z."""
@@ -270,14 +283,18 @@ class MapGenerator:
         """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
         return _store((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index]))
 
-    def sample_tree_counts(self, density: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        """Stochastic per-cell tree counts.
+    def sample_tree_counts(self, density: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+        """Stochastic per-cell tree counts on density.device.
 
-        Each cell's count is floor(Exp(mean=density)) capped at max_trees_per_cell,
-        so cells with higher density average more trees (mean 0 -> always 0).
+        Each cell's count is floor(Exp(mean=density)) capped at max_trees_per_cell, so
+        cells with higher density average more trees (mean 0 -> always 0). The unit-mean
+        exponential draws come from the per-map numpy rng (so the count stays reproducible
+        and device-independent) and are scaled on-device by the density: Exp(mean=d) = d * E.
         """
-        samples = rng.exponential(np.maximum(density, 0.0))
-        return np.minimum(np.floor(samples), self.max_trees_per_cell).astype(np.float32)
+        e = rng.standard_exponential(size=tuple(density.shape))
+        e = torch.as_tensor(e, dtype=density.dtype, device=density.device)
+        samples = density.clamp(min=0.0) * e
+        return _store(torch.floor(samples).clamp(max=float(self.max_trees_per_cell)))
 
 
 def generate_map(
@@ -288,6 +305,11 @@ def generate_map(
 ) -> MapData:
     """Build one fully-baked, unperturbed initial state.
 
+    The whole rest state is built as torch tensors on gen.device (CUDA when available),
+    so the noise and field math run on the GPU; the per-map random scalars (noise bases,
+    wind, tree draws) come from the numpy rng, so output is reproducible and identical
+    across devices. Fields are moved back to numpy only at the MapData boundary.
+
     Fire is intentionally not baked here: ignition (random spawn or click) is a
     runtime concern applied by the environment, so maps describe the world at rest.
 
@@ -297,14 +319,14 @@ def generate_map(
     # Normalised [0,1] relief drives both the elevation (scaled to metres) and the
     # vegetation thinning (which is a function of fractional altitude).
     relief = gen.create_terrain(grid_size, rng=rng)
-    terrain = (relief * gen.elev_max).astype(np.float32)
+    terrain = relief * gen.elev_max
 
     # Air temperature from the lapse rate; oxygen from the hydrostatic air density.
     air_temperatures = gen.air_temperature_profile(terrain)
     oxygen = gen.oxygen_profile(terrain, air_temperatures)
 
     N = gen.num_fuel_types
-    fuel = np.zeros((N, grid_size, grid_size), dtype=np.float32)
+    fuel = torch.zeros((N, grid_size, grid_size), dtype=torch.float64, device=gen.device)
 
     names = gen.fuel_type_names
     if "grass" in names:
@@ -312,7 +334,7 @@ def generate_map(
         gi = names.index("grass")
         grass_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), rng=rng)
         grass_alt = gen.altitude_vegetation_multiplier(relief, gi)
-        fuel[gi] = (grass_noise * float(gen.spawn_densities[gi]) * grass_alt).astype(np.float32)
+        fuel[gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_alt
 
     if gen.tree_indices:
         # Trees: one stochastic per-cell count (exponential mean = altitude-thinned noise density,
@@ -325,10 +347,10 @@ def generate_map(
         density = tree_noise * float(gen.spawn_densities[t0]) * tree_alt
         tree_counts = gen.sample_tree_counts(density, rng)
         for ti in gen.tree_indices:
-            fuel[ti] = (tree_counts * float(gen.fuel_per_tree[ti])).astype(np.float32)
+            fuel[ti] = tree_counts * float(gen.fuel_per_tree[ti])
 
     # Each fuel type starts at ambient air temperature.
-    fuel_temperatures = np.tile(air_temperatures[np.newaxis], (N, 1, 1)).astype(np.float32)
+    fuel_temperatures = air_temperatures.unsqueeze(0).expand(N, -1, -1)
 
     # Shallow boundary-layer mass at its level-lid rest state (thinner over high terrain).
     mass = gen.boundary_layer_mass(terrain)
@@ -339,36 +361,29 @@ def generate_map(
     ambient_wind_x = speed * np.cos(bearing)
     ambient_wind_y = speed * np.sin(bearing)
 
+    def to_np(t: torch.Tensor) -> np.ndarray:
+        return t.detach().contiguous().to("cpu").numpy().astype(np.float32)
+
+    terrain_np = to_np(terrain)
+    air_np = to_np(air_temperatures)
+    oxygen_np = to_np(oxygen)
+
     return MapData(
-        terrain=terrain,
-        air_temperatures=air_temperatures,
-        mass=mass,
-        oxygen=oxygen,
-        fuel=fuel,
-        fuel_temperatures=fuel_temperatures,
+        terrain=terrain_np,
+        air_temperatures=air_np,
+        mass=to_np(mass),
+        oxygen=oxygen_np,
+        fuel=to_np(fuel),
+        fuel_temperatures=to_np(fuel_temperatures),
         fuel_type_names=list(gen.fuel_type_names),
         grid_size=grid_size,
-        temp_eq=air_temperatures.copy(),
-        oxygen_eq=oxygen.copy(),
+        temp_eq=air_np.copy(),
+        oxygen_eq=oxygen_np.copy(),
         seed=seed,
         source="gen_maps",
         ambient_wind_x=ambient_wind_x,
         ambient_wind_y=ambient_wind_y,
     )
-
-
-def _generate_one(task: tuple) -> MapData:
-    """Build one rest-state map. Top-level (picklable) so it can run in a worker process.
-
-    Rest-state generation is pure-Python Perlin noise (a scalar per-cell loop), the slowest part
-    of map-making and embarrassingly parallel across maps, so it is fanned out over a process pool.
-    Each worker rebuilds its own MapGenerator from the config (cheap) and draws from the per-map
-    SeedSequence child, so the output is identical to and independent of the serial path.
-    """
-    cfg, grid_size, child, map_seed = task
-    gen = MapGenerator(cfg)
-    rng = np.random.default_rng(child)
-    return generate_map(gen, grid_size, rng, seed=map_seed)
 
 
 def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int = 16) -> None:
@@ -393,9 +408,8 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
     """
     if steps <= 0 or not maps:
         return
-    # Imported here (not at module load) so the rest-state generator stays import-light and the
-    # engine dependency is confined to the spin-up.
-    import torch
+    # Simulation is imported here (not at module load) so the engine dependency stays confined
+    # to the spin-up; the rest-state build only needs the lightweight torch Perlin kernel.
     from simulation import Simulation, SimState
 
     sim = Simulation(cfg)
@@ -454,8 +468,9 @@ def main() -> None:
         help="first output file index (e.g. 8 to append after map_0007 without overwriting)",
     )
     parser.add_argument(
-        "--jobs", type=int, default=None,
-        help="parallel worker processes for rest-state generation (default: all CPUs)",
+        "--device", default=None,
+        help="generation device: 'cuda', 'cpu', or omit to auto-select (cuda when available). "
+             "Overrides [environment].device from the config.",
     )
     parser.add_argument(
         "--chunk", type=int, default=32,
@@ -464,40 +479,34 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    if args.device is not None:
+        config.setdefault("environment", {})["device"] = args.device
     grid_size = int((config or {}).get("environment", {}).get("grid_size", DEFAULT_GRID_SIZE))
     gen = MapGenerator(config)
-    jobs = args.jobs if args.jobs is not None else (os.cpu_count() or 1)
     chunk = max(1, args.chunk)
 
-    # Per-map seeds, spawned once so each map is reproducible regardless of chunking/parallelism.
+    # Per-map seeds, spawned once so each map is reproducible regardless of chunking.
     children = np.random.SeedSequence(args.seed).spawn(args.count)
     seeds = [int(c.generate_state(1)[0]) for c in children]
 
     print(f"Generating {args.count} map(s) at {grid_size}x{grid_size} into '{args.out}/' "
-          f"({jobs} worker(s), chunk={chunk}, spinup={gen.spinup_steps} ticks) ...", flush=True)
+          f"(device={gen.device}, chunk={chunk}, spinup={gen.spinup_steps} ticks) ...", flush=True)
 
-    # Process the maps in chunks: generate the chunk's rest states in parallel, spin up the whole
-    # chunk in one batched solver pass, then save it before moving on. So progress is durable (each
-    # chunk is on disk before the next starts), memory stays bounded (one chunk in RAM), and the
-    # parallel Perlin generation overlaps across CPUs -- the slow part of map-making.
-    def run(pool) -> None:
-        done = 0
-        for start in range(0, args.count, chunk):
-            idx = range(start, min(start + chunk, args.count))
-            tasks = [(config, grid_size, children[i], seeds[i]) for i in idx]
-            maps = list(pool.map(_generate_one, tasks)) if pool else [_generate_one(t) for t in tasks]
-            if gen.spinup_steps > 0:
-                spin_up_maps(maps, config, gen.spinup_steps)
-            for off, m in enumerate(maps):
-                save_map(f"{args.out}/{args.prefix}_{args.start_index + start + off:04d}.npz", m)
-            done += len(maps)
-            print(f"  [{done}/{args.count}] generated + spun up + saved", flush=True)
-
-    if jobs > 1:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            run(pool)
-    else:
-        run(None)
+    # Process the maps in chunks: build each rest state on the device (the torch Perlin kernel and
+    # field math run on the GPU when present), spin up the whole chunk in one batched solver pass,
+    # then save it before moving on. So progress is durable (each chunk is on disk before the next
+    # starts) and memory stays bounded (one chunk resident at a time).
+    done = 0
+    for start in range(0, args.count, chunk):
+        idx = range(start, min(start + chunk, args.count))
+        maps = [generate_map(gen, grid_size, np.random.default_rng(children[i]), seed=seeds[i])
+                for i in idx]
+        if gen.spinup_steps > 0:
+            spin_up_maps(maps, config, gen.spinup_steps)
+        for off, m in enumerate(maps):
+            save_map(f"{args.out}/{args.prefix}_{args.start_index + start + off:04d}.npz", m)
+        done += len(maps)
+        print(f"  [{done}/{args.count}] generated + spun up + saved", flush=True)
     print("Done.", flush=True)
 
 

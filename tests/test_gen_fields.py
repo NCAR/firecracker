@@ -88,6 +88,33 @@ def test_zero_lapse_rate_uses_isothermal_pressure():
     assert np.allclose(p_np, p_t.numpy(), rtol=1e-5, atol=1e-2)
 
 
+def test_batched_normalize_is_per_map():
+    # A batched (B, H, W) tensor normalises each map over its own extent: every map's
+    # min -> 0 and max -> 1 independently, regardless of the other maps' ranges.
+    gen = _gen()
+    batch = torch.stack([
+        torch.linspace(0.0, 1.0, GRID * GRID, dtype=torch.float64).reshape(GRID, GRID),
+        torch.linspace(-5.0, 50.0, GRID * GRID, dtype=torch.float64).reshape(GRID, GRID),
+    ])
+    out = gen.normalize_grid(batch)
+    assert out.shape == batch.shape
+    per_map_min = out.amin(dim=(-2, -1))
+    per_map_max = out.amax(dim=(-2, -1))
+    assert torch.allclose(per_map_min, torch.zeros(2, dtype=out.dtype), atol=1e-9)
+    assert torch.allclose(per_map_max, torch.ones(2, dtype=out.dtype), atol=1e-9)
+
+
+def test_batched_sample_perlin_matches_per_map():
+    # sample_perlin_grid with a list of bases stacks the per-base fields, so a future
+    # batched build matches looping generate_map.
+    gen = _gen()
+    bases = [1, 7, 19]
+    batch = gen.sample_perlin_grid(GRID, bases, scale=24.0)
+    assert batch.shape == (3, GRID, GRID)
+    stacked = torch.stack([gen.sample_perlin_grid(GRID, b, scale=24.0) for b in bases])
+    assert torch.allclose(batch, stacked)
+
+
 def test_device_property_resolves():
     # The lazy device property resolves to a real torch device without needing a GPU.
     dev = MapGenerator(load_config()).device
