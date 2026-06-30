@@ -48,6 +48,14 @@ from torch.utils.data import DataLoader, random_split
 from autoencoder import ConvAutoencoder
 from config import load_config
 from rollout import BatchedRollout, FireDataset
+from strided_autoencoder import StridedConvAutoencoder
+
+# Selectable autoencoder architectures (both share the same constructor signature and the
+# (reconstruction, latent) forward contract); --arch picks one by key.
+ARCHITECTURES = {
+    "shuffle": ConvAutoencoder,         # pixel-unshuffle/shuffle resampling
+    "strided": StridedConvAutoencoder,  # 2x2 stride-2 conv / transposed-conv resampling
+}
 
 
 def _resolve_device(name: str | None) -> torch.device:
@@ -183,6 +191,9 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true",
                         help="use mixed-precision autocast + GradScaler (CUDA only)")
     # Model
+    parser.add_argument("--arch", choices=tuple(ARCHITECTURES), default="shuffle",
+                        help="autoencoder architecture: 'shuffle' (pixel-shuffle resampling, "
+                             "default) or 'strided' (2x2 stride-2 conv resampling)")
     parser.add_argument("--channels", type=_parse_channels,
                         default=(8, 16, 32, 64, 128, 256, 512, 1024),
                         help="encoder channel widths per downsample stage; the last is the "
@@ -230,14 +241,15 @@ def main() -> None:
     )
 
     # 2. Model / optimiser ----------------------------------------------------
-    model = ConvAutoencoder(
+    model = ARCHITECTURES[args.arch](
         in_channels=in_channels,
         grid_size=grid_size,
         channels=args.channels,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     latent_shape = f"{model.latent_channels}x{model.latent_size}x{model.latent_size}"
-    print(f"model: channels={args.channels} latent={latent_shape} params={n_params:,}")
+    print(f"model: arch={args.arch} channels={args.channels} latent={latent_shape} "
+          f"params={n_params:,}")
 
     loss_fn = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -247,6 +259,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     # The config an inference/eval script needs to rebuild the exact architecture.
     model_config = {
+        "arch": args.arch,
         "in_channels": in_channels,
         "grid_size": grid_size,
         "channels": list(args.channels),
