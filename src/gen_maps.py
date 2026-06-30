@@ -35,10 +35,58 @@ from map_loader import MapData, save_map
 DEFAULT_GRID_SIZE = 256
 
 
+# ---------------------------------------------------------------------------
+# Array-library helpers
+#
+# The field builders (temperature, pressure, mass, oxygen, vegetation thinning) are
+# pure elementwise math, so they run unchanged on either a NumPy array (the CPU path
+# and the test API) or a torch tensor (the batched GPU build path). These tiny helpers
+# pick the right module and storage cast without importing torch at module load -- torch
+# is only touched when a tensor is actually passed in, keeping rest-state generation
+# import-light (the engine dependency stays confined to the spin-up).
+# ---------------------------------------------------------------------------
+
+def _is_torch(arr) -> bool:
+    return type(arr).__module__.split(".", 1)[0] == "torch"
+
+
+def _xp(arr):
+    """The array module backing `arr`: torch for a tensor, numpy otherwise."""
+    if _is_torch(arr):
+        import torch
+        return torch
+    return np
+
+
+def _store(arr):
+    """Cast a built field to its storage dtype.
+
+    NumPy fields are stored float32 (the MapData/on-disk convention); torch tensors are
+    left in the engine's compute dtype (float64) until the MapData boundary, so the GPU
+    build keeps full precision through to the spin-up.
+    """
+    return arr if _is_torch(arr) else arr.astype(np.float32)
+
+
+def _resolve_device(name: str | None):
+    """Pick the generation device (mirrors simulation._resolve_device): an explicit
+    config value wins, else CUDA when present. Imports torch lazily."""
+    import torch
+    if name:
+        return torch.device(name)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class MapGenerator:
     """Procedural initial-state generator driven entirely by the config dict."""
 
     def __init__(self, cfg: dict | None = None):
+        # Target device for the batched GPU build path (slice 3). Stored as the raw
+        # config name and resolved lazily via the `device` property, so constructing a
+        # generator (e.g. in the tests) never imports torch.
+        self._device_name = (cfg or {}).get("environment", {}).get("device")
+        self._device = None
+
         noise_cfg = (cfg or {}).get("noise", {})
         self.noise_scale       = float(noise_cfg.get("scale",      64.0))
         self.noise_octaves     = int(noise_cfg.get("octaves",       4))
@@ -92,6 +140,14 @@ class MapGenerator:
         first_tree = self.fuel_type_names[self.tree_indices[0]] if self.tree_indices else "tree"
         self.max_trees_per_cell = int(_ft(first_tree, "max_trees_per_cell", 3))
 
+    @property
+    def device(self):
+        """The resolved torch device for the GPU build path (CUDA when available,
+        else CPU; an explicit config name wins). Resolved and cached on first use."""
+        if self._device is None:
+            self._device = _resolve_device(self._device_name)
+        return self._device
+
     # -----------------------------------------------------------------------
     # Field builders
     # -----------------------------------------------------------------------
@@ -123,12 +179,12 @@ class MapGenerator:
         return grid
 
     @staticmethod
-    def normalize_grid(grid: np.ndarray) -> np.ndarray:
+    def normalize_grid(grid):
         lo = grid.min()
         hi = grid.max()
         if hi == lo:
-            return np.zeros_like(grid)
-        return ((grid - lo) / (hi - lo)).astype(np.float32)
+            return _store(_xp(grid).zeros_like(grid))
+        return _store((grid - lo) / (hi - lo))
 
     def create_grid(
         self,
@@ -167,11 +223,11 @@ class MapGenerator:
         )
         return (height ** 2).astype(np.float32)
 
-    def air_temperature_profile(self, elevation_m: np.ndarray) -> np.ndarray:
+    def air_temperature_profile(self, elevation_m):
         """Air temperature [K] from the environmental lapse rate: T = T_REF - Gamma*z."""
-        return (pc.T_REF - self.temperature_lapse_rate * elevation_m).astype(np.float32)
+        return _store(pc.T_REF - self.temperature_lapse_rate * elevation_m)
 
-    def pressure_profile(self, elevation_m: np.ndarray) -> np.ndarray:
+    def pressure_profile(self, elevation_m):
         """Hydrostatic surface pressure [Pa].
 
         Exact barometric formula for the constant lapse rate Gamma, integrating
@@ -184,12 +240,12 @@ class MapGenerator:
         """
         gamma = self.temperature_lapse_rate
         if gamma <= 0.0:
-            return (pc.P_REF * np.exp(-elevation_m / pc.PRESSURE_SCALE_HEIGHT)).astype(np.float32)
+            return _store(pc.P_REF * _xp(elevation_m).exp(-elevation_m / pc.PRESSURE_SCALE_HEIGHT))
         exponent = pc.GRAVITY / (pc.GAS_CONSTANT_DRY_AIR * gamma)
         base = 1.0 - gamma * elevation_m / pc.T_REF   # = T(z)/T_REF, positive for z < T_REF/Gamma
-        return (pc.P_REF * base ** exponent).astype(np.float32)
+        return _store(pc.P_REF * base ** exponent)
 
-    def boundary_layer_mass(self, elevation_m: np.ndarray) -> np.ndarray:
+    def boundary_layer_mass(self, elevation_m):
         """Level-lid boundary-layer mass per area [kg/m^2] -- the shallow-water rest state.
 
         The modelled layer is a shallow near-surface layer, not the whole column. At rest its
@@ -203,16 +259,16 @@ class MapGenerator:
         lid = self.elev_max + self.layer_depth_ref            # level free-surface height [m]
         h = lid - elevation_m                                  # layer depth [m]
         T = self.air_temperature_profile(elevation_m)
-        return (h * pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * T)).astype(np.float32)
+        return _store(h * pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * T))
 
-    def oxygen_profile(self, elevation_m: np.ndarray, air_temperatures: np.ndarray) -> np.ndarray:
+    def oxygen_profile(self, elevation_m, air_temperatures):
         """Ambient O2 partial density [kg/m^3] = O2 mass fraction * air density p/(R_d*T)."""
         air_density = self.pressure_profile(elevation_m) / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures)
-        return (pc.O2_MASS_FRACTION * air_density).astype(np.float32)
+        return _store(pc.O2_MASS_FRACTION * air_density)
 
-    def altitude_vegetation_multiplier(self, terrain: np.ndarray, fuel_index: int) -> np.ndarray:
+    def altitude_vegetation_multiplier(self, terrain, fuel_index: int):
         """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
-        return ((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index])).astype(np.float32)
+        return _store((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index]))
 
     def sample_tree_counts(self, density: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         """Stochastic per-cell tree counts.
