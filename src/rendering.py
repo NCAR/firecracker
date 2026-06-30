@@ -43,6 +43,7 @@ VEGETATION_COLORS: dict[str, tuple[float, float, float]] = {
     "tree_canopy": (0.0,  1.0, 0.0),   # green (a tree's fine fuel)
     "tree_bole":   (0.0,  1.0, 0.0),   # green (a tree's coarse fuel)
     "grass":       (0.75, 1.0, 0.0),   # yellow-green
+    "shrub":       (0.5,  0.75, 0.25), # muted olive-green (woody scrub)
 }
 DEFAULT_VEGETATION_COLOR: tuple[float, float, float] = (0.0, 1.0, 0.0)
 

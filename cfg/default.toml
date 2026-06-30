@@ -49,6 +49,7 @@ scale       = 96.0
 octaves     = 6
 persistence = 0.5
 lacunarity  = 2.0
+exponent    = 1.0       # power applied to the normalised relief: >1 flattens lowlands and sharpens peaks; 1 = raw noise
 elev_max    = 500.0     # peak elevation [m] (the normalised relief is scaled by this)
 # Air temperature falls with elevation at the environmental lapse rate: T = T_REF - rate*z.
 # Oxygen and column mass follow the hydrostatic profile (see physics_constants.py), so
@@ -184,6 +185,26 @@ fuel_air_transfer_rate = 12.0    # k [W/(m^2*K)]: fuel<->air convective conducta
 noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
 altitude_falloff       = 0.5    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
 spawn_density          = 1.5    # peak grass loading [kg/m^2] (scales the [0,1] noise)
+
+# Shrub (chaparral/sagebrush-type woody scrub): a continuous fuel like grass, but woodier. Real
+# shrubs carry fine, often resinous/waxy foliage on small woody stems, so they sit between grass and
+# tree foliage: a SAV below grass (more woody stem, less fine surface) makes them ignite and burn a
+# touch slower than grass, landing them at about the tree-canopy flammability the comment below
+# describes, and well above the coarse, hard-to-light bole. Their volatile oils give a high heat
+# content (real chaparral HHV ~19-21 MJ/kg, above both grass and clean wood).
+[fuel_types.shrub]
+specific_heat          = 2000.0  # SI specific heat [J/(kg*K)]: woody foliage, between dry grass (1800) and wood (2300)
+ignition_threshold     = 573.0   # pyrolysis onset temperature [K] (~300 C): fine foliage lights readily, like grass
+heat_of_combustion     = 1.9e7   # HHV [J/kg]: resinous/waxy extractives -> energetic, above grass (1.6e7) and wood (1.8e7)
+stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]: lignocellulosic, same as the other fuels
+arrhenius_pre          = 8.0e7   # B [kg/(m^2*s)]: eager kinetics near the canopy's 1.0e8, above the bole's 5.0e7
+activation_energy      = 1.0e5   # E_a [J/mol]: ignites readily, same gate as grass/canopy (not the bole's higher 1.1e5)
+surface_area_to_volume = 4000.0  # sigma [1/m]: foliage + small woody stems -> below grass (12000) and just under the canopy (5000); a_s = 8
+particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
+fuel_air_transfer_rate = 10.0    # k [W/(m^2*K)]: between the fine canopy (12) and the coarse bole (8)
+noise_scale            = 32.0    # spatial scale for Perlin noise initialisation
+altitude_falloff       = 1.0     # hardier than trees (3.0), less persistent than grass (0.5): mid-slope scrub
+spawn_density          = 1.0     # peak shrub loading [kg/m^2] (scales the [0,1] noise)
 
 # A tree is modelled as two co-located fuel types (Phase 6b): a light, high-SAV CANOPY (foliage,
 # twigs, bark) that ignites readily from a passing front and carries the flame, and a heavy, low-SAV

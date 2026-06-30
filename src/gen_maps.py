@@ -105,6 +105,9 @@ class MapGenerator:
         self.terrain_octaves     = int(terrain.get("octaves",       6))
         self.terrain_persistence = float(terrain.get("persistence", 0.5))
         self.terrain_lacunarity  = float(terrain.get("lacunarity",  2.0))
+        # Exponent applied to the normalised [0,1] height map: >1 biases toward flat low-elevation
+        # terrain with sharper, less frequent peaks; 1 leaves the raw Perlin field unchanged.
+        self.terrain_exponent    = float(terrain.get("exponent",     1.0))
         # SI elevation: the normalised [0,1] height map is scaled to metres by elev_max.
         self.elev_max               = float(terrain.get("elev_max",               500.0))
         # Environmental lapse rate [K/m]: air temperature falls T_REF - rate*elevation.
@@ -222,8 +225,8 @@ class MapGenerator:
     ) -> torch.Tensor:
         """Normalised [0, 1] elevation height map from octave Perlin noise.
 
-        The normalised map is squared to bias toward flat low-elevation terrain
-        with sharper, less frequent high-elevation peaks.
+        Raised to terrain_exponent (default 1, no-op): >1 biases toward flat
+        low-elevation terrain with sharper, less frequent high-elevation peaks.
         """
         height = self.create_grid(
             size,
@@ -234,7 +237,7 @@ class MapGenerator:
             lacunarity=self.terrain_lacunarity,
             rng=rng,
         )
-        return height ** 2
+        return height ** self.terrain_exponent
 
     def air_temperature_profile(self, elevation_m):
         """Air temperature [K] from the environmental lapse rate: T = T_REF - Gamma*z."""
@@ -335,6 +338,14 @@ def generate_map(
         grass_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), rng=rng)
         grass_alt = gen.altitude_vegetation_multiplier(relief, gi)
         fuel[gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_alt
+
+    if "shrub" in names:
+        # Shrub: continuous Perlin density [kg/m^2], thinned by altitude (same form as grass, its
+        # own noise field so the two layers are spatially independent).
+        si = names.index("shrub")
+        shrub_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[si]), rng=rng)
+        shrub_alt = gen.altitude_vegetation_multiplier(relief, si)
+        fuel[si] = shrub_noise * float(gen.spawn_densities[si]) * shrub_alt
 
     if gen.tree_indices:
         # Trees: one stochastic per-cell count (exponential mean = altitude-thinned noise density,
