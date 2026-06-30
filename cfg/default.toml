@@ -51,6 +51,9 @@ persistence = 0.5
 lacunarity  = 2.0
 exponent    = 1.0       # power applied to the normalised relief: >1 flattens lowlands and sharpens peaks; 1 = raw noise
 elev_max    = 500.0     # peak elevation [m] (the normalised relief is scaled by this)
+# Half-saturation slope (rise/run) for the slope-based vegetation preference: cells steeper than
+# this read as "steep" (favouring trees), gentler ones as "flat" (favouring grass). See fuel_types.
+slope_ref   = 0.5
 # Air temperature falls with elevation at the environmental lapse rate: T = T_REF - rate*z.
 # Oxygen and column mass follow the hydrostatic profile (see physics_constants.py), so
 # there is no separate oxygen falloff knob any more.
@@ -182,9 +185,10 @@ activation_energy      = 1.0e5   # E_a [J/mol]: Arrhenius activation energy
 surface_area_to_volume = 12000.0 # sigma [1/m]: surface-area-to-volume ratio (fine grass -> fast burn)
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 12.0    # k [W/(m^2*K)]: fuel<->air convective conductance
-noise_scale            = 32.0   # spatial scale for Perlin noise initialisation
-altitude_falloff       = 0.5    # vegetation thinning with elevation: (1-h)^falloff; gentle, grass persists at altitude
-spawn_density          = 1.5    # peak grass loading [kg/m^2] (scales the [0,1] noise)
+noise_scale            = 130.0  # spatial scale for Perlin noise: large -> grass varies in big patches/meadows rather than fine speckle
+slope_preference       = "flat" # grass favours flatter ground
+slope_falloff          = 1.5    # exponent on the normalised slope: how sharply grass thins on steeper ground (raised so grass recedes from slopes and leaves them to the trees)
+spawn_density          = 1.0    # peak grass loading [kg/m^2] (scales the [0,1] noise)
 
 # Shrub (chaparral/sagebrush-type woody scrub): a continuous fuel like grass, but woodier. Real
 # shrubs carry fine, often resinous/waxy foliage on small woody stems, so they sit between grass and
@@ -202,16 +206,17 @@ activation_energy      = 1.0e5   # E_a [J/mol]: ignites readily, same gate as gr
 surface_area_to_volume = 4000.0  # sigma [1/m]: foliage + small woody stems -> below grass (12000) and just under the canopy (5000); a_s = 8
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 10.0    # k [W/(m^2*K)]: between the fine canopy (12) and the coarse bole (8)
-noise_scale            = 32.0    # spatial scale for Perlin noise initialisation
-altitude_falloff       = 1.0     # hardier than trees (3.0), less persistent than grass (0.5): mid-slope scrub
-spawn_density          = 1.0     # peak shrub loading [kg/m^2] (scales the [0,1] noise)
+noise_scale            = 110.0   # spatial scale for Perlin noise: large -> shrub forms big patches rather than fine speckle
+slope_preference       = "flat"  # leans flat like grass, but the gentle falloff keeps it on mid-slope scrub too
+slope_falloff          = 0.5     # exponent on the normalised slope: gentle, so shrub persists onto moderate slopes
+spawn_density          = 0.8     # peak shrub loading [kg/m^2] (scales the [0,1] noise)
 
 # A tree is modelled as two co-located fuel types (Phase 6b): a light, high-SAV CANOPY (foliage,
 # twigs, bark) that ignites readily from a passing front and carries the flame, and a heavy, low-SAV
 # BOLE (trunk, big limbs) that holds most of the mass and burns slowly for minutes once the canopy
 # heat lights it. Both spawn from the same per-cell tree count (gen_maps), so they always share a
-# cell; the spatial params (noise_scale/spawn_density/altitude_falloff/max_trees_per_cell) are read
-# from the first tree component (tree_canopy) and must match. fuel_per_tree splits the per-tree
+# cell; the spatial params (noise_scale/spawn_density/slope_preference/slope_falloff/max_trees_per_cell)
+# are read from the first tree component (tree_canopy) and must match. fuel_per_tree splits the per-tree
 # biomass between them (0.7 + 4.3 = 5.0 kg/m^2 per tree, same total as the old single tree type).
 
 [fuel_types.tree_canopy]
@@ -224,9 +229,10 @@ activation_energy      = 1.0e5   # E_a [J/mol]: low -> ignites readily
 surface_area_to_volume = 5000.0  # sigma [1/m]: fine canopy fuel -> high surface -> fast ignite/burn (a_s = 10)
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 12.0    # k [W/(m^2*K)]: well-coupled fine fuel
-noise_scale            = 32.0    # (tree spatial distribution; read from this first tree component)
-altitude_falloff       = 3.0     # steep: trees thin out quickly with elevation
-spawn_density          = 2.0     # mean trees per cell per unit elevation-thinned noise (exponential mean scale)
+noise_scale            = 150.0   # spatial scale for Perlin noise: large -> trees gather into big stands with wide gaps (tree spatial distribution; read from this first tree component)
+slope_preference       = "steep" # trees favour steeper ground
+slope_falloff          = 2.0     # exponent on the normalised slope: sharp, so trees concentrate on the steeper ground and stay off flats/valleys (steep:flat coverage ~3.5:1)
+spawn_density          = 5.0     # mean trees per cell per unit slope-biased noise (exponential mean scale). Sets how much of the steeper ground fills with forest: the per-cell count is floor(Exp(mean=density)), so a cell needs density~O(1) for a decent chance of a tree (~20% cell coverage at 5.0, paired with slope_falloff 2.0). Does not change the per-cell cap (max_trees_per_cell), so peak fuel loading is unchanged.
 fuel_per_tree          = 0.7     # fine-fuel loading per tree [kg/m^2] (4 trees -> 2.8 kg/m^2)
 max_trees_per_cell     = 4       # hard cap on the per-cell tree count
 
@@ -240,9 +246,10 @@ activation_energy      = 1.1e5   # E_a [J/mol]: higher than the canopy -> ignite
 surface_area_to_volume = 500.0   # sigma [1/m]: coarse branch/limb wood (a_s=1). Tuned: below ~500 the bole never catches before the canopy burns out; above ~1000 its reactive surface re-hogs the ignition deposit and re-quenches the grass front. 500 -> bole lights and burns ~slowly (~1-2 min) over its heavy load
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 8.0     # k [W/(m^2*K)]
-noise_scale            = 32.0
-altitude_falloff       = 3.0
-spawn_density          = 2.0
+noise_scale            = 150.0   # must match tree_canopy (shared tree spatial distribution)
+slope_preference       = "steep"
+slope_falloff          = 2.0
+spawn_density          = 5.0
 fuel_per_tree          = 4.3     # coarse-fuel loading per tree [kg/m^2] (4 trees -> 17.2 kg/m^2)
 max_trees_per_cell     = 4
 

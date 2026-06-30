@@ -34,18 +34,14 @@ def _elevation_np() -> np.ndarray:
     return z
 
 
-def _relief_np() -> np.ndarray:
-    # Normalised [0, 1] relief, the input the vegetation multiplier expects.
-    return np.linspace(0.0, 1.0, GRID * GRID, dtype=np.float32).reshape(GRID, GRID)
-
-
 def test_numpy_in_numpy_out_float32():
     gen = _gen()
     z = _elevation_np()
     air = gen.air_temperature_profile(z)
     for field in (air, gen.pressure_profile(z), gen.boundary_layer_mass(z),
                   gen.oxygen_profile(z, air),
-                  gen.altitude_vegetation_multiplier(_relief_np(), 0),
+                  gen.terrain_slope(z),
+                  gen.slope_vegetation_multiplier(gen.terrain_slope(z), 0),
                   gen.normalize_grid(z)):
         assert isinstance(field, np.ndarray)
         assert field.dtype == np.float32
@@ -55,8 +51,6 @@ def test_torch_in_torch_out_matches_numpy():
     gen = _gen()
     z_np = _elevation_np()
     z_t = torch.as_tensor(z_np, dtype=torch.float64)
-    relief_np = _relief_np()
-    relief_t = torch.as_tensor(relief_np, dtype=torch.float64)
 
     air_np = gen.air_temperature_profile(z_np)
     air_t = gen.air_temperature_profile(z_t)
@@ -67,8 +61,9 @@ def test_torch_in_torch_out_matches_numpy():
         (gen.pressure_profile(z_np), gen.pressure_profile(z_t)),
         (gen.boundary_layer_mass(z_np), gen.boundary_layer_mass(z_t)),
         (gen.oxygen_profile(z_np, air_np), gen.oxygen_profile(z_t, air_t)),
-        (gen.altitude_vegetation_multiplier(relief_np, 0),
-         gen.altitude_vegetation_multiplier(relief_t, 0)),
+        (gen.terrain_slope(z_np), gen.terrain_slope(z_t)),
+        (gen.slope_vegetation_multiplier(gen.terrain_slope(z_np), 0),
+         gen.slope_vegetation_multiplier(gen.terrain_slope(z_t), 0)),
         (gen.normalize_grid(z_np), gen.normalize_grid(z_t)),
     ]
     for arr_np, arr_t in pairs:

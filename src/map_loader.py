@@ -37,7 +37,13 @@ MAP_SUFFIX = ".npz"
 #        GPU-capable) instead of the noise C library. Field semantics are unchanged; the
 #        noise implementation differs, so v4 maps' relief/fuel differ pixel-for-pixel and
 #        are rejected (regenerate). Same seed is reproducible and identical across devices.
-UNITS_VERSION = 5
+#   v6 = added a shrub fuel layer and a tunable terrain exponent, so the fuel stack and relief
+#        differ from v5; v5 maps are rejected (regenerate).
+#   v7 = vegetation density is driven by terrain slope, not elevation: grass/shrub favour
+#        flatter ground and trees favour steeper ground (per-fuel slope_preference/slope_falloff),
+#        with enlarged fuel noise scales so each fuel gathers into big patches. v6 fuel maps
+#        differ, so they are rejected (regenerate).
+UNITS_VERSION = 7
 
 # Maps live at <repo_root>/maps by default (alongside cfg/), same convention as
 # config.py. A relative maps dir is anchored here so the app finds its maps

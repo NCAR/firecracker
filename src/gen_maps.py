@@ -92,6 +92,10 @@ class MapGenerator:
         # config name and resolved lazily via the `device` property, so constructing a
         # generator (e.g. in the tests) never imports torch.
         self._device_name = (cfg or {}).get("environment", {}).get("device")
+
+        # Cell size [m] sets the grid spacing used to turn the elevation field into a
+        # physical slope (rise/run) for the slope-based vegetation preference.
+        self.cell_size_m = float((cfg or {}).get("units", {}).get("cell_size_m", 10.0))
         self._device = None
 
         noise_cfg = (cfg or {}).get("noise", {})
@@ -108,6 +112,9 @@ class MapGenerator:
         # Exponent applied to the normalised [0,1] height map: >1 biases toward flat low-elevation
         # terrain with sharper, less frequent peaks; 1 leaves the raw Perlin field unchanged.
         self.terrain_exponent    = float(terrain.get("exponent",     1.0))
+        # Half-saturation slope (rise/run) for the slope-based vegetation preference: cells at this
+        # slope sit at the midpoint between the flat-loving and steep-loving extremes.
+        self.slope_ref              = float(terrain.get("slope_ref",              0.5))
         # SI elevation: the normalised [0,1] height map is scaled to metres by elev_max.
         self.elev_max               = float(terrain.get("elev_max",               500.0))
         # Environmental lapse rate [K/m]: air temperature falls T_REF - rate*elevation.
@@ -136,13 +143,22 @@ class MapGenerator:
             return float(fuel_types_cfg.get(name, {}).get(key, default))
 
         self.fuel_noise_scales = np.array([_ft(n, "noise_scale",      32.0) for n in self.fuel_type_names], dtype=np.float32)
-        self.altitude_falloffs = np.array([_ft(n, "altitude_falloff", 1.0)  for n in self.fuel_type_names], dtype=np.float32)
         self.spawn_densities   = np.array([_ft(n, "spawn_density",     0.5)  for n in self.fuel_type_names], dtype=np.float32)
+
+        # Slope-based vegetation preference: each fuel either prefers flat ground (grass) or steep
+        # ground (trees), with slope_falloff sharpening that bias. slope_preference is "flat" or
+        # "steep" (default flat); slope_falloff is the exponent on the normalised slope.
+        self.slope_falloffs    = np.array([_ft(n, "slope_falloff",    1.0)  for n in self.fuel_type_names], dtype=np.float32)
+        self.slope_prefer_steep = np.array(
+            [str(fuel_types_cfg.get(n, {}).get("slope_preference", "flat")).lower() == "steep"
+             for n in self.fuel_type_names]
+        )
 
         # Tree components: any fuel type whose name starts with "tree" (e.g. tree_canopy, tree_bole)
         # is part of the same physical trees, so they share one per-cell count and spatial
         # distribution. fuel_per_tree is per type (the biomass each tree contributes to that
-        # component); the count/distribution params are read from the first tree component.
+        # component); the count/distribution params (noise/spawn/slope) are read from the first
+        # tree component.
         self.fuel_per_tree = np.array(
             [_ft(n, "fuel_per_tree", 0.0) for n in self.fuel_type_names], dtype=np.float32
         )
@@ -282,9 +298,30 @@ class MapGenerator:
         air_density = self.pressure_profile(elevation_m) / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures)
         return _store(pc.O2_MASS_FRACTION * air_density)
 
-    def altitude_vegetation_multiplier(self, terrain, fuel_index: int):
-        """Per-cell vegetation density scale from elevation: (1 - h)^falloff in [0, 1]."""
-        return _store((1.0 - terrain) ** float(self.altitude_falloffs[fuel_index]))
+    def terrain_slope(self, elevation_m):
+        """Per-cell terrain slope magnitude (rise/run, dimensionless) of the elevation field [m].
+
+        Central differences along both grid axes with cell_size_m spacing (one-sided at the
+        edges), then |grad z|. Drives the slope-based vegetation preference below."""
+        dz = float(self.cell_size_m)
+        if _is_torch(elevation_m):
+            gy, gx = torch.gradient(elevation_m, spacing=dz)
+            return _store((gx * gx + gy * gy).sqrt())
+        gy, gx = np.gradient(elevation_m, dz)
+        return _store(np.sqrt(gx * gx + gy * gy))
+
+    def slope_vegetation_multiplier(self, slope, fuel_index: int):
+        """Per-cell vegetation density scale from terrain slope, in [0, 1].
+
+        The normalised slope s = slope/(slope + slope_ref) is 0 on flat ground and -> 1 on
+        steep ground (= 0.5 at slope_ref). Flat-preferring fuels (grass) scale as (1 - s)^k and
+        steep-preferring fuels (trees) as s^k, where k is the per-fuel slope_falloff -- so grass
+        favours gentle ground and trees favour steeper slopes."""
+        s = slope / (slope + self.slope_ref)
+        k = float(self.slope_falloffs[fuel_index])
+        if bool(self.slope_prefer_steep[fuel_index]):
+            return _store(s ** k)
+        return _store((1.0 - s) ** k)
 
     def sample_tree_counts(self, density: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
         """Stochastic per-cell tree counts on density.device.
@@ -319,10 +356,11 @@ def generate_map(
     All fields are SI: terrain [m], air_temperatures [K], mass [kg/m^2], oxygen
     [kg/m^3], fuel [kg/m^2].
     """
-    # Normalised [0,1] relief drives both the elevation (scaled to metres) and the
-    # vegetation thinning (which is a function of fractional altitude).
+    # Normalised [0,1] relief is scaled to metres for the elevation; its per-cell slope
+    # (rise/run) drives the vegetation preference (flat-loving grass, steep-loving trees).
     relief = gen.create_terrain(grid_size, rng=rng)
     terrain = relief * gen.elev_max
+    slope = gen.terrain_slope(terrain)
 
     # Air temperature from the lapse rate; oxygen from the hydrostatic air density.
     air_temperatures = gen.air_temperature_profile(terrain)
@@ -333,29 +371,29 @@ def generate_map(
 
     names = gen.fuel_type_names
     if "grass" in names:
-        # Grass: continuous Perlin density [kg/m^2], thinned by altitude.
+        # Grass: continuous Perlin density [kg/m^2], biased toward flatter (low-slope) ground.
         gi = names.index("grass")
         grass_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), rng=rng)
-        grass_alt = gen.altitude_vegetation_multiplier(relief, gi)
-        fuel[gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_alt
+        grass_slope = gen.slope_vegetation_multiplier(slope, gi)
+        fuel[gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_slope
 
     if "shrub" in names:
-        # Shrub: continuous Perlin density [kg/m^2], thinned by altitude (same form as grass, its
-        # own noise field so the two layers are spatially independent).
+        # Shrub: continuous Perlin density [kg/m^2], slope-biased like grass (its own noise field
+        # so the two layers are spatially independent).
         si = names.index("shrub")
         shrub_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[si]), rng=rng)
-        shrub_alt = gen.altitude_vegetation_multiplier(relief, si)
-        fuel[si] = shrub_noise * float(gen.spawn_densities[si]) * shrub_alt
+        shrub_slope = gen.slope_vegetation_multiplier(slope, si)
+        fuel[si] = shrub_noise * float(gen.spawn_densities[si]) * shrub_slope
 
     if gen.tree_indices:
-        # Trees: one stochastic per-cell count (exponential mean = altitude-thinned noise density,
+        # Trees: one stochastic per-cell count (exponential mean = slope-biased noise density,
         # capped) drives every co-located tree component (canopy + bole), each scaled by its own
         # fuel_per_tree -- so the canopy and bole of the same trees always share a cell. The count's
         # spatial params are taken from the first tree component.
         t0 = gen.tree_indices[0]
         tree_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[t0]), rng=rng)
-        tree_alt = gen.altitude_vegetation_multiplier(relief, t0)
-        density = tree_noise * float(gen.spawn_densities[t0]) * tree_alt
+        tree_slope = gen.slope_vegetation_multiplier(slope, t0)
+        density = tree_noise * float(gen.spawn_densities[t0]) * tree_slope
         tree_counts = gen.sample_tree_counts(density, rng)
         for ti in gen.tree_indices:
             fuel[ti] = tree_counts * float(gen.fuel_per_tree[ti])
