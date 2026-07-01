@@ -341,6 +341,27 @@ minibatch_size = 256       # samples per sample_minibatch() draw
 buffer_device  = "cpu"     # where the sample pool lives ("cpu" or "cuda")
 buffer_dtype   = "float32" # pool storage dtype ("float32" or "float16")
 
+[autoencoder]
+# Convolutional autoencoder pretraining (src/train_autoencoder.py). `arch` selects the
+# resampling style; each style ("shuffle" = pixel-unshuffle/shuffle, "strided" = 2x2 stride-2
+# conv) has its own subtable so the two can be sized independently. CLI flags on
+# train_autoencoder.py (--arch/--channels/--latent-dim) override these.
+#
+# `channels` is the encoder width per downsample stage; the last entry is the conv channel
+# count before flattening, and len(channels) sets how far H/W halve. On a 256x256 input the six
+# defaults below produce a 512x4x4 feature map (flatten = 8192), which a dense layer projects
+# to a `latent_dim` vector. grid_size must be divisible by 2**len(channels). Roughly 8.7M
+# params at these settings.
+arch = "shuffle"
+
+[autoencoder.shuffle]
+channels   = [16, 32, 64, 128, 256, 512]  # pixel-unshuffle/shuffle encoder widths per stage
+latent_dim = 256                          # dense latent vector width
+
+[autoencoder.strided]
+channels   = [16, 32, 64, 128, 256, 512]  # 2x2 stride-2 conv encoder widths per stage
+latent_dim = 256                          # dense latent vector width
+
 [action]
 # Coarse action grid overlaid on the simulation grid: the map is divided into
 # grid_size x grid_size action-cells, each spanning ([environment].grid_size /

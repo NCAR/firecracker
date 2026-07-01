@@ -192,13 +192,17 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true",
                         help="use mixed-precision autocast + GradScaler (CUDA only)")
     # Model
-    parser.add_argument("--arch", choices=tuple(ARCHITECTURES), default="shuffle",
-                        help="autoencoder architecture: 'shuffle' (pixel-shuffle resampling, "
-                             "default) or 'strided' (2x2 stride-2 conv resampling)")
-    parser.add_argument("--channels", type=_parse_channels,
-                        default=(8, 16, 32, 64, 128, 256, 512, 1024),
-                        help="encoder channel widths per downsample stage; the last is the "
-                             "latent channel count, e.g. 8,16,32,64,128,256,512,1024")
+    parser.add_argument("--arch", choices=tuple(ARCHITECTURES), default=None,
+                        help="autoencoder architecture: 'shuffle' (pixel-shuffle resampling) or "
+                             "'strided' (2x2 stride-2 conv resampling); default from "
+                             "[autoencoder].arch")
+    parser.add_argument("--channels", type=_parse_channels, default=None,
+                        help="encoder channel widths per downsample stage; the last is the conv "
+                             "channel count before flattening, e.g. 16,32,64,128,256,512; default "
+                             "from [autoencoder.<arch>].channels")
+    parser.add_argument("--latent-dim", type=int, default=None,
+                        help="width of the dense latent vector the flattened feature map "
+                             "projects to; default from [autoencoder.<arch>].latent_dim")
     # Bookkeeping
     parser.add_argument("--out", default="checkpoints", help="dir to write checkpoints into")
     parser.add_argument("--save-interval", type=int, default=5,
@@ -213,6 +217,15 @@ def main() -> None:
     device = _resolve_device(args.device)
     torch.manual_seed(args.seed)
     print(f"device: {device}")
+
+    # Model architecture: CLI flags override the [autoencoder] config, which in turn overrides
+    # the model constructor defaults. `channels`/`latent_dim` are read from the per-arch subtable.
+    ae_cfg = config.get("autoencoder", {})
+    arch = args.arch or ae_cfg.get("arch", "shuffle")
+    arch_cfg = ae_cfg.get(arch, {})
+    channels = args.channels if args.channels is not None else arch_cfg.get("channels")
+    channels = tuple(channels) if channels is not None else None
+    latent_dim = args.latent_dim if args.latent_dim is not None else arch_cfg.get("latent_dim")
 
     # 1. Dataset --------------------------------------------------------------
     build_dataset_if_needed(args, config)
@@ -242,15 +255,17 @@ def main() -> None:
     )
 
     # 2. Model / optimiser ----------------------------------------------------
-    model = ARCHITECTURES[args.arch](
-        in_channels=in_channels,
-        grid_size=grid_size,
-        channels=args.channels,
-    ).to(device)
+    # Pass only the settings that were resolved; None lets the constructor default apply.
+    model_kwargs = {"in_channels": in_channels, "grid_size": grid_size}
+    if channels is not None:
+        model_kwargs["channels"] = channels
+    if latent_dim is not None:
+        model_kwargs["latent_dim"] = latent_dim
+    model = ARCHITECTURES[arch](**model_kwargs).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    latent_shape = f"{model.latent_channels}x{model.latent_size}x{model.latent_size}"
-    print(f"model: arch={args.arch} channels={args.channels} latent={latent_shape} "
-          f"params={n_params:,}")
+    conv_shape = f"{model.conv_channels}x{model.conv_spatial}x{model.conv_spatial}"
+    print(f"model: arch={arch} channels={tuple(model.channels)} conv_latent={conv_shape} "
+          f"latent_dim={model.latent_dim} params={n_params:,}")
 
     loss_fn = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -260,10 +275,11 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     # The config an inference/eval script needs to rebuild the exact architecture.
     model_config = {
-        "arch": args.arch,
+        "arch": arch,
         "in_channels": in_channels,
         "grid_size": grid_size,
-        "channels": list(args.channels),
+        "channels": list(model.channels),
+        "latent_dim": model.latent_dim,
     }
 
     def save_checkpoint(path: Path, epoch: int, val_loss: float) -> None:

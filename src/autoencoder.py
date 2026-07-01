@@ -12,15 +12,16 @@ convs do all the learning:
     UpBlock   : 1x1 conv -> PixelShuffle(2) -> 3x3 (same) conv     (H/W double, channels set)
 
 The encoder is a stack of DownBlocks that halve H/W and fold detail into channels at every
-stage, ending at a fully-convolutional spatial latent (no flatten, no dense bottleneck); the
-decoder mirrors it with a stack of UpBlocks back to the original `C x N x N` shape. This is a
-baseline for compressing the world-model observation stack (see
+stage, producing a spatial feature map that is then flattened and projected by a dense layer
+to a `latent_dim` vector; the decoder mirrors this with a dense layer back to the flattened
+feature map, reshapes it, and applies a stack of UpBlocks back to the original `C x N x N`
+shape. This is a baseline for compressing the world-model observation stack (see
 `Simulation.build_observation` / `obs_channel_names`).
 
-With the default eight stages on a 256x256 input the latent is a 1x1x1024 feature map, fed
-straight into the decoder. The grid size `N` must be divisible by `2 ** len(channels)` so every
-shuffle stage lands on an integer spatial size; choose `channels` so the final spatial size is
-whatever latent footprint you want (1x1 for a pure vector latent).
+With the default six stages on a 256x256 input the encoder produces a 512x4x4 feature map
+(channels x height x width), which flattens to 8192 features and projects down to a 256-d
+latent vector. The grid size `N` must be divisible by `2 ** len(channels)` so every shuffle
+stage lands on an integer spatial size.
 
 Quick use:
 
@@ -28,9 +29,9 @@ Quick use:
     from autoencoder import ConvAutoencoder
 
     model = ConvAutoencoder(in_channels=5, grid_size=256,
-                            channels=(8, 16, 32, 64, 128, 256, 512, 1024))
+                            channels=(16, 32, 64, 128, 256, 512), latent_dim=256)
     x = torch.randn(8, 5, 256, 256)       # a B x C x N x N batch
-    x_hat, z = model(x)                   # reconstruction and B x 1024 x 1 x 1 latent map
+    x_hat, z = model(x)                   # reconstruction and B x 256 latent vector
     loss = torch.nn.functional.mse_loss(x_hat, x)
 """
 
@@ -133,25 +134,28 @@ class Decoder(nn.Module):
 
 
 class ConvAutoencoder(nn.Module):
-    """A symmetric convolutional autoencoder.
+    """A symmetric convolutional autoencoder with a dense latent bottleneck.
 
     Args:
         in_channels: number of input channels (e.g. len(obs_channel_names(...))).
         grid_size:   spatial size N of the square input; must be divisible by 2**len(channels).
         channels:    encoder channel widths, one per downsampling stage. The last entry is the
-                     latent channel count; len(channels) sets how far H/W are halved.
+                     conv channel count before flattening; len(channels) sets how far H/W halve.
+        latent_dim:  width of the dense latent vector the flattened feature map projects to.
         activation:  activation module class used between conv layers.
 
-    The latent is the encoder's output feature map, of shape
-    `(channels[-1], N // 2**len(channels), N // 2**len(channels))`. With the defaults
-    (N=256, eight stages) that is `1024 x 1 x 1`, fed straight into the decoder.
+    The encoder produces a `(channels[-1], N // 2**len(channels), N // 2**len(channels))`
+    feature map, which is flattened and projected by a linear layer to a `latent_dim` vector.
+    With the defaults (N=256, six stages, latent_dim=256) the feature map is `512 x 4 x 4`,
+    flattening to 8192 features before the projection to a 256-d latent.
     """
 
     def __init__(
         self,
         in_channels: int = 5,
         grid_size: int = 256,
-        channels: Sequence[int] = (8, 16, 32, 64, 128, 256, 512, 1024),
+        channels: Sequence[int] = (16, 32, 64, 128, 256, 512),
+        latent_dim: int = 256,
         activation: type[nn.Module] = nn.ReLU,
     ) -> None:
         super().__init__()
@@ -163,20 +167,27 @@ class ConvAutoencoder(nn.Module):
 
         self.in_channels = in_channels
         self.grid_size = grid_size
-        self.latent_channels = channels[-1]
-        self.latent_size = grid_size // (2 ** n_stages)
-        self.latent_dim = self.latent_channels * self.latent_size * self.latent_size
+        self.channels = tuple(channels)
+        self.conv_channels = channels[-1]
+        self.conv_spatial = grid_size // (2 ** n_stages)
+        self.flat_dim = self.conv_channels * self.conv_spatial * self.conv_spatial
+        self.latent_dim = latent_dim
 
         self.encoder = Encoder(in_channels, channels, activation)
+        self.to_latent = nn.Linear(self.flat_dim, latent_dim)
+        self.from_latent = nn.Linear(latent_dim, self.flat_dim)
         self.decoder = Decoder(in_channels, channels, activation)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Map a B x C x N x N batch to its B x latent_channels x h x w latent feature map."""
-        return self.encoder(x)
+        """Map a B x C x N x N batch to its B x latent_dim latent vector."""
+        h = self.encoder(x)
+        return self.to_latent(h.flatten(1))
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Map a B x latent_channels x h x w latent map back to a B x C x N x N reconstruction."""
-        return self.decoder(z)
+        """Map a B x latent_dim latent vector back to a B x C x N x N reconstruction."""
+        h = self.from_latent(z)
+        h = h.view(-1, self.conv_channels, self.conv_spatial, self.conv_spatial)
+        return self.decoder(h)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (reconstruction, latent)."""
