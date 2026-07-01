@@ -97,8 +97,7 @@ class MapGenerator:
         # generator (e.g. in the tests) never imports torch.
         self._device_name = (cfg or {}).get("environment", {}).get("device")
 
-        # Cell size [m] sets the grid spacing used to turn the elevation field into a
-        # physical slope (rise/run) for the slope-based vegetation preference.
+        # Cell size [m]: the physical grid spacing, used by the sunlight/shadow geometry.
         self.cell_size_m = float((cfg or {}).get("units", {}).get("cell_size_m", 10.0))
         self._device = None
 
@@ -116,9 +115,6 @@ class MapGenerator:
         # Exponent applied to the normalised [0,1] height map: >1 biases toward flat low-elevation
         # terrain with sharper, less frequent peaks; 1 leaves the raw Perlin field unchanged.
         self.terrain_exponent    = float(terrain.get("exponent",     1.0))
-        # Half-saturation slope (rise/run) for the slope-based vegetation preference: cells at this
-        # slope sit at the midpoint between the flat-loving and steep-loving extremes.
-        self.slope_ref              = float(terrain.get("slope_ref",              0.5))
         # SI elevation: the normalised [0,1] height map is scaled to metres by elev_max.
         self.elev_max               = float(terrain.get("elev_max",               500.0))
         # Environmental lapse rate [K/m]: air temperature falls T_REF - rate*elevation.
@@ -156,6 +152,28 @@ class MapGenerator:
         # elevation profile). Earth's air insulation + lateral mixing keep shade only "a bit cool".
         self.sun_temp_moderation  = float(sun.get("temp_moderation",     0.7))
 
+        # Non-overlapping vegetation biomes. Each cell is labelled exactly one biome from its
+        # elevation and baked surface temperature (see classify_biomes) for the discrete biome map,
+        # but the vegetation reads soft membership weights that blend across the thresholds (see
+        # biome_weights), so the fuel transitions smoothly at biome borders instead of stepping.
+        biomes = (cfg or {}).get("biomes", {})
+        self.woodland_temp_max = float(biomes.get("woodland_temp_max", 298.0))  # K: cool cells -> woodland
+        self.grass_elev_max    = float(biomes.get("grass_elev_max",    250.0))  # m: warm+low -> grassland
+        # Border softness: the width of the smooth transition band the vegetation blends over at each
+        # biome threshold (temperature for the woodland edge, elevation for the grassland/shrubland
+        # edge). Larger = wider, gentler blend; -> 0 recovers a hard edge. See biome_weights.
+        self.woodland_temp_softness = float(biomes.get("woodland_temp_softness", 1.5))   # K
+        self.grass_elev_softness    = float(biomes.get("grass_elev_softness",    35.0))  # m
+        # Fraction of the grassland's grass loading that also grows in the (cooler, tree-dense)
+        # woodland: >0 so woodland floors keep some grass, <1 so it stays below the open grassland.
+        self.woodland_grass_fraction = float(biomes.get("woodland_grass_fraction", 0.3))
+        # Per-biome exponential-mean tree count (drives sample_tree_counts): one value per biome,
+        # scaled per cell only by the tree noise -- dense woodland canopy, a sparse grassland
+        # sprinkle, and a modest shrubland cover in between.
+        self.tree_density_woodland    = float(biomes.get("tree_density_woodland",    8.0))
+        self.tree_density_grassland   = float(biomes.get("tree_density_grassland",   0.6))
+        self.tree_density_shrubland   = float(biomes.get("tree_density_shrubland",   1.2))
+
         fuel_types_cfg = (cfg or {}).get("fuel_types", {})
         self.fuel_type_names: list[str] = list(fuel_types_cfg.keys())
         self.num_fuel_types: int = len(self.fuel_type_names)
@@ -165,20 +183,15 @@ class MapGenerator:
 
         self.fuel_noise_scales = np.array([_ft(n, "noise_scale",      32.0) for n in self.fuel_type_names], dtype=np.float32)
         self.spawn_densities   = np.array([_ft(n, "spawn_density",     0.5)  for n in self.fuel_type_names], dtype=np.float32)
-
-        # Slope-based vegetation preference: each fuel either prefers flat ground (grass) or steep
-        # ground (trees), with slope_falloff sharpening that bias. slope_preference is "flat" or
-        # "steep" (default flat); slope_falloff is the exponent on the normalised slope.
-        self.slope_falloffs    = np.array([_ft(n, "slope_falloff",    1.0)  for n in self.fuel_type_names], dtype=np.float32)
-        self.slope_prefer_steep = np.array(
-            [str(fuel_types_cfg.get(n, {}).get("slope_preference", "flat")).lower() == "steep"
-             for n in self.fuel_type_names]
-        )
+        # Coverage floor for a continuous fuel's [0,1] noise: the noise is remapped to [floor, 1],
+        # so even low-noise patches keep a base loading (floor of the peak) instead of thinning to
+        # bare ground. Raises overall grass/shrub cover so the map reads less barren; 0 = raw noise.
+        self.fuel_noise_floors = np.array([_ft(n, "noise_floor",      0.0)  for n in self.fuel_type_names], dtype=np.float32)
 
         # Tree components: any fuel type whose name starts with "tree" (e.g. tree_canopy, tree_bole)
         # is part of the same physical trees, so they share one per-cell count and spatial
         # distribution. fuel_per_tree is per type (the biomass each tree contributes to that
-        # component); the count/distribution params (noise/spawn/slope) are read from the first
+        # component); the count/distribution params (noise/spawn) are read from the first
         # tree component.
         self.fuel_per_tree = np.array(
             [_ft(n, "fuel_per_tree", 0.0) for n in self.fuel_type_names], dtype=np.float32
@@ -319,30 +332,74 @@ class MapGenerator:
         air_density = self.pressure_profile(elevation_m) / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures)
         return _store(pc.O2_MASS_FRACTION * air_density)
 
-    def terrain_slope(self, elevation_m):
-        """Per-cell terrain slope magnitude (rise/run, dimensionless) of the elevation field [m].
+    def classify_biomes(self, elevation_m, surface_temperature):
+        """Partition the grid into the three non-overlapping vegetation biomes.
 
-        Central differences along both grid axes with cell_size_m spacing (one-sided at the
-        edges), then |grad z|. Drives the slope-based vegetation preference below."""
-        dz = float(self.cell_size_m)
-        if _is_torch(elevation_m):
-            gy, gx = torch.gradient(elevation_m, spacing=dz)
-            return _store((gx * gx + gy * gy).sqrt())
-        gy, gx = np.gradient(elevation_m, dz)
-        return _store(np.sqrt(gx * gx + gy * gy))
+        Returns (woodland, grassland, shrubland) boolean masks that tile the grid (every cell is
+        in exactly one):
+          * woodland  -- cool cells (surface_temperature <= woodland_temp_max), any slope. Cool
+                         ground is high and/or shaded, so this captures the tops and the cold
+                         hollows regardless of steepness;
+          * grassland -- the remaining warm cells on low ground (elevation <= grass_elev_max);
+          * shrubland -- the remaining warm cells above that elevation (higher than the grassland
+                         but, being warm rather than cool, not high enough to have turned to woodland).
+        Pure elementwise comparisons/logical ops, so it runs on a NumPy array or a torch tensor;
+        the masks stay boolean (not cast to the float storage dtype)."""
+        woodland = surface_temperature <= self.woodland_temp_max
+        warm = ~woodland
+        low = elevation_m <= self.grass_elev_max
+        grassland = warm & low
+        shrubland = warm & ~low
+        return woodland, grassland, shrubland
 
-    def slope_vegetation_multiplier(self, slope, fuel_index: int):
-        """Per-cell vegetation density scale from terrain slope, in [0, 1].
+    def biome_weights(self, elevation_m, surface_temperature):
+        """Soft per-cell biome membership (woodland, grassland, shrubland), each in [0, 1] and
+        summing to 1 -- the smooth counterpart of classify_biomes used to place vegetation.
 
-        The normalised slope s = slope/(slope + slope_ref) is 0 on flat ground and -> 1 on
-        steep ground (= 0.5 at slope_ref). Flat-preferring fuels (grass) scale as (1 - s)^k and
-        steep-preferring fuels (trees) as s^k, where k is the per-fuel slope_falloff -- so grass
-        favours gentle ground and trees favour steeper slopes."""
-        s = slope / (slope + self.slope_ref)
-        k = float(self.slope_falloffs[fuel_index])
-        if bool(self.slope_prefer_steep[fuel_index]):
-            return _store(s ** k)
-        return _store((1.0 - s) ** k)
+        The hard thresholds are replaced by logistic ramps so the biomes blend over a transition
+        band instead of stepping at a border: the woodland share rises smoothly as the surface
+        temperature drops through woodland_temp_max (band width woodland_temp_softness), and the
+        remaining (warm) share is split between grassland and shrubland by a smooth ramp on elevation
+        through grass_elev_max (band width grass_elev_softness). Feeding these weights (instead of the
+        boolean masks) to biome_grass_multiplier / biome_tree_density -- both linear in their
+        arguments -- makes the grass, shrub and tree densities cross-fade across biome borders. As
+        the softness knobs -> 0 the ramps become steps and this reduces to classify_biomes. Array-
+        agnostic (NumPy or torch)."""
+        xp = _xp(surface_temperature)
+        w_wood = 1.0 / (1.0 + xp.exp((surface_temperature - self.woodland_temp_max) / self.woodland_temp_softness))
+        share_grass = 1.0 / (1.0 + xp.exp((elevation_m - self.grass_elev_max) / self.grass_elev_softness))
+        warm = 1.0 - w_wood
+        return _store(w_wood), _store(warm * share_grass), _store(warm * (1.0 - share_grass))
+
+    def apply_noise_floor(self, noise, fuel_index: int):
+        """Lift a fuel's [0,1] noise onto [floor, 1] so low-noise patches keep a base loading.
+
+        floor = fuel_noise_floors[fuel_index]; the remap is floor + (1-floor)*noise, so the noise
+        texture is preserved but its trough sits at `floor` of the peak instead of zero -- filling
+        the bare gaps that read as barren. floor = 0 is a no-op. Array-agnostic (NumPy or torch)."""
+        f = float(self.fuel_noise_floors[fuel_index])
+        return _store(f + (1.0 - f) * noise) if f > 0.0 else _store(noise)
+
+    def biome_grass_multiplier(self, grassland, woodland):
+        """Per-cell scale on the grass loading by biome, in [0, 1].
+
+        Grass grows at full strength on the open grassland and at woodland_grass_fraction of that
+        under the cooler, tree-dense woodland canopy (less grass than the grassland, but not none);
+        the shrubland gets no grass. The masks are the boolean biome labels from classify_biomes.
+        Array-agnostic (NumPy or torch)."""
+        return _store(grassland + woodland * self.woodland_grass_fraction)
+
+    def biome_tree_density(self, woodland, grassland, shrubland):
+        """Per-cell exponential-mean tree count (the sample_tree_counts density), set by biome.
+
+        Trees grow in every biome, at one mean per biome (scaled per cell only by the tree noise):
+        a dense woodland canopy, a sparse grassland sprinkle, and a modest shrubland cover in
+        between. The masks are the boolean biome labels from classify_biomes; combining them selects
+        one density per cell. Array-agnostic (NumPy or torch)."""
+        density = (woodland * self.tree_density_woodland
+                   + grassland * self.tree_density_grassland
+                   + shrubland * self.tree_density_shrubland)
+        return _store(density)
 
     def sample_tree_counts(self, density: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
         """Stochastic per-cell tree counts on density.device.
@@ -532,11 +589,9 @@ def generate_map(
     [kg/m^3], fuel [kg/m^2]. `sunlight` is a static dimensionless [0,1] solar-exposure field that
     drives the baked surface (rest) temperature: sunnier cells warmer, shaded cells cooler.
     """
-    # Normalised [0,1] relief is scaled to metres for the elevation; its per-cell slope
-    # (rise/run) drives the vegetation preference (flat-loving grass, steep-loving trees).
+    # Normalised [0,1] relief is scaled to metres for the elevation.
     relief = gen.create_terrain(grid_size, rng=rng)
     terrain = relief * gen.elev_max
-    slope = gen.terrain_slope(terrain)
 
     # Static solar exposure [0,1]: south-facing slopes catch the sun, shadowed valleys lose it.
     sunlight = gen.sunlight_exposure(terrain)
@@ -552,31 +607,41 @@ def generate_map(
     N = gen.num_fuel_types
     fuel = torch.zeros((N, grid_size, grid_size), dtype=torch.float64, device=gen.device)
 
+    # Vegetation biomes: each cell has a soft membership in woodland / grassland / shrubland (from
+    # its elevation and baked surface temperature) that blends smoothly across the biome borders, so
+    # the fuel cross-fades there instead of stepping. Within a biome the density comes purely from a
+    # Perlin noise map (elevation/slope/temperature no longer shape it): grass grows on the grassland
+    # (and, more thinly, under the woodland), shrub on the shrubland, and trees in every biome at a
+    # per-biome mean -- dense woodland canopy, a sparse grassland sprinkle, and a modest shrubland
+    # cover. The weights are linear, so biome_grass_multiplier/biome_tree_density blend the densities.
+    w_wood, w_grass, w_shrub = gen.biome_weights(terrain, surface_temperature)
+
     names = gen.fuel_type_names
     if "grass" in names:
-        # Grass: continuous Perlin density [kg/m^2], biased toward flatter (low-slope) ground.
+        # Grass: continuous Perlin density [kg/m^2], full-strength on the grassland and thinned to
+        # woodland_grass_fraction under the woodland canopy (none on the shrubland).
         gi = names.index("grass")
-        grass_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), rng=rng)
-        grass_slope = gen.slope_vegetation_multiplier(slope, gi)
-        fuel[gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_slope
+        grass_noise = gen.apply_noise_floor(
+            gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), rng=rng), gi)
+        grass_biome = gen.biome_grass_multiplier(w_grass, w_wood)
+        fuel[gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_biome
 
     if "shrub" in names:
-        # Shrub: continuous Perlin density [kg/m^2], slope-biased like grass (its own noise field
-        # so the two layers are spatially independent).
+        # Shrub: continuous Perlin density [kg/m^2] (its own noise field, so it is spatially
+        # independent of the grass), confined to the shrubland.
         si = names.index("shrub")
-        shrub_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[si]), rng=rng)
-        shrub_slope = gen.slope_vegetation_multiplier(slope, si)
-        fuel[si] = shrub_noise * float(gen.spawn_densities[si]) * shrub_slope
+        shrub_noise = gen.apply_noise_floor(
+            gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[si]), rng=rng), si)
+        fuel[si] = shrub_noise * float(gen.spawn_densities[si]) * w_shrub
 
     if gen.tree_indices:
-        # Trees: one stochastic per-cell count (exponential mean = slope-biased noise density,
-        # capped) drives every co-located tree component (canopy + bole), each scaled by its own
-        # fuel_per_tree -- so the canopy and bole of the same trees always share a cell. The count's
-        # spatial params are taken from the first tree component.
+        # Trees: one stochastic per-cell count (exponential mean = biome-set density * noise, capped)
+        # drives every co-located tree component (canopy + bole), each scaled by its own fuel_per_tree
+        # -- so the canopy and bole of the same trees always share a cell. The count's noise scale is
+        # taken from the first tree component; its density is set per biome (biome_tree_density).
         t0 = gen.tree_indices[0]
         tree_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[t0]), rng=rng)
-        tree_slope = gen.slope_vegetation_multiplier(slope, t0)
-        density = tree_noise * float(gen.spawn_densities[t0]) * tree_slope
+        density = tree_noise * gen.biome_tree_density(w_wood, w_grass, w_shrub)
         tree_counts = gen.sample_tree_counts(density, rng)
         for ti in gen.tree_indices:
             fuel[ti] = tree_counts * float(gen.fuel_per_tree[ti])

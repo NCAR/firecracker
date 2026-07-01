@@ -40,8 +40,6 @@ def test_numpy_in_numpy_out_float32():
     air = gen.air_temperature_profile(z)
     for field in (air, gen.pressure_profile(z), gen.boundary_layer_mass(z),
                   gen.oxygen_profile(z, air),
-                  gen.terrain_slope(z),
-                  gen.slope_vegetation_multiplier(gen.terrain_slope(z), 0),
                   gen.normalize_grid(z)):
         assert isinstance(field, np.ndarray)
         assert field.dtype == np.float32
@@ -61,9 +59,6 @@ def test_torch_in_torch_out_matches_numpy():
         (gen.pressure_profile(z_np), gen.pressure_profile(z_t)),
         (gen.boundary_layer_mass(z_np), gen.boundary_layer_mass(z_t)),
         (gen.oxygen_profile(z_np, air_np), gen.oxygen_profile(z_t, air_t)),
-        (gen.terrain_slope(z_np), gen.terrain_slope(z_t)),
-        (gen.slope_vegetation_multiplier(gen.terrain_slope(z_np), 0),
-         gen.slope_vegetation_multiplier(gen.terrain_slope(z_t), 0)),
         (gen.normalize_grid(z_np), gen.normalize_grid(z_t)),
     ]
     for arr_np, arr_t in pairs:
@@ -187,6 +182,124 @@ def test_surface_temperature_torch_matches_numpy():
     surf_t = gen.surface_temperature(z_t, gen.sunlight_exposure(z_t))
     assert isinstance(surf_t, torch.Tensor)
     assert np.allclose(surf_np, surf_t.numpy(), rtol=1e-5, atol=1e-3)
+
+
+def test_biomes_partition_the_grid():
+    # Every cell lands in exactly one biome (the three masks tile the grid without overlap),
+    # on both backends.
+    gen = _gen()
+    z = _elevation_np()
+    surf = gen.surface_temperature(z, gen.sunlight_exposure(z))
+    woodland, grass, shrub = gen.classify_biomes(z, surf)
+    exactly_one = woodland.astype(int) + grass.astype(int) + shrub.astype(int)
+    assert np.array_equal(exactly_one, np.ones_like(exactly_one))
+
+    z_t = torch.as_tensor(z, dtype=torch.float64)
+    surf_t = gen.surface_temperature(z_t, gen.sunlight_exposure(z_t))
+    w_t, g_t, s_t = gen.classify_biomes(z_t, surf_t)
+    assert torch.equal(w_t, torch.as_tensor(woodland))
+    assert torch.equal(g_t, torch.as_tensor(grass))
+    assert torch.equal(s_t, torch.as_tensor(shrub))
+
+
+def test_biome_labels_follow_temperature_and_elevation():
+    # Woodland is the cool cells (surface T <= woodland_temp_max); among the warm cells, low ground
+    # is grassland and higher ground shrubland.
+    gen = _gen()
+    z = _elevation_np()
+    surf = gen.surface_temperature(z, gen.sunlight_exposure(z))
+    woodland, grass, shrub = gen.classify_biomes(z, surf)
+    assert np.all(surf[woodland] <= gen.woodland_temp_max)
+    assert np.all(surf[grass] > gen.woodland_temp_max)
+    assert np.all(z[grass] <= gen.grass_elev_max)
+    assert np.all(z[shrub] > gen.grass_elev_max)
+
+
+def test_biome_weights_partition_softly_and_track_classification():
+    # The soft weights sum to 1 everywhere, blend smoothly (interior values strictly between 0 and 1
+    # near the borders), and collapse onto the hard classification as the softness -> 0. Fields that
+    # straddle both thresholds (temperature around woodland_temp_max, elevation around grass_elev_max)
+    # so every biome and its borders are exercised.
+    gen = _gen()
+    surf = np.linspace(294.0, 302.0, GRID * GRID, dtype=np.float32).reshape(GRID, GRID)
+    z = np.linspace(150.0, 350.0, GRID * GRID, dtype=np.float32).reshape(GRID, GRID)
+    w_wood, w_grass, w_shrub = gen.biome_weights(z, surf)
+    total = w_wood + w_grass + w_shrub
+    assert np.allclose(total, 1.0, atol=1e-5)
+    assert np.all(w_wood >= 0) and np.all(w_grass >= 0) and np.all(w_shrub >= 0)
+    # A transition band exists: some cell is a genuine blend, not a hard 0/1 label.
+    assert np.any((w_wood > 0.05) & (w_wood < 0.95))
+
+    # Shrinking the softness collapses the ramps toward steps: the winning (argmax) biome then
+    # agrees with the hard classification everywhere but the thin residual transition band.
+    gen.woodland_temp_softness = 0.2
+    gen.grass_elev_softness = 5.0
+    soft_label = np.argmax(np.stack(gen.biome_weights(z, surf)), axis=0)
+    woodland, grass, shrub = gen.classify_biomes(z, surf)
+    hard_label = np.where(woodland, 0, np.where(grass, 1, 2))
+    assert (soft_label == hard_label).mean() > 0.95
+
+    # torch backend matches numpy.
+    gen2 = _gen()
+    wt = gen2.biome_weights(torch.as_tensor(z, dtype=torch.float64),
+                            torch.as_tensor(surf, dtype=torch.float64))
+    ref = gen2.biome_weights(z, surf)
+    for a_t, a_np in zip(wt, ref):
+        assert isinstance(a_t, torch.Tensor)
+        assert np.allclose(a_t.numpy(), a_np, rtol=1e-5, atol=1e-4)
+
+
+def test_biome_tree_density_ranks_woodland_over_shrub_over_grass():
+    # Woodland is the densest tree biome, grassland the sparsest, shrubland in between; the density
+    # is one flat value per biome (no slope dependence), on both backends.
+    gen = _gen()
+    assert gen.tree_density_woodland > gen.tree_density_shrubland > gen.tree_density_grassland
+
+    ones = np.ones((GRID, GRID), dtype=bool)
+    zeros = np.zeros((GRID, GRID), dtype=bool)
+    wood = gen.biome_tree_density(ones, zeros, zeros)
+    grass = gen.biome_tree_density(zeros, ones, zeros)
+    shrub = gen.biome_tree_density(zeros, zeros, ones)
+    assert np.allclose(wood, gen.tree_density_woodland)
+    assert np.allclose(grass, gen.tree_density_grassland)
+    assert np.allclose(shrub, gen.tree_density_shrubland)
+
+    shrub_t = gen.biome_tree_density(
+        torch.as_tensor(zeros), torch.as_tensor(zeros), torch.as_tensor(ones))
+    assert isinstance(shrub_t, torch.Tensor)
+    assert np.allclose(shrub, shrub_t.numpy())
+
+
+def test_apply_noise_floor_lifts_trough_to_floor():
+    # The [0,1] noise is remapped onto [floor, 1]: its min rises to the floor, its max stays at 1,
+    # and the ordering/texture is preserved. Grass carries a nonzero floor in the default config.
+    gen = _gen()
+    gi = gen.fuel_type_names.index("grass")
+    floor = float(gen.fuel_noise_floors[gi])
+    assert floor > 0.0
+    noise = np.linspace(0.0, 1.0, GRID * GRID, dtype=np.float32).reshape(GRID, GRID)
+    lifted = gen.apply_noise_floor(noise, gi)
+    assert np.isclose(lifted.min(), floor, atol=1e-6)
+    assert np.isclose(lifted.max(), 1.0, atol=1e-6)
+    # Monotone remap: same ordering as the input (no texture inversion).
+    assert np.all(np.diff(lifted.ravel()) >= -1e-6)
+
+    # A zero-floor fuel is returned unchanged; torch in -> torch out matches.
+    lifted_t = gen.apply_noise_floor(torch.as_tensor(noise, dtype=torch.float64), gi)
+    assert isinstance(lifted_t, torch.Tensor)
+    assert np.allclose(lifted, lifted_t.numpy(), atol=1e-6)
+
+
+def test_biome_grass_multiplier_woodland_between_zero_and_grassland():
+    # Grass runs full-strength on the grassland, a reduced fraction under the woodland, and none on
+    # the shrubland (which is left as the implicit zero).
+    gen = _gen()
+    ones = np.ones((GRID, GRID), dtype=bool)
+    zeros = np.zeros((GRID, GRID), dtype=bool)
+    assert np.allclose(gen.biome_grass_multiplier(ones, zeros), 1.0)          # all grassland
+    assert np.allclose(gen.biome_grass_multiplier(zeros, ones),               # all woodland
+                       gen.woodland_grass_fraction)
+    assert 0.0 < gen.woodland_grass_fraction < 1.0
 
 
 def test_device_property_resolves():

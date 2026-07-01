@@ -22,6 +22,7 @@ from gymnasium import spaces
 
 from simulation import OBS_CHANNELS, Simulation, SimState
 from config import boundary_pad
+from gen_maps import MapGenerator
 from map_loader import load_map, resolve_map, validate_against_config
 # Presentation layer: the stateless field/colorbar drawing primitives and their display
 # constants. This module orchestrates them against env state; it never draws a pixel itself.
@@ -59,7 +60,9 @@ from rendering import (
     build_sunlight_surface,
     build_column_height_surface,
     build_fire_surface,
+    build_biome_surface,
     build_legend_panel,
+    build_biome_legend_panel,
 )
 
 
@@ -107,6 +110,7 @@ class ViewMode(Enum):
     TERRAIN = 8
     COLUMN_HEIGHT = 9
     SUNLIGHT = 10        # off the number row -> bound to a letter key below (the digits are taken)
+    BIOME = 11           # off the number row -> bound to a letter key below (the digits are taken)
 
 
 # Modes 0-9 are picked up automatically from the number row; modes past it (the digits ran out)
@@ -117,6 +121,7 @@ MODE_KEYS: dict[int, ViewMode] = {
     if 0 <= mode.value <= 9
 }
 MODE_KEYS[pygame.K_s] = ViewMode.SUNLIGHT
+MODE_KEYS[pygame.K_b] = ViewMode.BIOME
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -138,6 +143,12 @@ class FirecrackerEnv(gymnasium.Env):
         )
 
         self._sim = Simulation(config)
+
+        # Reuses the map generator's biome definition (thresholds + classify_biomes) to label each
+        # cell woodland / grassland / shrubland for the BIOME view, so the view and the fuel placement
+        # share one source of truth. Only classify_biomes is used (no device/noise), and it is
+        # recomputed from the loaded map's terrain + rest surface temperature at reset.
+        self._biome_gen = MapGenerator(config)
 
         env_cfg  = (config or {}).get("environment", {})
         fire_cfg = (config or {}).get("fire", {})
@@ -225,6 +236,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._mass_eq: torch.Tensor | None = None   # rest-state mass (open-boundary sponge target)
         self._terrain: np.ndarray | None = None
         self._sunlight: np.ndarray | None = None   # static average solar exposure [0,1] (SUNLIGHT view)
+        self._biome_labels: np.ndarray | None = None   # static per-cell biome label 0/1/2 (BIOME view)
         self._u_amb_x: torch.Tensor | None = None   # synoptic ambient wind [m/s]
         self._u_amb_y: torch.Tensor | None = None
         # Phase 6 (Option 2): static terrain-channeling gain and the near-surface wind the fire reads.
@@ -279,6 +291,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._radiant_flux_surface: pygame.Surface | None = None
         self._terrain_surface: pygame.Surface | None = None
         self._sunlight_surface: pygame.Surface | None = None
+        self._biome_surface: pygame.Surface | None = None
         self._column_height_surface: pygame.Surface | None = None
         # Reusable translucent white fills for the action highlight, cached by (w, h) pixel size.
         self._alpha_rect_cache: dict[tuple[int, int], pygame.Surface] = {}
@@ -384,6 +397,15 @@ class FirecrackerEnv(gymnasium.Env):
         self._terrain_stats = torch.stack(
             [terr_obs.mean(), terr_obs.min(), terr_obs.max()]
         ).tolist()
+
+        # Static biome label (0 woodland / 1 grassland / 2 shrubland) for the BIOME view, recomputed
+        # over the observed interior from the same terrain + rest surface temperature (temp_eq) the
+        # generator classified at bake time (temp_eq is the pre-spin-up surface temperature, so this
+        # reproduces the biomes that placed the fuel). classify_biomes returns three exclusive masks.
+        woodland, grassland, shrubland = self._biome_gen.classify_biomes(
+            _to_numpy(terr_obs), _to_numpy(self._crop(self._temp_eq))
+        )
+        self._biome_labels = np.where(woodland, 0, np.where(grassland, 1, 2)).astype(np.int64)
 
         # Optional ignition overlay (random spawn). Maps describe the world at rest; fire is a
         # runtime concern applied on top. The patch is placed in the observed interior (coords are
@@ -639,9 +661,13 @@ class FirecrackerEnv(gymnasium.Env):
         if self._legend_font is None:
             return
         sim_px = self.grid_size * self._pixel_scale
-        panel = build_legend_panel(
-            self._legend_specs(), sim_px, self._legend_font, self._legend_title_font
-        )
+        # The biome view is categorical, so it gets labeled swatches instead of a gradient colorbar.
+        if self._current_mode == ViewMode.BIOME:
+            panel = build_biome_legend_panel(sim_px, self._legend_font, self._legend_title_font)
+        else:
+            panel = build_legend_panel(
+                self._legend_specs(), sim_px, self._legend_font, self._legend_title_font
+            )
         self._screen.blit(panel, (sim_px, 0))
 
     def _blit_cursor_wind_vector(self) -> None:
@@ -685,6 +711,8 @@ class FirecrackerEnv(gymnasium.Env):
             return self._terrain_surface
         if self._current_mode == ViewMode.SUNLIGHT:
             return self._sunlight_surface
+        if self._current_mode == ViewMode.BIOME:
+            return self._biome_surface
         if self._current_mode == ViewMode.COLUMN_HEIGHT:
             return self._column_height_surface
         return self._radiant_flux_surface
@@ -766,6 +794,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._sunlight_surface = build_sunlight_surface(
             _to_numpy(self._crop(self._sunlight)), self._pixel_scale
         )
+        # Static after reset: the per-cell biome labels computed at reset, painted with a flat
+        # per-biome color (the vegetation hues from the fire view).
+        self._biome_surface = build_biome_surface(self._biome_labels, self._pixel_scale)
         self._column_height_surface = build_column_height_surface(
             column_height, self._pixel_scale, self._column_height_display_max
         )

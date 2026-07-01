@@ -47,6 +47,18 @@ VEGETATION_COLORS: dict[str, tuple[float, float, float]] = {
 }
 DEFAULT_VEGETATION_COLOR: tuple[float, float, float] = (0.0, 1.0, 0.0)
 
+# Biome view: one flat color per non-overlapping vegetation biome (see gen_maps.classify_biomes),
+# taken straight from the fire-view vegetation hue of the fuel that dominates each biome — woodland
+# reads as trees, grassland as grass, shrubland as shrub — so the biome map colors match how that
+# vegetation is drawn elsewhere. Ordered by the integer label the classifier assigns (0 woodland,
+# 1 grassland, 2 shrubland), so a label array indexes straight into the palette.
+BIOME_NAMES: list[str] = ["Woodland", "Grassland", "Shrubland"]
+_BIOME_FUELS: list[str] = ["tree", "grass", "shrub"]
+BIOME_COLORS: np.ndarray = np.array(
+    [[int(round(c * MAX_CHANNEL_VALUE)) for c in VEGETATION_COLORS[f]] for f in _BIOME_FUELS],
+    dtype=np.uint8,
+)
+
 # ---------------------------------------------------------------------------
 # Wind arrow visualization parameters
 # ---------------------------------------------------------------------------
@@ -376,6 +388,17 @@ def build_sunlight_surface(sunlight: np.ndarray, scale: int) -> pygame.Surface:
     return _render_field(sunlight, scale, sunlight_colormap)
 
 
+def build_biome_surface(labels: np.ndarray, scale: int) -> pygame.Surface:
+    """Paint the categorical biome map: each cell's integer biome label (0 woodland, 1 grassland,
+    2 shrubland) indexes the BIOME_COLORS palette, giving a flat per-biome color (no ramp)."""
+    rows, cols = labels.shape
+    rgb = BIOME_COLORS[np.clip(labels, 0, len(BIOME_COLORS) - 1)]   # (rows, cols, 3) uint8
+    rgb_scaled = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
+    surface = pygame.Surface((cols * scale, rows * scale))
+    pygame.surfarray.blit_array(surface, rgb_scaled.transpose(1, 0, 2))
+    return surface
+
+
 def build_column_height_surface(
     height: np.ndarray, scale: int, display_max: float | None = None
 ) -> pygame.Surface:
@@ -500,4 +523,25 @@ def build_legend_panel(
     for spec in specs:
         panel.blit(build_colorbar_column(spec, height, bar_font, title_font), (x, 0))
         x += LEGEND_COLUMN_WIDTH
+    return panel
+
+
+def build_biome_legend_panel(
+    height: int, bar_font: pygame.font.Font, title_font: pygame.font.Font,
+) -> pygame.Surface:
+    """The right-side legend for the categorical biome view: a title over a color swatch and its
+    name for each biome (a gradient bar makes no sense for discrete classes, so this replaces it).
+    The name sits under its swatch, not beside it, so the long biome names clear the panel width."""
+    panel = pygame.Surface((LEGEND_PANEL_WIDTH, height))
+    panel.fill(LEGEND_BG)
+    x = LEGEND_BAR_X + LEGEND_GUTTER
+    panel.blit(title_font.render("Biome", True, LEGEND_TEXT), (x, LEGEND_TITLE_Y))
+    sw_w, sw_h = 2 * LEGEND_BAR_WIDTH, LEGEND_BAR_WIDTH   # a short, wide swatch key
+    y = LEGEND_BAR_PAD_TOP
+    for name, color in zip(BIOME_NAMES, BIOME_COLORS):
+        pygame.draw.rect(panel, tuple(int(c) for c in color), (x, y, sw_w, sw_h))
+        pygame.draw.rect(panel, LEGEND_BORDER, (x, y, sw_w, sw_h), 1)
+        label = bar_font.render(name, True, LEGEND_TEXT)
+        panel.blit(label, (x, y + sw_h + LEGEND_LABEL_GAP))
+        y += sw_h + label.get_height() + LEGEND_TICK_LEN * 2
     return panel

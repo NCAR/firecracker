@@ -53,7 +53,13 @@ MAP_SUFFIX = ".npz"
 #        sponge sits in the ring, outside the observed interior; and (3) the baked air temperature
 #        is the developed, wind-smeared equilibrium (full-physics spin-up), not the sharp rest
 #        profile. v8 maps differ in field values and grid shape, so they are rejected (regenerate).
-UNITS_VERSION = 9
+#   v10 = vegetation is placed by non-overlapping biomes (see [biomes]): each cell is labelled
+#         woodland / grassland / shrubland from its elevation and baked surface temperature, and
+#         within a biome the density comes purely from a Perlin noise map (no slope/elevation
+#         thinning). Grass grows on the grassland (and, more thinly, the woodland), shrub only on the
+#         shrubland, and trees at a per-biome density (dense woodland, sparse grassland, modest
+#         shrubland). v9 fuel maps differ, so they are rejected (regenerate).
+UNITS_VERSION = 10
 
 # Maps live at <repo_root>/maps by default (alongside cfg/), same convention as
 # config.py. A relative maps dir is anchored here so the app finds its maps
