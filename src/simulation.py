@@ -20,10 +20,23 @@ import physics_constants as pc
 # Stability cap for the explicit Laplacian diffusion coefficient (2D: must be < 0.25).
 _MAX_DIFFUSION_COEFF: float = 0.2
 
-# Observation channels, in order, produced by Simulation.build_observation. Each is a
-# single (H, W) field reduced across fuel types. Extend this (and build_observation) to
-# grow the channel count C.
-OBS_CHANNELS: tuple[str, ...] = ("fuel_temperature", "fuel", "terrain", "wind_x", "wind_y")
+# Observation channels, in order, produced by Simulation.build_observation. Each is a single
+# (H, W) field. The stack is the hottest fuel temperature (reduced across types with amax), then
+# one vegetation-mass channel per configured fuel type (fuel_<name>), then terrain and the two
+# near-surface wind components. Because the per-fuel-type channels make the count depend on the
+# configured fuel types, callers derive the ordered names via obs_channel_names(fuel_type_names)
+# rather than reading a fixed tuple. OBS_CHANNELS_PRE/POST are the type-independent channels that
+# bracket the fuel block; every fuel_<name> channel is normalized by the shared "fuel" window in
+# physics_constants.OBS_NORM.
+OBS_CHANNELS_PRE:  tuple[str, ...] = ("fuel_temperature",)
+OBS_CHANNELS_POST: tuple[str, ...] = ("terrain", "wind_x", "wind_y")
+
+
+def obs_channel_names(fuel_type_names: list[str]) -> tuple[str, ...]:
+    """The ordered observation channel names for a run with these fuel types: the fixed pre
+    channels, one fuel_<name> channel per fuel type (in fuel_type_names order), then the fixed
+    post channels. Matches the channel order produced by Simulation.build_observation."""
+    return OBS_CHANNELS_PRE + tuple(f"fuel_{n}" for n in fuel_type_names) + OBS_CHANNELS_POST
 
 
 @dataclass
@@ -1079,27 +1092,35 @@ class Simulation:
         wind_x: torch.Tensor,             # (..., H, W) near-surface fire wind u [m/s]
         wind_y: torch.Tensor,             # (..., H, W) near-surface fire wind v [m/s]
     ) -> torch.Tensor:
-        """Stack the OBS_CHANNELS into a normalized (..., C, H, W) observation.
+        """Stack the observation channels into a normalized (..., C, H, W) observation.
 
-        Each channel is reduced across fuel types: fuel temperature is the hottest type
-        (amax), fuel/vegetation is the total mass (sum), terrain is passed through, and the
-        two wind components are the same near-surface velocity the fire reads for spread
-        (prognostic wind x channeling gain). With a leading batch axis the result is the
-        B x C x N x N tensor the world model trains on.
+        The channels are (see obs_channel_names): the hottest fuel temperature (amax over
+        types), then one vegetation-mass channel per fuel type (in the fuel stack's order, no
+        longer summed together), then terrain (passed through) and the two near-surface wind
+        components -- the same velocity the fire reads for spread (prognostic wind x channeling
+        gain). N_fuel is read from the fuel stack, so C = 4 + N_fuel. With a leading batch axis
+        the result is the B x C x N x N tensor the world model trains on.
 
         The raw SI fields span very different magnitudes (K vs kg/m^2 vs m vs m/s), so each
         channel is mapped to roughly [0, 1] by the documented affine window in
-        physics_constants.OBS_NORM (value - offset) / scale. Wind is signed about 0; the high
-        side is not clamped, so flames (and strong gusts) ride a little above 1.
+        physics_constants.OBS_NORM (value - offset) / scale; every per-type fuel channel shares
+        the "fuel" window. Wind is signed about 0; the high side is not clamped, so flames (and
+        strong gusts) ride a little above 1.
         """
         channels = [
             fuel_temperatures.amax(dim=-3),  # fuel_temperature: hottest fuel type
-            fuel.sum(dim=-3),                # fuel: total vegetation mass
+            *fuel.unbind(dim=-3),            # fuel_<type>: per-type vegetation mass
             terrain,                         # terrain: elevation
             wind_x,                          # wind_x: near-surface fire wind u
             wind_y,                          # wind_y: near-surface fire wind v
         ]
         obs = torch.stack(channels, dim=-3)
-        offsets = torch.tensor([pc.OBS_NORM[c][0] for c in OBS_CHANNELS], dtype=obs.dtype, device=obs.device)
-        scales  = torch.tensor([pc.OBS_NORM[c][1] for c in OBS_CHANNELS], dtype=obs.dtype, device=obs.device)
+        n_fuel = fuel.shape[-3]
+        windows = (
+            [pc.OBS_NORM[c] for c in OBS_CHANNELS_PRE]
+            + [pc.OBS_NORM["fuel"]] * n_fuel
+            + [pc.OBS_NORM[c] for c in OBS_CHANNELS_POST]
+        )
+        offsets = torch.tensor([w[0] for w in windows], dtype=obs.dtype, device=obs.device)
+        scales  = torch.tensor([w[1] for w in windows], dtype=obs.dtype, device=obs.device)
         return (obs - offsets[:, None, None]) / scales[:, None, None]

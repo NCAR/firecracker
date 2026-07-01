@@ -17,7 +17,7 @@ import torch
 
 import physics_constants as pc
 from conftest import to_numpy
-from simulation import Simulation, SimState, OBS_CHANNELS
+from simulation import Simulation, SimState, obs_channel_names
 from map_loader import save_map
 from config import boundary_pad
 from rollout import BatchedRollout, FireDataset
@@ -128,12 +128,15 @@ def test_build_observation_shape_and_channels():
         offset, scale = pc.OBS_NORM[channel]
         return (to_numpy(raw) - offset) / scale
 
-    assert obs.shape == (B, len(OBS_CHANNELS), N, N)
+    # C = 4 fixed channels (fuel_temperature + terrain + 2 wind) + one per fuel type;
+    # this synthetic case uses 2 fuel types -> 6.
+    assert obs.shape == (B, len(obs_channel_names(names)), N, N)
     np.testing.assert_allclose(to_numpy(obs[:, 0]), norm("fuel_temperature", fuel_temps.amax(dim=1)))  # hottest type
-    np.testing.assert_allclose(to_numpy(obs[:, 1]), norm("fuel", fuel.sum(dim=1)))                     # total fuel
-    np.testing.assert_allclose(to_numpy(obs[:, 2]), norm("terrain", terrain))                          # terrain
-    np.testing.assert_allclose(to_numpy(obs[:, 3]), norm("wind_x", wind_x))                            # fire wind u
-    np.testing.assert_allclose(to_numpy(obs[:, 4]), norm("wind_y", wind_y))                            # fire wind v
+    np.testing.assert_allclose(to_numpy(obs[:, 1]), norm("fuel", fuel[:, 0]))                          # fuel type 0
+    np.testing.assert_allclose(to_numpy(obs[:, 2]), norm("fuel", fuel[:, 1]))                          # fuel type 1
+    np.testing.assert_allclose(to_numpy(obs[:, 3]), norm("terrain", terrain))                          # terrain
+    np.testing.assert_allclose(to_numpy(obs[:, 4]), norm("wind_x", wind_x))                            # fire wind u
+    np.testing.assert_allclose(to_numpy(obs[:, 5]), norm("wind_y", wind_y))                            # fire wind v
 
 
 def test_rollout_collects_and_samples(tmp_path):
@@ -153,11 +156,11 @@ def test_rollout_collects_and_samples(tmp_path):
 
     # stride=2 over 8 steps stores 4 frames, each a batch of 4 worlds -> 16 samples.
     assert roll.capacity == (8 // 2) * 4
-    assert pool.shape == (roll.capacity, len(OBS_CHANNELS), grid, grid)
+    assert pool.shape == (roll.capacity, roll.num_channels, grid, grid)
     assert torch.isfinite(pool).all()
 
     batch = roll.sample_minibatch()
-    assert batch.shape == (10, len(OBS_CHANNELS), grid, grid)
+    assert batch.shape == (10, roll.num_channels, grid, grid)
     assert batch.device.type == "cpu"
 
 
@@ -200,7 +203,7 @@ def test_build_dataset_and_load(tmp_path):
     ds = FireDataset(out)
     assert len(ds) == per_shard * rounds
     sample = ds[0]
-    assert sample.shape == (len(OBS_CHANNELS), grid, grid)
+    assert sample.shape == (roll.num_channels, grid, grid)
 
     # Last item indexes into the final shard and must match that shard's raw contents.
     last_shard = np.load(sorted(out.glob("shard_*.npy"))[-1])
@@ -227,7 +230,7 @@ def test_firedataset_unions_worker_subdirs(tmp_path):
     per_shard = (4 // 2) * 2
     ds = FireDataset(parent)                            # parent has no meta.json -> nested
     assert len(ds) == per_shard * rounds * 3
-    assert ds[0].shape == (len(OBS_CHANNELS), grid, grid)
+    assert ds[0].shape == (roll.num_channels, grid, grid)
 
 
 def test_firedataset_rejects_incompatible_sources(tmp_path):

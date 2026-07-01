@@ -20,7 +20,7 @@ The encoder is a stack of DownBlocks that halve H/W and grow channels at every s
 at a fully-convolutional spatial latent (no flatten, no dense bottleneck); the decoder mirrors
 it with a stack of UpBlocks back to the original `C x N x N` shape. This is a baseline for
 compressing the world-model observation stack (see `Simulation.build_observation` /
-`OBS_CHANNELS`).
+`obs_channel_names`).
 
 With the default eight stages on a 256x256 input the latent is a 1x1x1024 feature map, fed
 straight into the decoder. The grid size `N` must be divisible by `2 ** len(channels)` so every
@@ -141,7 +141,7 @@ class StridedConvAutoencoder(nn.Module):
     and (reconstruction, latent) forward contract.
 
     Args:
-        in_channels: number of input channels (e.g. len(OBS_CHANNELS)).
+        in_channels: number of input channels (e.g. len(obs_channel_names(...))).
         grid_size:   spatial size N of the square input; must be divisible by 2**len(channels).
         channels:    encoder channel widths, one per downsampling stage. The last entry is the
                      latent channel count; len(channels) sets how far H/W are halved.

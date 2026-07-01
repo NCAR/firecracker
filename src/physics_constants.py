@@ -39,7 +39,8 @@ WIND_REF_M_S:   float = 30.0                # solver's peak-wind calibration tar
 # The world-model observation (Simulation.build_observation) carries SI fields whose
 # magnitudes span several orders (K vs kg/m^2 vs m). Each channel is mapped to roughly
 # [0, 1] by an affine (value - offset) / scale with a documented, physically motivated
-# window -- deterministic, not data-fitted. Keyed by the OBS_CHANNELS name. The high side
+# window -- deterministic, not data-fitted. Keyed by channel name; every per-type fuel
+# channel (fuel_<name>) shares the single "fuel" window here. The high side
 # is intentionally not clamped: flames legitimately exceed the temperature window (they
 # ride a little above 1) rather than saturating the model's view of fire.
 OBS_NORM: dict[str, tuple[float, float]] = {

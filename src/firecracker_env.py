@@ -3,7 +3,8 @@ firecracker_env.py
 
 Gymnasium environment wrapping the Firecracker heat-diffusion simulation.
 Observation: the world-model observation — a normalized (C, grid_size, grid_size) float32
-             stack of the OBS_CHANNELS (see Simulation.build_observation).
+             stack of the observation channels (see Simulation.build_observation /
+             obs_channel_names).
 Action:      Discrete(action_grid_size) — an action-cell is selected over two steps (first a
              row, then a column). A completed selection goes through only when the cell or one
              of its 8 neighbour action-cells contains fire; over a fire-free neighbourhood it is
@@ -20,7 +21,7 @@ import pygame
 import gymnasium
 from gymnasium import spaces
 
-from simulation import OBS_CHANNELS, Simulation, SimState
+from simulation import Simulation, SimState, obs_channel_names
 from config import boundary_pad
 from gen_maps import MapGenerator
 from map_loader import load_map, resolve_map, validate_against_config
@@ -210,13 +211,16 @@ class FirecrackerEnv(gymnasium.Env):
         self._selected_action_cell: tuple[int, int] | None = None
 
         # reset/step return the same world-model observation the rollout collector consumes:
-        # the normalized multi-channel stack produced by Simulation.build_observation
-        # (OBS_CHANNELS). Channels are mapped to roughly [0, 1] by their affine windows, but the
-        # high side is intentionally not clamped (flames/strong gusts ride above 1) and wind is
-        # signed, so the Box is left unbounded rather than asserting a false finite range.
+        # the normalized multi-channel stack produced by Simulation.build_observation. The
+        # channel count depends on the configured fuel types (one fuel_<name> channel each), so
+        # it is derived from the sim's fuel types via obs_channel_names. Channels are mapped to
+        # roughly [0, 1] by their affine windows, but the high side is intentionally not clamped
+        # (flames/strong gusts ride above 1) and wind is signed, so the Box is left unbounded
+        # rather than asserting a false finite range.
+        self.obs_channels = obs_channel_names(self._sim.fuel_type_names)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
-            shape=(len(OBS_CHANNELS), self.grid_size, self.grid_size), dtype=np.float32,
+            shape=(len(self.obs_channels), self.grid_size, self.grid_size), dtype=np.float32,
         )
         # An action-cell is selected over two consecutive steps (first a row, then a column), each a
         # Discrete index in [0, action_grid_size) -- no dedicated no-op action, so the space is
@@ -332,7 +336,8 @@ class FirecrackerEnv(gymnasium.Env):
 
     def _observation(self) -> np.ndarray:
         """The world-model observation for the current state: a normalized (C, H, W) float32
-        stack of OBS_CHANNELS over the observed interior (the padded sponge ring is cropped off).
+        stack of the observation channels over the observed interior (the padded sponge ring is
+        cropped off).
         Identical to what BatchedRollout.observe collects, including the near-surface fire wind
         (prognostic wind x channeling gain) used by the spread physics."""
         obs = Simulation.build_observation(

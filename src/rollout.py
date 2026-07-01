@@ -6,7 +6,7 @@ Batched rollout collector for world-model training — decoupled from Gymnasium.
 One `Simulation` steps `B` worlds in parallel on the sim device (the physics ops are
 rank-agnostic, so the single-world engine batches with no special-casing). Every `stride`-th
 tick's observation, a `B x C x N x N` tensor (see `Simulation.build_observation` /
-`OBS_CHANNELS`), is written into a fixed pool of independent samples; the trainer then draws
+`obs_channel_names`), is written into a fixed pool of independent samples; the trainer then draws
 random, near-I.I.D. minibatches from that pool. Consecutive frames are highly redundant, so
 subsampling (default stride=16) keeps the pool decorrelated and small.
 
@@ -66,7 +66,7 @@ import torch
 from torch.utils.data import Dataset
 
 from config import load_config, boundary_pad
-from simulation import Simulation, SimState, OBS_CHANNELS
+from simulation import Simulation, SimState, obs_channel_names
 from map_loader import load_map, resolve_map, validate_against_config
 
 DEFAULT_GRID_SIZE = 256
@@ -132,7 +132,8 @@ class BatchedRollout:
             buffer_dtype if buffer_dtype is not None else roll_cfg.get("buffer_dtype", "float32")
         )
 
-        self.num_channels = len(OBS_CHANNELS)
+        self.obs_channels = obs_channel_names(self._sim.fuel_type_names)
+        self.num_channels = len(self.obs_channels)
         # Host RNG for map selection / ignition; torch generator for minibatch sampling.
         self._np_rng = np.random.default_rng(seed)
         self._gen = torch.Generator(device=self._buffer_device)
@@ -337,7 +338,7 @@ class BatchedRollout:
             "rounds":            rounds,
             "samples_per_shard": samples_per_shard,
             "total_samples":     samples_per_shard * rounds,
-            "channels":          list(OBS_CHANNELS),
+            "channels":          list(self.obs_channels),
             "num_channels":      self.num_channels,
             "grid_size":         self.grid_size,
             "dtype":             str(np.dtype(self._buffer_dtype_np)),
