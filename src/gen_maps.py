@@ -14,10 +14,13 @@ valleys less).
 The whole rest state is built as torch tensors on `MapGenerator.device` (CUDA when
 available, else CPU -- set [environment].device or pass --device to force one), using
 the vectorized torch Perlin kernel in perlin.py instead of a per-cell scalar loop. So
-both the noise and the field math run on the GPU; only the per-map random scalars
-(noise bases, wind, tree draws) are drawn from the numpy rng, which keeps output
-reproducible and identical across devices. Fields move back to numpy at the MapData
-boundary, then the chunk is spun up on the same device.
+both the noise and the field math run on the GPU. A whole chunk of maps is built in one
+batched pass (`generate_maps`): the Perlin kernel samples every field for the batch at
+once (one base per map) and the field math broadcasts over the leading map dim, so the
+maps are built together rather than one at a time. Map generation is not required to be
+deterministic (only the maps, once written, must stay stable), so every per-map random
+draw (noise bases, wind, tree counts) comes from a single shared numpy rng. Fields move
+back to numpy at the MapData boundary, then the chunk is spun up on the same device.
 
 After the rest state is built, `spin_up_maps` steps the full field physics to its
 developed state and bakes the developed mass, air temperature and prognostic wind
@@ -31,6 +34,17 @@ out.) This is the one place generation touches the physics engine; the emitted
 Run as a script to bake a batch of maps to disk:
 
     python src/gen_maps.py --count 8 --out maps --seed 0
+
+Generation is embarrassingly parallel, so a large run can be sharded across processes / GPUs /
+nodes without ever producing duplicate maps (disjoint output index blocks + an independent random
+stream per shard). Fan across the local GPUs in one command:
+
+    python src/gen_maps.py --count 1000 --seed 0 --gpus cuda:0,cuda:1,cuda:2,cuda:3
+
+or launch the shards yourself (one process per rank, e.g. under MPI/PBS across nodes), pinning a
+GPU per rank and passing the same --count/--seed/--shards with a distinct --shard-id:
+
+    python src/gen_maps.py --count 1000 --seed 0 --shards $NRANKS --shard-id $RANK --device cuda
 """
 
 import argparse
@@ -464,39 +478,52 @@ class MapGenerator:
 
         Built on torch (grid_sample for the shadow march); a NumPy elevation is accepted and
         returns NumPy float32, a torch tensor returns a torch tensor in the compute dtype.
+
+        Accepts either a single (H, W) elevation or a batched (B, H, W) stack of maps: a 2-D input
+        returns a 2-D field, a batched input returns (B, H, W) with every map evaluated together in
+        one pass (the whole shadow ray-march runs across the batch on the GPU). The sun-sample
+        geometry is terrain-independent, so it is computed once and shared over the batch.
         """
         import torch
         as_torch = _is_torch(elevation_m)
         t = elevation_m if as_torch else torch.as_tensor(elevation_m, dtype=torch.float64)
+        squeeze = t.ndim == 2                     # remember to drop the batch dim on a single-map call
+        if squeeze:
+            t = t[None]
         device, dtype = t.device, t.dtype
-        H, W = t.shape
+        B, H, W = t.shape
         dz = float(self.cell_size_m)
         diffuse = self.sun_diffuse_fraction
 
+        def _finish(out):
+            out = out[0] if squeeze else out
+            return _store(out) if as_torch else out.cpu().numpy().astype(np.float32)
+
         E, N, U = self._sun_directions()
         if E.size == 0:                          # polar night: only the diffuse floor reaches the ground
-            out = torch.full((H, W), diffuse, dtype=dtype, device=device)
-            return out if as_torch else out.cpu().numpy().astype(np.float32)
+            return _finish(torch.full((B, H, W), diffuse, dtype=dtype, device=device))
 
         Es = torch.as_tensor(E, dtype=dtype, device=device)            # (S,)
         Ns = torch.as_tensor(N, dtype=dtype, device=device)
         Us = torch.as_tensor(U, dtype=dtype, device=device)
         S = Es.shape[0]
 
-        # Upward surface normal from the terrain gradient. Grid convention: row i runs south,
+        # Upward surface normal from each map's terrain gradient. Grid convention: row i runs south,
         # column j runs east, so the north gradient is -d/di. n = (-dz/dE, -dz/dN, 1)/|.|.
-        gy, gx = torch.gradient(t, spacing=dz)                          # gy = dz/di, gx = dz/dj
+        gy, gx = torch.gradient(t, spacing=dz, dim=(1, 2))             # (B, H, W) each: gy=dz/di, gx=dz/dj
         inv_norm = torch.rsqrt(gx * gx + gy * gy + 1.0)
-        nE, nN, nU = -gx * inv_norm, gy * inv_norm, inv_norm           # (H, W) each
+        nE, nN, nU = -gx * inv_norm, gy * inv_norm, inv_norm           # (B, H, W) each
 
-        # Lambertian incidence for every sun sample (clamped at the terminator).
-        cos_inc = (nE[None] * Es[:, None, None]
-                   + nN[None] * Ns[:, None, None]
-                   + nU[None] * Us[:, None, None]).clamp(min=0.0)       # (S, H, W)
+        # Lambertian incidence for every (map, sun sample) pair (clamped at the terminator).
+        cos_inc = (nE[:, None] * Es[None, :, None, None]
+                   + nN[:, None] * Ns[None, :, None, None]
+                   + nU[:, None] * Us[None, :, None, None]).clamp(min=0.0)   # (B, S, H, W)
 
         # Cast shadow: march each cell toward the sun's horizontal direction and test whether the
         # terrain ever rises above the line of sight (height + horizontal_distance * tan(elevation)).
-        visible = torch.ones((S, H, W), dtype=dtype, device=device)
+        # The ray geometry is map-independent, so the sample coordinates are shared across the batch
+        # and only the sampled terrain differs between maps.
+        visible = torch.ones((B, S, H, W), dtype=dtype, device=device)
         if self.sun_shadows:
             hmag = torch.sqrt(Es * Es + Ns * Ns).clamp(min=1e-6)       # horizontal speed (S,)
             tan_elev = Us / hmag                                       # rise per unit horizontal run
@@ -505,8 +532,8 @@ class MapGenerator:
             ii = torch.arange(H, device=device, dtype=dtype)
             jj = torch.arange(W, device=device, dtype=dtype)
             gi, gj = torch.meshgrid(ii, jj, indexing="ij")            # (H, W) base coords
-            terr = t[None, None].expand(S, 1, H, W)                    # grid_sample input (S, 1, H, W)
-            shadowed = torch.zeros((S, H, W), dtype=torch.bool, device=device)
+            terr = t[:, None, None].expand(B, S, 1, H, W).reshape(B * S, 1, H, W)  # grid_sample input
+            shadowed = torch.zeros((B, S, H, W), dtype=torch.bool, device=device)
             zmin, zmax = float(t.min()), float(t.max())
             tan_min = float(tan_elev.min())
             steps = self.sun_max_shadow_steps or max(H, W)
@@ -519,19 +546,20 @@ class MapGenerator:
                 gxn = c / (W - 1) * 2.0 - 1.0                          # normalised grid_sample coords
                 gyn = r / (H - 1) * 2.0 - 1.0
                 grid = torch.stack((gxn, gyn), dim=-1)                 # (S, H, W, 2)
+                grid = grid[None].expand(B, S, H, W, 2).reshape(B * S, H, W, 2)
                 sampled = torch.nn.functional.grid_sample(
                     terr, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-                )[:, 0]                                                # (S, H, W) terrain along the ray
-                los = t[None] + (k * dz) * tan_elev[:, None, None]     # line-of-sight height
-                in_bounds = (r >= 0) & (r <= H - 1) & (c >= 0) & (c <= W - 1)
-                shadowed |= in_bounds & (sampled > los)
+                ).reshape(B, S, H, W)                                  # terrain along the ray, per map
+                los = t[:, None] + (k * dz) * tan_elev[None, :, None, None]   # line-of-sight height
+                in_bounds = (r >= 0) & (r <= H - 1) & (c >= 0) & (c <= W - 1)  # (S, H, W)
+                shadowed |= in_bounds[None] & (sampled > los)
             visible = (~shadowed).to(dtype)
 
         # Beam-weighted (sin elevation) average of the unshadowed cosine incidence, plus a uniform
         # diffuse skylight floor so fully shaded ground is dim, not black.
-        direct = (Us[:, None, None] * cos_inc * visible).sum(0) / Us.sum()
+        direct = (Us[None, :, None, None] * cos_inc * visible).sum(1) / Us.sum()   # (B, H, W)
         out = (diffuse + (1.0 - diffuse) * direct).clamp(0.0, 1.0)
-        return _store(out) if as_torch else out.cpu().numpy().astype(np.float32)
+        return _finish(out)
 
     def flat_exposure(self) -> float:
         """The sunlight_exposure value a flat, fully-open cell receives (no slope, no shadow).
@@ -569,18 +597,23 @@ class MapGenerator:
         return _store(ambient + (1.0 - m) * (radiative - ambient))
 
 
-def generate_map(
+def generate_maps(
     gen: MapGenerator,
     grid_size: int,
+    count: int,
     rng: np.random.Generator,
-    seed: int | None = None,
-) -> MapData:
-    """Build one fully-baked, unperturbed initial state.
+    seeds: list[int | None] | None = None,
+) -> list[MapData]:
+    """Build `count` fully-baked, unperturbed initial states in one batched GPU pass.
 
-    The whole rest state is built as torch tensors on gen.device (CUDA when available),
-    so the noise and field math run on the GPU; the per-map random scalars (noise bases,
-    wind, tree draws) come from the numpy rng, so output is reproducible and identical
-    across devices. Fields are moved back to numpy only at the MapData boundary.
+    The whole chunk's rest states are built as (count, ...) torch tensors on gen.device (CUDA
+    when available): the octave Perlin kernel samples every terrain/fuel field for the batch at
+    once (one random base per map) and all the field math -- temperature, pressure, mass, oxygen,
+    sunlight/shadows, biomes, tree counts -- broadcasts over the leading map dim, so a chunk of
+    maps is built together instead of one at a time. Map generation is not required to be
+    deterministic (only the maps, once written, must stay stable), so every per-map random draw
+    (noise bases, tree counts, wind) comes straight from a single shared numpy rng. Fields move
+    back to numpy only at the MapData boundary, where the batch is sliced into one MapData per map.
 
     Fire is intentionally not baked here: ignition (random spawn or click) is a
     runtime concern applied by the environment, so maps describe the world at rest.
@@ -589,8 +622,19 @@ def generate_map(
     [kg/m^3], fuel [kg/m^2]. `sunlight` is a static dimensionless [0,1] solar-exposure field that
     drives the baked surface (rest) temperature: sunnier cells warmer, shaded cells cooler.
     """
-    # Normalised [0,1] relief is scaled to metres for the elevation.
-    relief = gen.create_terrain(grid_size, rng=rng)
+    B = int(count)
+    device = gen.device
+    if seeds is None:
+        seeds = [None] * B
+    names = gen.fuel_type_names
+
+    # One random Perlin base per map for each noise field. Order/independence between fields does
+    # not matter (generation need not be reproducible), so every base is drawn from the shared rng.
+    def bases():
+        return list(rng.integers(0, 256, size=B))
+
+    # Normalised [0,1] relief is scaled to metres for the elevation (one field per map).
+    relief = gen.create_terrain(grid_size, base=bases())
     terrain = relief * gen.elev_max
 
     # Static solar exposure [0,1]: south-facing slopes catch the sun, shadowed valleys lose it.
@@ -605,7 +649,7 @@ def generate_map(
     oxygen = gen.oxygen_profile(terrain, air_temperatures)
 
     N = gen.num_fuel_types
-    fuel = torch.zeros((N, grid_size, grid_size), dtype=torch.float64, device=gen.device)
+    fuel = torch.zeros((B, N, grid_size, grid_size), dtype=torch.float64, device=device)
 
     # Vegetation biomes: each cell has a soft membership in woodland / grassland / shrubland (from
     # its elevation and baked surface temperature) that blends smoothly across the biome borders, so
@@ -616,23 +660,22 @@ def generate_map(
     # cover. The weights are linear, so biome_grass_multiplier/biome_tree_density blend the densities.
     w_wood, w_grass, w_shrub = gen.biome_weights(terrain, surface_temperature)
 
-    names = gen.fuel_type_names
     if "grass" in names:
         # Grass: continuous Perlin density [kg/m^2], full-strength on the grassland and thinned to
         # woodland_grass_fraction under the woodland canopy (none on the shrubland).
         gi = names.index("grass")
         grass_noise = gen.apply_noise_floor(
-            gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), rng=rng), gi)
+            gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[gi]), base=bases()), gi)
         grass_biome = gen.biome_grass_multiplier(w_grass, w_wood)
-        fuel[gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_biome
+        fuel[:, gi] = grass_noise * float(gen.spawn_densities[gi]) * grass_biome
 
     if "shrub" in names:
         # Shrub: continuous Perlin density [kg/m^2] (its own noise field, so it is spatially
         # independent of the grass), confined to the shrubland.
         si = names.index("shrub")
         shrub_noise = gen.apply_noise_floor(
-            gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[si]), rng=rng), si)
-        fuel[si] = shrub_noise * float(gen.spawn_densities[si]) * w_shrub
+            gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[si]), base=bases()), si)
+        fuel[:, si] = shrub_noise * float(gen.spawn_densities[si]) * w_shrub
 
     if gen.tree_indices:
         # Trees: one stochastic per-cell count (exponential mean = biome-set density * noise, capped)
@@ -640,21 +683,21 @@ def generate_map(
         # -- so the canopy and bole of the same trees always share a cell. The count's noise scale is
         # taken from the first tree component; its density is set per biome (biome_tree_density).
         t0 = gen.tree_indices[0]
-        tree_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[t0]), rng=rng)
+        tree_noise = gen.create_grid(grid_size, scale=float(gen.fuel_noise_scales[t0]), base=bases())
         density = tree_noise * gen.biome_tree_density(w_wood, w_grass, w_shrub)
-        tree_counts = gen.sample_tree_counts(density, rng)
+        tree_counts = gen.sample_tree_counts(density, rng)             # (B, H, W)
         for ti in gen.tree_indices:
-            fuel[ti] = tree_counts * float(gen.fuel_per_tree[ti])
+            fuel[:, ti] = tree_counts * float(gen.fuel_per_tree[ti])
 
     # Each fuel type starts at ambient air temperature.
-    fuel_temperatures = air_temperatures.unsqueeze(0).expand(N, -1, -1)
+    fuel_temperatures = air_temperatures.unsqueeze(1).expand(B, N, grid_size, grid_size)
 
     # Shallow boundary-layer mass at its level-lid rest state (thinner over high terrain).
     mass = gen.boundary_layer_mass(terrain)
 
     # Per-map synoptic (prevailing) wind: random bearing, speed from the configured range.
-    speed = float(rng.uniform(gen.ambient_speed_min, gen.ambient_speed_max))
-    bearing = float(rng.uniform(0.0, 2.0 * np.pi))
+    speed = rng.uniform(gen.ambient_speed_min, gen.ambient_speed_max, size=B)
+    bearing = rng.uniform(0.0, 2.0 * np.pi, size=B)
     ambient_wind_x = speed * np.cos(bearing)
     ambient_wind_y = speed * np.sin(bearing)
 
@@ -662,26 +705,49 @@ def generate_map(
         return t.detach().contiguous().to("cpu").numpy().astype(np.float32)
 
     terrain_np = to_np(terrain)
+    sunlight_np = to_np(sunlight)
     air_np = to_np(air_temperatures)
+    mass_np = to_np(mass)
     oxygen_np = to_np(oxygen)
+    fuel_np = to_np(fuel)
+    fuel_temp_np = to_np(fuel_temperatures)
 
-    return MapData(
-        terrain=terrain_np,
-        sunlight=to_np(sunlight),
-        air_temperatures=air_np,
-        mass=to_np(mass),
-        oxygen=oxygen_np,
-        fuel=to_np(fuel),
-        fuel_temperatures=to_np(fuel_temperatures),
-        fuel_type_names=list(gen.fuel_type_names),
-        grid_size=grid_size,
-        temp_eq=air_np.copy(),
-        oxygen_eq=oxygen_np.copy(),
-        seed=seed,
-        source="gen_maps",
-        ambient_wind_x=ambient_wind_x,
-        ambient_wind_y=ambient_wind_y,
-    )
+    maps: list[MapData] = []
+    for i in range(B):
+        air_i = air_np[i]
+        oxygen_i = oxygen_np[i]
+        maps.append(MapData(
+            terrain=terrain_np[i],
+            sunlight=sunlight_np[i],
+            air_temperatures=air_i,
+            mass=mass_np[i],
+            oxygen=oxygen_i,
+            fuel=fuel_np[i],
+            fuel_temperatures=fuel_temp_np[i],
+            fuel_type_names=list(gen.fuel_type_names),
+            grid_size=grid_size,
+            temp_eq=air_i.copy(),
+            oxygen_eq=oxygen_i.copy(),
+            seed=seeds[i],
+            source="gen_maps",
+            ambient_wind_x=float(ambient_wind_x[i]),
+            ambient_wind_y=float(ambient_wind_y[i]),
+        ))
+    return maps
+
+
+def generate_map(
+    gen: MapGenerator,
+    grid_size: int,
+    rng: np.random.Generator,
+    seed: int | None = None,
+) -> MapData:
+    """Build one fully-baked, unperturbed initial state (a single-map `generate_maps`).
+
+    Retained for the single-map callers (tools/bench.py, tests); the map pipeline builds a whole
+    chunk at once via generate_maps.
+    """
+    return generate_maps(gen, grid_size, 1, rng, seeds=[seed])[0]
 
 
 def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int = 16) -> None:
@@ -775,6 +841,87 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
         print(f"  spun up maps {start + 1}-{start + len(batch)} / {len(maps)} ({steps} ticks)")
 
 
+def _run_shard(
+    config: dict,
+    grid_size: int,
+    observed: int,
+    pad: int,
+    *,
+    count: int,
+    start_index: int,
+    out: str,
+    prefix: str,
+    chunk: int,
+    shard_id: int,
+    num_shards: int,
+    device: str | None,
+    root_seq: np.random.SeedSequence,
+) -> None:
+    """Generate one shard of a (possibly multi-process) run: the maps whose global index falls in
+    this shard's contiguous block of the `count` total.
+
+    Sharding is what makes generation safe to fan out across processes / GPUs / nodes without
+    duplicate maps. Two guarantees keep the shards disjoint:
+      * output index range -- shard s owns the contiguous global block [s*count//N, (s+1)*count//N),
+        written at `start_index + global_index`, so no two shards ever target the same file; and
+      * random stream -- each shard draws from its own SeedSequence child (root_seq.spawn(N)[s]),
+        which numpy guarantees is statistically independent, so no two shards draw the same maps
+        even though generation is non-deterministic. Per-map provenance seeds are spawned from the
+        same shard stream, so every written map still records a distinct seed.
+
+    A single-shard run (num_shards == 1) is exactly the old whole-run behaviour.
+    """
+    if device is not None:
+        config.setdefault("environment", {})["device"] = device
+    gen = MapGenerator(config)
+    chunk = max(1, chunk)
+
+    lo = shard_id * count // num_shards
+    hi = (shard_id + 1) * count // num_shards
+    n_shard = hi - lo
+    tag = "" if num_shards == 1 else f"[shard {shard_id}/{num_shards}] "
+
+    shard_seq = root_seq.spawn(num_shards)[shard_id]
+    rng = np.random.default_rng(shard_seq)
+    map_seeds = [int(s.generate_state(1)[0]) for s in shard_seq.spawn(n_shard)]
+
+    if n_shard == 0:
+        print(f"{tag}no maps for this shard.", flush=True)
+        return
+
+    print(f"{tag}Generating {n_shard} map(s) [global {start_index + lo}..{start_index + hi - 1}] at "
+          f"{grid_size}x{grid_size} (observed {observed}x{observed} + {pad}-cell sponge padding) "
+          f"into '{out}/' (device={gen.device}, chunk={chunk}, spinup={gen.spinup_steps} ticks) ...",
+          flush=True)
+
+    # Process the maps in chunks: build each rest state on the device (the torch Perlin kernel and
+    # field math run on the GPU when present), spin up the whole chunk in one batched solver pass,
+    # then save it before moving on. So progress is durable (each chunk is on disk before the next
+    # starts) and memory stays bounded (one chunk resident at a time).
+    done = 0
+    for start in range(0, n_shard, chunk):
+        n = min(start + chunk, n_shard) - start
+        maps = generate_maps(gen, grid_size, n, rng, seeds=map_seeds[start:start + n])
+        if gen.spinup_steps > 0:
+            spin_up_maps(maps, config, gen.spinup_steps)
+        for off, m in enumerate(maps):
+            gidx = start_index + lo + start + off
+            save_map(f"{out}/{prefix}_{gidx:04d}.npz", m)
+        done += len(maps)
+        print(f"  {tag}[{done}/{n_shard}] generated + spun up + saved", flush=True)
+    print(f"{tag}Done ({n_shard} maps).", flush=True)
+
+
+def _shard_worker(rank, config, meta, gpus, root_seq) -> None:
+    """torch.multiprocessing entry point: run shard `rank` pinned to gpus[rank] (see main --gpus)."""
+    _run_shard(
+        config, meta["grid_size"], meta["observed"], meta["pad"],
+        count=meta["count"], start_index=meta["start_index"], out=meta["out"],
+        prefix=meta["prefix"], chunk=meta["chunk"],
+        shard_id=rank, num_shards=len(gpus), device=gpus[rank], root_seq=root_seq,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Firecracker maps")
     parser.add_argument("--count", type=int, default=1, help="number of maps to generate")
@@ -795,43 +942,59 @@ def main() -> None:
         "--chunk", type=int, default=32,
         help="maps per generate->spin-up->save chunk (bounds memory; saves progress durably)",
     )
+    parser.add_argument(
+        "--shards", type=int, default=1,
+        help="split --count into this many disjoint shards for multi-process / multi-node "
+             "generation; this process builds only its --shard-id slice (no duplicate maps across "
+             "shards). Launch one process per rank with the same --count/--seed/--shards.",
+    )
+    parser.add_argument(
+        "--shard-id", type=int, default=0,
+        help="which shard (0..shards-1) this process generates (see --shards)",
+    )
+    parser.add_argument(
+        "--gpus", default=None,
+        help="comma-separated devices (e.g. 'cuda:0,cuda:1,cuda:2,cuda:3') to fan this run across on "
+             "THIS node: spawns one process per device, each building a disjoint shard. Overrides "
+             "--device/--shards/--shard-id.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
-    if args.device is not None:
-        config.setdefault("environment", {})["device"] = args.device
     observed = int((config or {}).get("environment", {}).get("grid_size", DEFAULT_GRID_SIZE))
     # Maps are generated at the padded physics size (observed + 2*boundary_pad): the open-boundary
     # sponge lives in the ring, so the observed interior the env crops out is sponge-free.
     pad = boundary_pad(config)
     grid_size = physics_grid_size(config, observed)
-    gen = MapGenerator(config)
-    chunk = max(1, args.chunk)
+    # Shared seed root: every shard spawns an independent child stream from this, so the shards are
+    # coordinated (given --seed) yet never draw the same maps.
+    root_seq = np.random.SeedSequence(args.seed)
 
-    # Per-map seeds, spawned once so each map is reproducible regardless of chunking.
-    children = np.random.SeedSequence(args.seed).spawn(args.count)
-    seeds = [int(c.generate_state(1)[0]) for c in children]
+    # Fan out across local GPUs: one process per device, each a disjoint shard. Parent must not touch
+    # CUDA before spawning, so device selection is deferred into the workers (spawn start method).
+    if args.gpus:
+        gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
+        if not gpus:
+            parser.error("--gpus was empty")
+        import torch.multiprocessing as mp
+        meta = dict(count=args.count, start_index=args.start_index, out=args.out,
+                    prefix=args.prefix, chunk=args.chunk, grid_size=grid_size,
+                    observed=observed, pad=pad)
+        print(f"Fanning {args.count} map(s) across {len(gpus)} device(s): {', '.join(gpus)}",
+              flush=True)
+        mp.spawn(_shard_worker, args=(config, meta, gpus, root_seq), nprocs=len(gpus), join=True)
+        print("All shards done.", flush=True)
+        return
 
-    print(f"Generating {args.count} map(s) at {grid_size}x{grid_size} "
-          f"(observed {observed}x{observed} + {pad}-cell sponge padding) into '{args.out}/' "
-          f"(device={gen.device}, chunk={chunk}, spinup={gen.spinup_steps} ticks) ...", flush=True)
+    if not (0 <= args.shard_id < args.shards):
+        parser.error(f"--shard-id must be in [0, {args.shards}) (got {args.shard_id})")
 
-    # Process the maps in chunks: build each rest state on the device (the torch Perlin kernel and
-    # field math run on the GPU when present), spin up the whole chunk in one batched solver pass,
-    # then save it before moving on. So progress is durable (each chunk is on disk before the next
-    # starts) and memory stays bounded (one chunk resident at a time).
-    done = 0
-    for start in range(0, args.count, chunk):
-        idx = range(start, min(start + chunk, args.count))
-        maps = [generate_map(gen, grid_size, np.random.default_rng(children[i]), seed=seeds[i])
-                for i in idx]
-        if gen.spinup_steps > 0:
-            spin_up_maps(maps, config, gen.spinup_steps)
-        for off, m in enumerate(maps):
-            save_map(f"{args.out}/{args.prefix}_{args.start_index + start + off:04d}.npz", m)
-        done += len(maps)
-        print(f"  [{done}/{args.count}] generated + spun up + saved", flush=True)
-    print("Done.", flush=True)
+    _run_shard(
+        config, grid_size, observed, pad,
+        count=args.count, start_index=args.start_index, out=args.out, prefix=args.prefix,
+        chunk=args.chunk, shard_id=args.shard_id, num_shards=args.shards,
+        device=args.device, root_seq=root_seq,
+    )
 
 
 if __name__ == "__main__":

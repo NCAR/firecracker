@@ -19,7 +19,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from config import load_config  # noqa: E402
-from gen_maps import MapGenerator  # noqa: E402
+from gen_maps import MapGenerator, generate_maps  # noqa: E402
 
 GRID = 24
 
@@ -103,6 +103,37 @@ def test_batched_sample_perlin_matches_per_map():
     assert batch.shape == (3, GRID, GRID)
     stacked = torch.stack([gen.sample_perlin_grid(GRID, b, scale=24.0) for b in bases])
     assert torch.allclose(batch, stacked)
+
+
+def test_batched_sunlight_matches_per_map():
+    # sunlight_exposure over a (B, H, W) stack equals evaluating each map on its own, and a 2-D
+    # input still returns a 2-D field (the single-map contract the rest of the code relies on).
+    gen = _gen()
+    stack = torch.stack([torch.as_tensor(_ns_ridge(), dtype=torch.float64) + 30.0 * m
+                         for m in range(3)])
+    batched = gen.sunlight_exposure(stack)
+    assert batched.shape == (3, GRID, GRID)
+    looped = torch.stack([gen.sunlight_exposure(stack[i]) for i in range(3)])
+    assert looped.shape == (3, GRID, GRID)          # each single-map call is 2-D
+    assert torch.allclose(batched, looped, atol=1e-9)
+
+
+def test_generate_maps_shapes_and_distinct():
+    # The batched build emits one well-formed MapData per map, each with its own random terrain and
+    # synoptic wind, at the requested count.
+    gen = _gen()
+    maps = generate_maps(gen, GRID, 4, np.random.default_rng(0), seeds=[5, 6, 7, 8])
+    assert len(maps) == 4
+    n_fuel = len(maps[0].fuel_type_names)
+    for m in maps:
+        assert m.terrain.shape == (GRID, GRID)
+        assert m.fuel.shape == (n_fuel, GRID, GRID)
+        assert m.fuel_temperatures.shape == (n_fuel, GRID, GRID)
+        for field in (m.terrain, m.fuel, m.air_temperatures, m.mass, m.oxygen, m.sunlight):
+            assert np.isfinite(field).all()
+    assert [m.seed for m in maps] == [5, 6, 7, 8]
+    # Distinct random terrain per map (not the same field broadcast across the batch).
+    assert not np.allclose(maps[0].terrain, maps[1].terrain)
 
 
 def _ns_ridge() -> np.ndarray:
