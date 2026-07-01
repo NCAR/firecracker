@@ -43,7 +43,17 @@ MAP_SUFFIX = ".npz"
 #        flatter ground and trees favour steeper ground (per-fuel slope_preference/slope_falloff),
 #        with enlarged fuel noise scales so each fuel gathers into big patches. v6 fuel maps
 #        differ, so they are rejected (regenerate).
-UNITS_VERSION = 7
+#   v8 = added a static per-cell `sunlight` field (average solar exposure [0,1]): slope/aspect
+#        (south-facing slopes catch more sun) plus terrain cast-shadow. v7 maps lack it, so they
+#        are rejected (regenerate).
+#   v9 = three coupled changes to the baked state: (1) `temp_eq` (and the initial air) is the
+#        sunlight-driven surface temperature -- sun-facing slopes warmer, shaded valleys cooler --
+#        not the elevation-only profile; (2) maps are generated at the padded physics size
+#        (observed grid + 2*sponge_width, e.g. 272 for a 256 observation) so the open-boundary
+#        sponge sits in the ring, outside the observed interior; and (3) the baked air temperature
+#        is the developed, wind-smeared equilibrium (full-physics spin-up), not the sharp rest
+#        profile. v8 maps differ in field values and grid shape, so they are rejected (regenerate).
+UNITS_VERSION = 9
 
 # Maps live at <repo_root>/maps by default (alongside cfg/), same convention as
 # config.py. A relative maps dir is anchored here so the app finds its maps
@@ -76,6 +86,7 @@ class MapData:
     temp_eq:           np.ndarray | None = None  # (H, W) temperature relaxation target (rest profile)
     oxygen_eq:         np.ndarray | None = None  # (H, W) oxygen replenishment target
     mass_eq:           np.ndarray | None = None  # (H, W) level-lid rest mass (open-boundary sponge target)
+    sunlight:          np.ndarray | None = None  # (H, W) static average solar exposure [0,1] (drives temp_eq)
     x_wind_vel:        np.ndarray | None = None  # (H, W) developed prognostic wind u [m/s]
     y_wind_vel:        np.ndarray | None = None  # (H, W) developed prognostic wind v [m/s]
     seed:              int | None = None
@@ -100,6 +111,10 @@ class MapData:
             self.x_wind_vel = np.full_like(self.mass, self.ambient_wind_x)
         if self.y_wind_vel is None:
             self.y_wind_vel = np.full_like(self.mass, self.ambient_wind_y)
+        # A map without a baked solar-exposure field (hand-built scenarios, a real-data importer)
+        # defaults to full, uniform sun (no terrain shading).
+        if self.sunlight is None:
+            self.sunlight = np.ones_like(self.terrain)
 
     @property
     def num_fuel_types(self) -> int:
@@ -121,6 +136,7 @@ def save_map(path: str | Path, m: MapData) -> Path:
     np.savez_compressed(
         path,
         terrain=m.terrain,
+        sunlight=m.sunlight,
         air_temperatures=m.air_temperatures,
         mass=m.mass,
         oxygen=m.oxygen,
@@ -151,6 +167,7 @@ def load_map(path: str | Path) -> MapData:
         units_version = int(data["units_version"]) if "units_version" in data else 0
         return MapData(
             terrain=data["terrain"].astype(np.float32),
+            sunlight=data["sunlight"].astype(np.float32) if "sunlight" in data else None,
             air_temperatures=data["air_temperatures"].astype(np.float32),
             mass=data["mass"].astype(np.float32),
             oxygen=data["oxygen"].astype(np.float32),
@@ -238,8 +255,8 @@ def validate_against_config(
         )
 
     expected_2d = (grid_size, grid_size)
-    for field_name in ("terrain", "air_temperatures", "mass", "oxygen", "temp_eq", "oxygen_eq",
-                       "mass_eq", "x_wind_vel", "y_wind_vel"):
+    for field_name in ("terrain", "sunlight", "air_temperatures", "mass", "oxygen", "temp_eq",
+                       "oxygen_eq", "mass_eq", "x_wind_vel", "y_wind_vel"):
         arr = getattr(m, field_name)
         if arr.shape != expected_2d:
             raise ValueError(

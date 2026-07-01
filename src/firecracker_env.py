@@ -21,6 +21,7 @@ import gymnasium
 from gymnasium import spaces
 
 from simulation import OBS_CHANNELS, Simulation, SimState
+from config import boundary_pad
 from map_loader import load_map, resolve_map, validate_against_config
 # Presentation layer: the stateless field/colorbar drawing primitives and their display
 # constants. This module orchestrates them against env state; it never draws a pixel itself.
@@ -41,6 +42,7 @@ from rendering import (
     pressure_colormap,
     radiant_heat_colormap,
     terrain_colormap,
+    sunlight_colormap,
     column_height_colormap,
     wind_temp_colormap,
     fire_overlay_colormap,
@@ -54,6 +56,7 @@ from rendering import (
     build_pressure_surface,
     build_radiant_heat_surface,
     build_terrain_surface,
+    build_sunlight_surface,
     build_column_height_surface,
     build_fire_surface,
     build_legend_panel,
@@ -103,13 +106,17 @@ class ViewMode(Enum):
     RADIANT_HEAT = 7
     TERRAIN = 8
     COLUMN_HEIGHT = 9
+    SUNLIGHT = 10        # off the number row -> bound to a letter key below (the digits are taken)
 
 
-# Populated from ViewMode values so new modes are picked up automatically.
+# Modes 0-9 are picked up automatically from the number row; modes past it (the digits ran out)
+# get an explicit letter binding.
 MODE_KEYS: dict[int, ViewMode] = {
     getattr(pygame, f"K_{mode.value}"): mode
     for mode in ViewMode
+    if 0 <= mode.value <= 9
 }
+MODE_KEYS[pygame.K_s] = ViewMode.SUNLIGHT
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -143,7 +150,15 @@ class FirecrackerEnv(gymnasium.Env):
             map_name if map_name is not None else (str(maps_cfg.get("name", "")) or None)
         )
 
+        # grid_size is the OBSERVED grid: what the observation, rendering, UI and action grid use.
+        # The physics runs on a grid padded by _pad cells on every side (_sim_size = grid_size +
+        # 2*_pad), so the open-boundary sponge sits in the ring and the observed interior is sponge-
+        # free. The observation and the rendered surfaces are the inner [_pad:_pad+grid_size] window;
+        # screen->cell coordinates add _pad to index the physics grid. _pad = 0 recovers the
+        # un-padded grid (observed == physics, sponge on the observed edges).
         self.grid_size   = int(env_cfg.get("grid_size",   DEFAULT_GRID_SIZE))
+        self._pad        = boundary_pad(config)
+        self._sim_size   = self.grid_size + 2 * self._pad
         self.window_size = int(env_cfg.get("window_size", DEFAULT_WINDOW_SIZE))
         self.max_steps   = int(env_cfg.get("max_steps",   1000))
         self._fire_spawn_radius = int(fire_cfg.get("spawn_radius", FIRE_SPAWN_RADIUS))
@@ -209,6 +224,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._mass: np.ndarray | None = None   # boundary-layer areal mass [kg/m^2]
         self._mass_eq: torch.Tensor | None = None   # rest-state mass (open-boundary sponge target)
         self._terrain: np.ndarray | None = None
+        self._sunlight: np.ndarray | None = None   # static average solar exposure [0,1] (SUNLIGHT view)
         self._u_amb_x: torch.Tensor | None = None   # synoptic ambient wind [m/s]
         self._u_amb_y: torch.Tensor | None = None
         # Phase 6 (Option 2): static terrain-channeling gain and the near-surface wind the fire reads.
@@ -226,8 +242,12 @@ class FirecrackerEnv(gymnasium.Env):
         # labels the exact range its (cached) field was normalised over. Each is the live max
         # over all cells. Set in _rebuild_surfaces_if_dirty; the defaults keep a legend valid
         # before the first build.
+        # Air/fuel temperature windows auto-range to the live field (floor = coldest cell, ceiling =
+        # hottest, min-span clamped). Defaults hold until the first surface build.
+        self._air_temp_display_min: float = DISPLAY_TEMP_FLOOR_K
         self._air_temp_display_max: float = DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
-        self._fuel_temp_display_max: float = 0.0
+        self._fuel_temp_display_min: float = DISPLAY_TEMP_FLOOR_K
+        self._fuel_temp_display_max: float = DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
         self._radiant_flux_display_max: float = 0.0
         self._pressure_display_max: float = 0.0
         self._terrain_display_max: float = 0.0
@@ -258,6 +278,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._fuel_temperature_surface: pygame.Surface | None = None
         self._radiant_flux_surface: pygame.Surface | None = None
         self._terrain_surface: pygame.Surface | None = None
+        self._sunlight_surface: pygame.Surface | None = None
         self._column_height_surface: pygame.Surface | None = None
         # Reusable translucent white fills for the action highlight, cached by (w, h) pixel size.
         self._alpha_rect_cache: dict[tuple[int, int], pygame.Surface] = {}
@@ -287,16 +308,26 @@ class FirecrackerEnv(gymnasium.Env):
             self._legend_font = pygame.font.Font(None, LEGEND_FONT_SIZE)
             self._legend_title_font = pygame.font.Font(None, LEGEND_TITLE_FONT_SIZE)
 
+    def _crop(self, field):
+        """The observed inner window of a padded (..., H, W) field: drops the _pad-cell sponge
+        ring so the observation/render see only the interior. Works on torch tensors and numpy
+        arrays alike; a no-op when _pad == 0. Use _pad-offset indices to map the other way."""
+        if self._pad == 0:
+            return field
+        p, g = self._pad, self.grid_size
+        return field[..., p:p + g, p:p + g]
+
     def _observation(self) -> np.ndarray:
         """The world-model observation for the current state: a normalized (C, H, W) float32
-        stack of OBS_CHANNELS. Identical to what BatchedRollout.observe collects, including the
-        near-surface fire wind (prognostic wind x channeling gain) used by the spread physics."""
+        stack of OBS_CHANNELS over the observed interior (the padded sponge ring is cropped off).
+        Identical to what BatchedRollout.observe collects, including the near-surface fire wind
+        (prognostic wind x channeling gain) used by the spread physics."""
         obs = Simulation.build_observation(
             self._fuel_temperatures, self._fuel, self._terrain,
             self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel,
             self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel,
         )
-        return _to_numpy(obs).astype(np.float32)
+        return _to_numpy(self._crop(obs)).astype(np.float32)
 
     def reset(
         self,
@@ -311,12 +342,14 @@ class FirecrackerEnv(gymnasium.Env):
         map_name = (options or {}).get("map", self._map_name)
         map_path = resolve_map(self._maps_dir, map_name, self.np_random)
         m = load_map(map_path)
-        validate_against_config(m, self.grid_size, self._sim.fuel_type_names)
+        # Maps are stored at the padded physics size (observed grid + 2*_pad sponge ring).
+        validate_against_config(m, self._sim_size, self._sim.fuel_type_names)
         self._current_map = map_path.name
 
         # Maps load from disk as numpy (map_loader is source-agnostic); move every field
         # onto the simulation device so the per-step physics stays GPU-resident.
         self._terrain           = self._to_tensor(m.terrain)
+        self._sunlight          = self._to_tensor(m.sunlight)   # static solar exposure (SUNLIGHT view)
         self._air_temperatures  = self._to_tensor(m.air_temperatures)
         self._temp_eq           = self._to_tensor(m.temp_eq)
         self._oxygen            = self._to_tensor(m.oxygen)
@@ -344,21 +377,25 @@ class FirecrackerEnv(gymnasium.Env):
         self._x_wind_fire = self._x_wind_vel * self._channel_gain
         self._y_wind_fire = self._y_wind_vel * self._channel_gain
 
-        # Terrain is static for the episode, so reduce its stats once here (one host
-        # transfer) instead of re-syncing them every step in _build_info.
+        # Terrain is static for the episode, so reduce its stats once here (one host transfer)
+        # instead of re-syncing them every step in _build_info. Stats are over the observed
+        # interior (what's rendered), not the padded sponge ring.
+        terr_obs = self._crop(self._terrain)
         self._terrain_stats = torch.stack(
-            [self._terrain.mean(), self._terrain.min(), self._terrain.max()]
+            [terr_obs.mean(), terr_obs.min(), terr_obs.max()]
         ).tolist()
 
-        # Optional ignition overlay (random spawn). Maps describe the world at rest;
-        # fire is a runtime concern applied on top of the loaded state.
+        # Optional ignition overlay (random spawn). Maps describe the world at rest; fire is a
+        # runtime concern applied on top. The patch is placed in the observed interior (coords are
+        # offset into the padded grid by _spawn_fire_patch), so a spawned fire is always on-screen.
         if self._spawn_fire:
             r = int(self.np_random.integers(0, self.grid_size))
             c = int(self.np_random.integers(0, self.grid_size))
             self._spawn_fire_patch(r, c)
 
+        # Radiant-flux buffer lives on the physics grid (it travels in SimState through the engine).
         self._last_radiant_flux = torch.zeros(
-            (self.grid_size, self.grid_size), dtype=self._sim.dtype, device=self._sim.device
+            (self._sim_size, self._sim_size), dtype=self._sim.dtype, device=self._sim.device
         )
         self._step_count = 0
         self._pending_action_row = None
@@ -418,7 +455,8 @@ class FirecrackerEnv(gymnasium.Env):
         """True if the action-cell (arow, acol) or any of its 8 neighbours contains a burning sim
         cell. An action goes through only when this holds; a fire-free neighbourhood is a no-op."""
         G, c = self.action_grid_size, self._action_cell_cells
-        burning = self._burning_per_type().any(dim=0)          # (H, W) any-type burning
+        # The action grid tiles the OBSERVED interior, so crop off the sponge ring before binning.
+        burning = self._crop(self._burning_per_type().any(dim=0))   # (obs, obs) any-type burning
         box = burning.reshape(G, c, G, c).any(dim=(1, 3))      # (G, G) burning per action-cell
         r0, r1 = max(0, arow - 1), min(G, arow + 2)            # 3x3 Moore neighbourhood, clamped
         c0, c1 = max(0, acol - 1), min(G, acol + 2)
@@ -562,7 +600,7 @@ class FirecrackerEnv(gymnasium.Env):
                                  0.0, self._wind_speed_display_max, lambda v: f"{v:.1f} m/s")]
         if mode == ViewMode.TEMPERATURE:
             return [ColorbarSpec("Air temp", heat_colormap,
-                                 DISPLAY_TEMP_FLOOR_K, self._air_temp_display_max, celsius)]
+                                 self._air_temp_display_min, self._air_temp_display_max, celsius)]
         if mode == ViewMode.WIND:
             # The arrows are tinted by air temperature; the bar shows that same window.
             lo, hi = self._wind_temp_window
@@ -582,13 +620,14 @@ class FirecrackerEnv(gymnasium.Env):
             return [ColorbarSpec("Radiant", radiant_heat_colormap,
                                  0.0, self._radiant_flux_display_max, lambda v: f"{v:.0f}")]
         if mode == ViewMode.FUEL_TEMPERATURE:
-            # Matches build_color_surface's ceiling in _rebuild_surfaces_if_dirty.
-            ceil = max(DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_max)
             return [ColorbarSpec("Fuel temp", heat_colormap,
-                                 DISPLAY_TEMP_FLOOR_K, ceil, celsius)]
+                                 self._fuel_temp_display_min, self._fuel_temp_display_max, celsius)]
         if mode == ViewMode.TERRAIN:
             return [ColorbarSpec("Terrain", terrain_colormap,
                                  0.0, self._terrain_display_max, meters)]
+        if mode == ViewMode.SUNLIGHT:
+            return [ColorbarSpec("Sunlight", sunlight_colormap,
+                                 0.0, 1.0, lambda v: f"{v * 100:.0f}%")]
         if mode == ViewMode.COLUMN_HEIGHT:
             return [ColorbarSpec("Column", column_height_colormap,
                                  0.0, self._column_height_display_max, meters)]
@@ -644,6 +683,8 @@ class FirecrackerEnv(gymnasium.Env):
             return self._fuel_temperature_surface
         if self._current_mode == ViewMode.TERRAIN:
             return self._terrain_surface
+        if self._current_mode == ViewMode.SUNLIGHT:
+            return self._sunlight_surface
         if self._current_mode == ViewMode.COLUMN_HEIGHT:
             return self._column_height_surface
         return self._radiant_flux_surface
@@ -651,33 +692,38 @@ class FirecrackerEnv(gymnasium.Env):
     def _rebuild_surfaces_if_dirty(self) -> None:
         if not self._surfaces_dirty:
             return
-        # The surface builders are CPU/pygame numpy code, so pull the state to the host
-        # once here — the numpy/tensor boundary lives at the render edge.
-        temp = _to_numpy(self._air_temperatures)
+        # The surface builders are CPU/pygame numpy code, so pull the state to the host once here --
+        # the numpy/tensor boundary lives at the render edge. Every spatial field is cropped to the
+        # observed interior first (drop the sponge ring), so what's drawn is exactly the observation.
+        temp = _to_numpy(self._crop(self._air_temperatures))
         # The WIND view shows the near-surface wind the fire/oxygen actually read: the prognostic
         # wind sped up through gaps by the terrain-channeling gain (so the Venturi is visible).
         # Falls back to the prognostic wind when channeling produced no fire-wind field.
-        wx = _to_numpy(self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel)
-        wy = _to_numpy(self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel)
-        pressure_field = _to_numpy(self._mass)
-        fuel_temps = _to_numpy(self._fuel_temperatures)
-        fuel = _to_numpy(self._fuel)
-        oxygen = _to_numpy(self._oxygen)
-        column_height = _to_numpy(
+        wx = _to_numpy(self._crop(self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel))
+        wy = _to_numpy(self._crop(self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel))
+        pressure_field = _to_numpy(self._crop(self._mass))
+        fuel_temps = _to_numpy(self._crop(self._fuel_temperatures))
+        fuel = _to_numpy(self._crop(self._fuel))
+        oxygen = _to_numpy(self._crop(self._oxygen))
+        column_height = _to_numpy(self._crop(
             self._sim.column_height(self._mass, self._terrain, self._air_temperatures)
-        )
+        ))
         ignition_thresholds = _to_numpy(self._sim.ignition_thresholds).reshape(-1)
-        terrain = _to_numpy(self._terrain)
-        radiant_flux = _to_numpy(self._last_radiant_flux)
+        terrain = _to_numpy(self._crop(self._terrain))
+        radiant_flux = _to_numpy(self._crop(self._last_radiant_flux))
         wind_ref = float(np.sqrt(wx ** 2 + wy ** 2).max())
 
-        # Capture each mode's color-scale ceiling (the live max over all cells) once, then feed
-        # the same value to the surface and (via _legend_specs) its colorbar, so the bar's labels
-        # match the rendered field.
-        self._air_temp_display_max = max(
-            DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, float(temp.max())
-        )
-        self._fuel_temp_display_max = float(fuel_temps.max())
+        # Capture each mode's color-scale window once, then feed the same values to the surface and
+        # (via _legend_specs) its colorbar, so the bar's labels match the rendered field. The
+        # temperature views auto-range: floor = the coldest cell, ceiling = the hottest, with the
+        # span clamped to a minimum so a near-uniform (no-fire) field isn't over-stretched. The
+        # floor sits at ambient and stays there during a fire (combustion only heats), so a flame
+        # lifts the ceiling without moving the floor.
+        hottest_fuel = fuel_temps.max(axis=0)                     # per-cell hottest fuel (the fuel view)
+        self._air_temp_display_min = float(temp.min())
+        self._air_temp_display_max = max(self._air_temp_display_min + DISPLAY_MIN_TEMP_SPAN_K, float(temp.max()))
+        self._fuel_temp_display_min = float(hottest_fuel.min())
+        self._fuel_temp_display_max = max(self._fuel_temp_display_min + DISPLAY_MIN_TEMP_SPAN_K, float(hottest_fuel.max()))
         self._radiant_flux_display_max = float(radiant_flux.max())
         self._pressure_display_max = float(pressure_field.max())
         self._terrain_display_max = float(terrain.max())
@@ -687,7 +733,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._render_wind_x, self._render_wind_y, self._render_air_temp = wx, wy, temp
 
         self._color_surface = build_color_surface(
-            temp, self._pixel_scale, DISPLAY_TEMP_FLOOR_K, self._air_temp_display_max,
+            temp, self._pixel_scale, self._air_temp_display_min, self._air_temp_display_max,
         )
         self._wind_surface = build_wind_surface(
             wx, wy, temp, self._pixel_scale, wind_ref,
@@ -705,13 +751,9 @@ class FirecrackerEnv(gymnasium.Env):
         self._pressure_surface = build_pressure_surface(
             pressure_field, self._pixel_scale, self._pressure_display_max
         )
-        # Fuel-temperature view: floor at ambient, ceiling at the live peak (clamped to a
-        # minimum span so a cold map doesn't over-stretch the ramp).
-        fuel_temp_ceil = max(
-            DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K, self._fuel_temp_display_max
-        )
+        # Fuel-temperature view: the same auto-ranged window over the per-cell hottest fuel.
         self._fuel_temperature_surface = build_color_surface(
-            fuel_temps.max(axis=0), self._pixel_scale, DISPLAY_TEMP_FLOOR_K, fuel_temp_ceil,
+            hottest_fuel, self._pixel_scale, self._fuel_temp_display_min, self._fuel_temp_display_max,
         )
         self._radiant_flux_surface = build_radiant_heat_surface(
             radiant_flux, self._pixel_scale, upper_bound=self._radiant_flux_display_max,
@@ -719,6 +761,10 @@ class FirecrackerEnv(gymnasium.Env):
         # Static after reset, but rebuilt with the batch for consistency (cost is negligible).
         self._terrain_surface = build_terrain_surface(
             terrain, self._pixel_scale, self._terrain_display_max
+        )
+        # Static after reset (like terrain); the [0,1] exposure maps straight onto its ramp.
+        self._sunlight_surface = build_sunlight_surface(
+            _to_numpy(self._crop(self._sunlight)), self._pixel_scale
         )
         self._column_height_surface = build_column_height_surface(
             column_height, self._pixel_scale, self._column_height_display_max
@@ -767,8 +813,11 @@ class FirecrackerEnv(gymnasium.Env):
         self._last_radiant_flux = s.radiant_flux
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
-        rows_idx = torch.arange(self.grid_size, device=self._sim.device).view(-1, 1)
-        cols_idx = torch.arange(self.grid_size, device=self._sim.device).view(1, -1)
+        # (row, col) are observed-grid coordinates (from a click or a random pick); offset by _pad
+        # to index the padded physics grid, and build the patch mask at the physics size.
+        row, col = row + self._pad, col + self._pad
+        rows_idx = torch.arange(self._sim_size, device=self._sim.device).view(-1, 1)
+        cols_idx = torch.arange(self._sim_size, device=self._sim.device).view(1, -1)
         patch = (rows_idx - row) ** 2 + (cols_idx - col) ** 2 <= self._fire_spawn_radius ** 2
         self._air_temperatures[patch] = float(self._sim.ignition_thresholds.max()) * 2.0
         for n in range(self._sim.num_fuel_types):
@@ -830,24 +879,29 @@ class FirecrackerEnv(gymnasium.Env):
         return running, mode, fire_click
 
     def _build_info(self) -> dict:
-        wind_speeds = torch.sqrt(self._x_wind_vel ** 2 + self._y_wind_vel ** 2)
-        burning_per_type = self._burning_per_type()
+        # Metrics describe the observed world, so reduce over the interior (drop the sponge ring).
+        air     = self._crop(self._air_temperatures)
+        oxygen  = self._crop(self._oxygen)
+        fuel     = self._crop(self._fuel)
+        ftemps   = self._crop(self._fuel_temperatures)
+        wind_speeds = torch.sqrt(self._crop(self._x_wind_vel) ** 2 + self._crop(self._y_wind_vel) ** 2)
+        burning_per_type = self._crop(self._burning_per_type())
 
         # Reduce every metric on-device, then pull the whole batch back in a SINGLE
         # host transfer (.tolist()). Doing per-scalar float() instead would force a
         # separate device sync for each of the ~5*N+10 values, stalling every step.
-        fuel_flat  = self._fuel.flatten(1)                 # (N, H*W)
-        ftemp_flat = self._fuel_temperatures.flatten(1)    # (N, H*W)
+        fuel_flat  = fuel.flatten(1)                       # (N, obs*obs)
+        ftemp_flat = ftemps.flatten(1)                     # (N, obs*obs)
         scalars = torch.stack([
-            self._air_temperatures.mean(),
-            self._air_temperatures.amin(),
-            self._air_temperatures.amax(),
-            self._air_temperatures.std(),
+            air.mean(),
+            air.amin(),
+            air.amax(),
+            air.std(),
             wind_speeds.mean(),
             wind_speeds.amax(),
             wind_speeds.std(),
-            self._oxygen.mean(),
-            self._oxygen.amin(),
+            oxygen.mean(),
+            oxygen.amin(),
             burning_per_type.any(dim=0).sum().to(self._sim.dtype),
         ])
         per_type = torch.cat([

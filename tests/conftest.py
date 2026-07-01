@@ -22,20 +22,25 @@ from scenarios import (  # noqa: E402,F401
     DEFAULT_GRID,
     build_map,
     make_config,
+    pad_map,
     to_numpy,
     total_air_energy,
     total_mass,
     total_oxygen,
 )
+from config import boundary_pad           # noqa: E402
 from map_loader import save_map           # noqa: E402
 from firecracker_env import FirecrackerEnv  # noqa: E402
 
 
 @pytest.fixture
 def make_env(tmp_path):
-    """Factory: bake a MapData to a temp dir and return a reset, headless env."""
+    """Factory: bake a MapData to a temp dir and return a reset, headless env.
+
+    The fixture is built at the observed size, so ring it out to the env's padded physics size
+    (observed + 2*boundary_pad) -- the env runs physics there and crops the observed interior back."""
     def _make(config: dict, map_data, seed: int = 0) -> FirecrackerEnv:
-        save_map(tmp_path / "fixture.npz", map_data)
+        save_map(tmp_path / "fixture.npz", pad_map(map_data, boundary_pad(config)))
         env = FirecrackerEnv(config=config, maps_dir=str(tmp_path), map_name="fixture")
         env.reset(seed=seed)
         return env

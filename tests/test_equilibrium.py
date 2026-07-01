@@ -16,7 +16,9 @@ from scenarios import make_config, si_channel, si_flat, si_ridge
 
 
 def _speed(env) -> np.ndarray:
-    return to_numpy(torch.sqrt(env._x_wind_vel ** 2 + env._y_wind_vel ** 2))
+    # Observed interior only (drop the padded sponge ring), so the wind checks see the same field
+    # the env exposes -- not the boundary belt the open-domain sponge holds at the free stream.
+    return to_numpy(env._crop(torch.sqrt(env._x_wind_vel ** 2 + env._y_wind_vel ** 2)))
 
 
 def test_flat_world_holds_ambient_wind(make_env):
@@ -112,7 +114,9 @@ def test_channeling_is_unity_over_flat_ground(make_env):
 def test_wind_is_steady_until_perturbed(make_env):
     """Once spun up, the wind field is (near-)constant step-to-step."""
     env = make_env(*si_ridge(grid=48, ambient=(15.0, 0.0), peak_m=400.0))
-    for _ in range(800):
+    # The observed interior carries no sponge damping at its edges (the ring holds it), so the
+    # ridge flow settles on the domain's own (longer) timescale; 800 ticks leaves it mid-transient.
+    for _ in range(1600):
         env.step(0)
 
     before = _speed(env)

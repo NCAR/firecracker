@@ -53,11 +53,15 @@ DEFAULT_VEGETATION_COLOR: tuple[float, float, float] = (0.0, 1.0, 0.0)
 
 _WIND_DISPLAY_THRESHOLD:       float = 1e-4
 
-# Temperature views map a Kelvin window onto the color ramp: a shared ambient floor up to a
-# ceiling that tracks the live peak over all cells (clamped to a minimum span so a near-uniform
-# field doesn't over-stretch the ramp).
+# Temperature views map a Kelvin window onto the color ramp. The window auto-ranges to the live
+# field: floor = the coldest cell, ceiling = the hottest (so the scale always reflects the real
+# range -- cool shaded ground through to a flame -- instead of a fixed band). The span is clamped
+# to a minimum so a near-uniform field (no fire) doesn't get over-stretched into noise. The floor
+# tracks the coldest cell, which stays at ambient even during a fire (combustion only heats), so a
+# flame raises the ceiling without destabilising the floor. DISPLAY_TEMP_FLOOR_K is only the
+# pre-first-frame default window, before any field has been measured.
 DISPLAY_TEMP_FLOOR_K:    float = 290.0
-DISPLAY_MIN_TEMP_SPAN_K: float = 50.0
+DISPLAY_MIN_TEMP_SPAN_K: float = 10.0
 # Kelvin above ignition that spans the fire-overlay color ramp (ignition -> +span). Sized to
 # the SI flame band: ignition ~550-600 K up through a sustained ~1540 K front to ~2400 K peaks,
 # so the ramp resolves flame structure instead of saturating just above ignition.
@@ -155,6 +159,15 @@ def terrain_colormap(normalized: np.ndarray) -> np.ndarray:
     return np.stack(
         [n * MAX_CHANNEL_VALUE, 60.0 + n * (MAX_CHANNEL_VALUE - 60.0), n * MAX_CHANNEL_VALUE], axis=-1
     ).astype(np.uint8)
+
+
+def sunlight_colormap(normalized: np.ndarray) -> np.ndarray:
+    """Solar-exposure ramp: dark/cold in shadow (0), warming through orange to bright sunlit
+    white at full exposure (1). R rises first, then G, then B, so shade -> orange -> yellow -> white."""
+    n = np.clip(normalized, 0.0, 1.0)
+    r = np.clip(n * 2.0, 0.0, 1.0)
+    b = np.clip(n * 2.0 - 1.0, 0.0, 1.0)
+    return np.stack([r * MAX_CHANNEL_VALUE, n * MAX_CHANNEL_VALUE, b * MAX_CHANNEL_VALUE], axis=-1).astype(np.uint8)
 
 
 def column_height_colormap(normalized: np.ndarray) -> np.ndarray:
@@ -355,6 +368,12 @@ def build_terrain_surface(
     t_max = float(terrain.max()) if display_max is None else display_max
     normalized = terrain / t_max if t_max > 0.0 else np.zeros_like(terrain)
     return _render_field(normalized, scale, terrain_colormap)
+
+
+def build_sunlight_surface(sunlight: np.ndarray, scale: int) -> pygame.Surface:
+    # Solar exposure is already a dimensionless [0, 1] fraction, so it maps straight onto the
+    # ramp over a fixed 0..1 window (no data-driven ceiling): shaded cells dark, sunlit cells bright.
+    return _render_field(sunlight, scale, sunlight_colormap)
 
 
 def build_column_height_surface(

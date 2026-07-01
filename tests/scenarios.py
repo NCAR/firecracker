@@ -121,6 +121,28 @@ def build_map(
     )
 
 
+def pad_map(m: MapData, pad: int) -> MapData:
+    """Grow a MapData to the padded physics size by edge-replicating every field by `pad` cells.
+
+    The env/rollout run physics on a grid padded by the boundary-sponge width; a real (generated)
+    map is already that size, but the analytic test fixtures are built at the observed size, so this
+    rings them out to match. Edge replication extends the boundary values into the sponge ring (a
+    flat continuation), which the sponge then relaxes to rest. Mutates and returns `m`; a no-op for
+    pad <= 0. __post_init__ has already filled temp_eq/oxygen_eq/mass_eq/x_wind_vel/y_wind_vel/
+    sunlight, so every field is concrete and padded here."""
+    if pad <= 0:
+        return m
+    pad2 = lambda a: np.pad(a, pad, mode="edge")
+    pad3 = lambda a: np.pad(a, ((0, 0), (pad, pad), (pad, pad)), mode="edge")
+    for name in ("terrain", "sunlight", "air_temperatures", "mass", "oxygen",
+                 "temp_eq", "oxygen_eq", "mass_eq", "x_wind_vel", "y_wind_vel"):
+        setattr(m, name, pad2(getattr(m, name)))
+    for name in ("fuel", "fuel_temperatures"):
+        setattr(m, name, pad3(getattr(m, name)))
+    m.grid_size = m.grid_size + 2 * pad
+    return m
+
+
 # ---------------------------------------------------------------------------
 # Invariant probes
 # ---------------------------------------------------------------------------

@@ -65,7 +65,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from config import load_config
+from config import load_config, boundary_pad
 from simulation import Simulation, SimState, OBS_CHANNELS
 from map_loader import load_map, resolve_map, validate_against_config
 
@@ -116,7 +116,11 @@ class BatchedRollout:
         self.minibatch_size = int(minibatch_size if minibatch_size is not None else roll_cfg.get("minibatch_size", 256))
         if self.stride < 1:
             raise ValueError(f"stride must be >= 1, got {self.stride}")
+        # grid_size is the OBSERVED grid (pooled/observed); physics runs on a grid padded by _pad on
+        # every side (the open-boundary sponge ring), and observe() crops the interior back out.
         self.grid_size      = int(grid_size      if grid_size      is not None else env_cfg.get("grid_size",       DEFAULT_GRID_SIZE))
+        self._pad           = boundary_pad(config)
+        self._sim_size      = self.grid_size + 2 * self._pad
         self._maps_dir      = str(maps_dir       if maps_dir       is not None else maps_cfg.get("dir",            "maps"))
         self._spawn_fire    = bool(spawn_fire    if spawn_fire     is not None else fire_cfg.get("spawn_fire",     False))
         self._fire_radius   = int(fire_cfg.get("spawn_radius", 5))
@@ -155,7 +159,7 @@ class BatchedRollout:
             # Sample with replacement so num_envs can exceed the number of map files.
             path = resolve_map(self._maps_dir, None, self._np_rng)
             m = load_map(path)
-            validate_against_config(m, self.grid_size, self._sim.fuel_type_names)
+            validate_against_config(m, self._sim_size, self._sim.fuel_type_names)
             for k in fields:
                 fields[k].append(getattr(m, k))
             amb_x.append(m.ambient_wind_x)
@@ -203,13 +207,17 @@ class BatchedRollout:
         self._filled = 0
 
     def _ignite(self) -> None:
-        """Light a random circular patch in every world (batched analogue of the env click)."""
-        s, n = self._state, self.grid_size
+        """Light a random circular patch in every world (batched analogue of the env click).
+
+        The patch grid spans the padded physics size, but the centre is drawn from the observed
+        interior (offset by _pad), so ignitions land on-screen and never in the hidden sponge ring."""
+        s, n = self._state, self._sim_size
         dev = self._sim.device
         rows = torch.arange(n, device=dev).view(1, -1, 1)
         cols = torch.arange(n, device=dev).view(1, 1, -1)
-        r0 = torch.as_tensor(self._np_rng.integers(0, n, size=self.num_envs), device=dev).view(-1, 1, 1)
-        c0 = torch.as_tensor(self._np_rng.integers(0, n, size=self.num_envs), device=dev).view(-1, 1, 1)
+        centres = self._np_rng.integers(0, self.grid_size, size=(2, self.num_envs)) + self._pad
+        r0 = torch.as_tensor(centres[0], device=dev).view(-1, 1, 1)
+        c0 = torch.as_tensor(centres[1], device=dev).view(-1, 1, 1)
         patch = (rows - r0) ** 2 + (cols - c0) ** 2 <= self._fire_radius ** 2   # (B, N, N)
 
         ign_max = float(self._sim.ignition_thresholds.max())
@@ -233,13 +241,20 @@ class BatchedRollout:
         return (self.steps // self.stride) * self.num_envs
 
     def observe(self) -> torch.Tensor:
-        """Current batched observation, B x C x N x N on the sim device."""
+        """Current batched observation, B x C x N x N on the sim device (N = observed grid size).
+
+        The physics runs on the padded grid; the observation crops the interior, dropping the
+        sponge ring so the pooled samples match the env's observation."""
         s = self._state
         # Same near-surface wind the fire reads for spread (prognostic x channeling gain),
         # falling back to the prognostic wind when no channeling layer is present.
         wind_x = s.x_wind_fire if s.x_wind_fire is not None else s.x_wind_vel
         wind_y = s.y_wind_fire if s.y_wind_fire is not None else s.y_wind_vel
-        return Simulation.build_observation(s.fuel_temperatures, s.fuel, s.terrain, wind_x, wind_y)
+        obs = Simulation.build_observation(s.fuel_temperatures, s.fuel, s.terrain, wind_x, wind_y)
+        if self._pad == 0:
+            return obs
+        p, g = self._pad, self.grid_size
+        return obs[..., p:p + g, p:p + g]
 
     def collect(self, steps: int | None = None, stride: int | None = None) -> torch.Tensor:
         """Step the `B` worlds `steps` times, pooling every `stride`-th tick's observation.

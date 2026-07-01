@@ -110,6 +110,85 @@ def test_batched_sample_perlin_matches_per_map():
     assert torch.allclose(batch, stacked)
 
 
+def _ns_ridge() -> np.ndarray:
+    # A north-south-running cosine ridge: elevation varies only with the row index (which runs
+    # south), so the slopes face due south on one flank and due north on the other.
+    i = np.arange(GRID)[:, None]
+    return (200.0 * np.cos(2.0 * np.pi * i / GRID)).repeat(GRID, axis=1).astype(np.float32)
+
+
+def test_sunlight_range_and_diffuse_floor():
+    # The exposure field is a dimensionless [0, 1] fraction, floored by the diffuse skylight.
+    gen = _gen()
+    sun = gen.sunlight_exposure(_ns_ridge())
+    assert isinstance(sun, np.ndarray) and sun.dtype == np.float32
+    assert sun.shape == (GRID, GRID)
+    assert sun.min() >= gen.sun_diffuse_fraction - 1e-6
+    assert sun.max() <= 1.0 + 1e-6
+
+
+def test_sunlight_south_face_brighter_than_north():
+    # Northern-hemisphere physics: the south-facing flank of the ridge catches far more sun than
+    # the north-facing flank (which falls back to the diffuse floor).
+    gen = _gen()
+    sun = gen.sunlight_exposure(_ns_ridge())
+    south_face = sun[GRID // 4, GRID // 2]      # dz/di < 0 -> surface faces south
+    north_face = sun[3 * GRID // 4, GRID // 2]  # dz/di > 0 -> surface faces north
+    assert south_face > north_face
+
+
+def test_sunlight_torch_matches_numpy():
+    # NumPy and torch backends produce the same field (the GPU build reuses the same geometry).
+    gen = _gen()
+    z = _ns_ridge()
+    sun_np = gen.sunlight_exposure(z)
+    sun_t = gen.sunlight_exposure(torch.as_tensor(z, dtype=torch.float64))
+    assert isinstance(sun_t, torch.Tensor)
+    assert np.allclose(sun_np, sun_t.numpy(), rtol=1e-5, atol=1e-4)
+
+
+def test_surface_temperature_flat_ground_is_ambient():
+    # A flat, open map gets the flat-exposure everywhere, so the baked surface temperature is the
+    # unmodulated elevation profile -- sunlight only perturbs the surface around that flat baseline.
+    gen = _gen()
+    z = np.zeros((GRID, GRID), dtype=np.float32)
+    surf = gen.surface_temperature(z, gen.sunlight_exposure(z))
+    assert np.allclose(surf, gen.air_temperature_profile(z), atol=1e-3)
+
+
+def test_surface_temperature_sunny_warmer_than_shaded():
+    # The sun-facing flank of the ridge bakes warmer than the shaded north flank.
+    gen = _gen()
+    z = _ns_ridge()
+    surf = gen.surface_temperature(z, gen.sunlight_exposure(z))
+    assert surf[GRID // 4, GRID // 2] > surf[3 * GRID // 4, GRID // 2]
+
+
+def test_surface_temperature_moderation_bounds():
+    # moderation = 1 removes the solar swing (pure ambient profile); moderation = 0 is the full
+    # (vacuum) radiative response -- shaded cells well below ambient, sunlit cells above.
+    gen = _gen()
+    z = _ns_ridge()
+    sun = gen.sunlight_exposure(z)
+    ambient = gen.air_temperature_profile(z)
+    gen.sun_temp_moderation = 1.0
+    assert np.allclose(gen.surface_temperature(z, sun), ambient, atol=1e-4)
+    gen.sun_temp_moderation = 0.0
+    full = gen.surface_temperature(z, sun)
+    assert full.min() < ambient.min() - 1.0
+    assert full.max() > ambient.max() + 0.5
+
+
+def test_surface_temperature_torch_matches_numpy():
+    gen = _gen()
+    z = _ns_ridge()
+    surf_np = gen.surface_temperature(z, gen.sunlight_exposure(z))
+    z_t = torch.as_tensor(z, dtype=torch.float64)
+    surf_t = gen.surface_temperature(z_t, gen.sunlight_exposure(z_t))
+    assert isinstance(surf_t, torch.Tensor)
+    assert np.allclose(surf_np, surf_t.numpy(), rtol=1e-5, atol=1e-3)
+
+
 def test_device_property_resolves():
     # The lazy device property resolves to a real torch device without needing a GPU.
     dev = MapGenerator(load_config()).device

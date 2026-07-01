@@ -103,13 +103,40 @@ def test_env_observation_matches_world_model(make_env):
     assert obs.shape == (len(OBS_CHANNELS), 24, 24)
     assert env.observation_space.shape == obs.shape
     assert env.observation_space.contains(obs)
-    expected = Simulation.build_observation(
+    # The env observation is build_observation cropped to the observed interior, so crop expected.
+    expected = env._crop(Simulation.build_observation(
         env._fuel_temperatures, env._fuel, env._terrain, env._x_wind_fire, env._y_wind_fire
-    ).detach().cpu().numpy().astype("float32")
+    )).detach().cpu().numpy().astype("float32")
     np.testing.assert_array_equal(obs, expected)
 
     step_obs, *_ = env.step(0)
-    step_expected = Simulation.build_observation(
+    step_expected = env._crop(Simulation.build_observation(
         env._fuel_temperatures, env._fuel, env._terrain, env._x_wind_fire, env._y_wind_fire
-    ).detach().cpu().numpy().astype("float32")
+    )).detach().cpu().numpy().astype("float32")
     np.testing.assert_array_equal(step_obs, step_expected)
+
+
+def test_padding_physics_grid_and_observation_crop(make_env):
+    """The env runs physics on the padded grid (observed + 2*pad) and observes only the inner
+    region; an action/click at an observed cell maps through the pad to the right physics cell."""
+    import numpy as np
+    from scenarios import make_config, build_map
+
+    obs_grid = 16
+    env = make_env(make_config(obs_grid), build_map(grid_size=obs_grid))
+    pad = env._pad
+    assert pad > 0                                      # the default sponge_width padding is active
+    assert env._sim_size == obs_grid + 2 * pad
+    assert env._terrain.shape[-1] == env._sim_size      # state lives on the padded physics grid
+
+    obs, _ = env.reset(seed=0)
+    assert obs.shape == (len(OBS_CHANNELS), obs_grid, obs_grid)   # observation is the inner region
+
+    # A fire spawned at observed (0, 0) is centred at physics (pad, pad) -- i.e. the observed
+    # top-left corner -- proving the screen->cell offset.
+    ign = float(env._sim.ignition_thresholds.flatten()[0])
+    env._spawn_fire_patch(0, 0)
+    hot = env._fuel_temperatures[0] > ign
+    assert bool(hot[pad, pad])                          # patch centre at the padded offset
+    assert not bool(hot[0, 0])                          # not at the physics corner (inside the ring)
+    assert bool(env._crop(hot)[0, 0])                   # and it shows at observed (0, 0)

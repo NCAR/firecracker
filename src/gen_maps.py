@@ -5,7 +5,9 @@ Synthetic map producer for the Firecracker simulation.
 
 Owns the procedural initial-state generation that used to live inside
 Simulation/reset(): octave Perlin terrain, elevation-driven temperature/oxygen
-profiles, the convective rest-state pressure, and the grass/tree fuel layers.
+profiles, the convective rest-state pressure, the grass/tree fuel layers, and a
+static per-cell solar-exposure field (south-facing slopes catch more sun, shadowed
+valleys less).
 `MapGenerator` reads what it needs straight from the config dict and emits a
 `MapData`, the same contract a future real-data importer would target.
 
@@ -17,11 +19,13 @@ both the noise and the field math run on the GPU; only the per-map random scalar
 reproducible and identical across devices. Fields move back to numpy at the MapData
 boundary, then the chunk is spun up on the same device.
 
-After the rest state is built, `spin_up_maps` runs the shallow-water wind solver
-to its developed orographic state and bakes the result (mass, air temperature, and
-the prognostic wind) back into each map, so a loaded map already shows the terrain-
-shaped flow (windward blocking, lee/foehn acceleration) instead of relaxing into it
-at runtime. This is the one place generation touches the physics engine; the emitted
+After the rest state is built, `spin_up_maps` steps the full field physics to its
+developed state and bakes the developed mass, air temperature and prognostic wind
+back into each map, so a loaded map already shows the terrain-shaped flow (windward
+blocking, lee/foehn acceleration) and the wind-smeared air temperature instead of
+relaxing into them at runtime. (Stepping the full physics -- not the wind alone --
+is what lets the air settle into its developed, advected pattern rather than washing
+out.) This is the one place generation touches the physics engine; the emitted
 `MapData` is still a plain baked state.
 
 Run as a script to bake a batch of maps to disk:
@@ -35,7 +39,7 @@ import numpy as np
 import torch
 
 import physics_constants as pc
-from config import load_config
+from config import load_config, boundary_pad, physics_grid_size
 from map_loader import MapData, save_map
 from perlin import perlin_noise
 
@@ -134,6 +138,23 @@ class MapGenerator:
         # fully formed (see docs/units.md). 0 skips the spin-up (maps stay in the level-lid rest
         # state with uniform wind, the pre-v4 behaviour).
         self.spinup_steps = int(momentum.get("spinup_steps", 800))
+
+        # Static solar exposure field (sunlight_exposure): the sun is sampled along the clear-sky
+        # daily arc (hour angle) over a few seasons (declination) at this latitude; each sample's
+        # beam is gated by a horizon ray-march so deep valleys lose their direct sun.
+        sun = (cfg or {}).get("sunlight", {})
+        self.latitude_deg         = float(sun.get("latitude_deg",        40.0))
+        self.axial_tilt_deg       = float(sun.get("axial_tilt_deg",      23.44))
+        self.sun_num_seasons      = int(sun.get("num_seasons",            1))
+        self.sun_num_hours        = int(sun.get("num_hours",             12))
+        self.sun_hour_half_angle  = float(sun.get("hour_half_angle_deg", 90.0))
+        self.sun_shadows          = bool(sun.get("shadows",             True))
+        self.sun_max_shadow_steps = int(sun.get("max_shadow_steps",       0))   # 0 = grid size
+        self.sun_diffuse_fraction = float(sun.get("diffuse_fraction",    0.15))
+        # How strongly the atmosphere damps the bare radiative temperature swing the sun drives
+        # (surface_temperature): 0 = pure (vacuum) radiative response, 1 = no solar effect (uniform
+        # elevation profile). Earth's air insulation + lateral mixing keep shade only "a bit cool".
+        self.sun_temp_moderation  = float(sun.get("temp_moderation",     0.7))
 
         fuel_types_cfg = (cfg or {}).get("fuel_types", {})
         self.fuel_type_names: list[str] = list(fuel_types_cfg.keys())
@@ -336,6 +357,160 @@ class MapGenerator:
         samples = density.clamp(min=0.0) * e
         return _store(torch.floor(samples).clamp(max=float(self.max_trees_per_cell)))
 
+    def _sun_directions(self):
+        """Unit sun vectors (East, North, Up) sampled over the clear-sky daily arc.
+
+        The sun is sampled at the configured latitude over `num_hours` hour angles (across
+        +/- hour_half_angle each side of solar noon) and `num_seasons` declinations (equinox
+        only when 1, else spread over +/- axial_tilt). Standard solar-position geometry gives,
+        for latitude phi, declination delta and hour angle h:
+            Up    = sin(phi) sin(delta) + cos(phi) cos(delta) cos(h)
+            East  = -cos(delta) sin(h)
+            North =  sin(delta) cos(phi) - cos(delta) sin(phi) cos(h)
+        so at solar noon the sun sits due south (North < 0) at elevation 90-phi -- which is why
+        south-facing slopes catch it. Samples below the horizon (Up <= 0) are dropped. Returns
+        three numpy arrays (E, N, U), one entry per above-horizon sample (possibly empty)."""
+        phi = np.deg2rad(self.latitude_deg)
+        if self.sun_num_seasons <= 1:
+            decls = np.array([0.0])                          # equinox
+        else:
+            decls = np.deg2rad(np.linspace(-self.axial_tilt_deg, self.axial_tilt_deg,
+                                           self.sun_num_seasons))
+        hours = np.deg2rad(np.linspace(-self.sun_hour_half_angle, self.sun_hour_half_angle,
+                                       max(1, self.sun_num_hours)))
+        E, N, U = [], [], []
+        for d in decls:
+            for h in hours:
+                up = np.sin(phi) * np.sin(d) + np.cos(phi) * np.cos(d) * np.cos(h)
+                if up <= 0.0:                                # sun below the horizon
+                    continue
+                E.append(-np.cos(d) * np.sin(h))
+                N.append(np.sin(d) * np.cos(phi) - np.cos(d) * np.sin(phi) * np.cos(h))
+                U.append(up)
+        return np.array(E), np.array(N), np.array(U)
+
+    def sunlight_exposure(self, elevation_m):
+        """Average relative solar exposure per cell, in [0, 1] (dimensionless).
+
+        A static field: how much sunlight a cell receives on average over the day/year,
+        relative to a flat, fully-exposed surface. It folds in the two dominant terrain effects:
+          * slope/aspect -- the Lambertian cos(incidence) between the surface normal and the sun,
+            so (northern hemisphere) south-facing slopes catch the sun and north-facing ones are
+            dim; and
+          * cast shadow -- a horizon ray-march toward each sun position, so deep valleys and
+            pole-facing hollows shaded by the surrounding terrain lose their direct beam.
+        The sun is sampled along the clear-sky daily arc over a few seasons (see _sun_directions);
+        each sample is weighted by sin(elevation) as a beam-strength proxy and gated by the
+        cast-shadow test. A small diffuse_fraction of isotropic skylight is added as a floor, so a
+        fully shaded cell stays dim rather than black. Drives the baked surface temperature
+        (surface_temperature): sunnier cells settle warmer, shaded cells cooler.
+
+        Built on torch (grid_sample for the shadow march); a NumPy elevation is accepted and
+        returns NumPy float32, a torch tensor returns a torch tensor in the compute dtype.
+        """
+        import torch
+        as_torch = _is_torch(elevation_m)
+        t = elevation_m if as_torch else torch.as_tensor(elevation_m, dtype=torch.float64)
+        device, dtype = t.device, t.dtype
+        H, W = t.shape
+        dz = float(self.cell_size_m)
+        diffuse = self.sun_diffuse_fraction
+
+        E, N, U = self._sun_directions()
+        if E.size == 0:                          # polar night: only the diffuse floor reaches the ground
+            out = torch.full((H, W), diffuse, dtype=dtype, device=device)
+            return out if as_torch else out.cpu().numpy().astype(np.float32)
+
+        Es = torch.as_tensor(E, dtype=dtype, device=device)            # (S,)
+        Ns = torch.as_tensor(N, dtype=dtype, device=device)
+        Us = torch.as_tensor(U, dtype=dtype, device=device)
+        S = Es.shape[0]
+
+        # Upward surface normal from the terrain gradient. Grid convention: row i runs south,
+        # column j runs east, so the north gradient is -d/di. n = (-dz/dE, -dz/dN, 1)/|.|.
+        gy, gx = torch.gradient(t, spacing=dz)                          # gy = dz/di, gx = dz/dj
+        inv_norm = torch.rsqrt(gx * gx + gy * gy + 1.0)
+        nE, nN, nU = -gx * inv_norm, gy * inv_norm, inv_norm           # (H, W) each
+
+        # Lambertian incidence for every sun sample (clamped at the terminator).
+        cos_inc = (nE[None] * Es[:, None, None]
+                   + nN[None] * Ns[:, None, None]
+                   + nU[None] * Us[:, None, None]).clamp(min=0.0)       # (S, H, W)
+
+        # Cast shadow: march each cell toward the sun's horizontal direction and test whether the
+        # terrain ever rises above the line of sight (height + horizontal_distance * tan(elevation)).
+        visible = torch.ones((S, H, W), dtype=dtype, device=device)
+        if self.sun_shadows:
+            hmag = torch.sqrt(Es * Es + Ns * Ns).clamp(min=1e-6)       # horizontal speed (S,)
+            tan_elev = Us / hmag                                       # rise per unit horizontal run
+            di = (-Ns / hmag)                                         # row step per cell (north = -i)
+            dj = (Es / hmag)                                          # col step per cell
+            ii = torch.arange(H, device=device, dtype=dtype)
+            jj = torch.arange(W, device=device, dtype=dtype)
+            gi, gj = torch.meshgrid(ii, jj, indexing="ij")            # (H, W) base coords
+            terr = t[None, None].expand(S, 1, H, W)                    # grid_sample input (S, 1, H, W)
+            shadowed = torch.zeros((S, H, W), dtype=torch.bool, device=device)
+            zmin, zmax = float(t.min()), float(t.max())
+            tan_min = float(tan_elev.min())
+            steps = self.sun_max_shadow_steps or max(H, W)
+            for k in range(1, steps + 1):
+                # Once the lowest line of sight clears the highest terrain, nothing can shadow.
+                if tan_min > 0.0 and zmin + k * dz * tan_min > zmax:
+                    break
+                r = gi[None] + di[:, None, None] * k                  # (S, H, W) sample row
+                c = gj[None] + dj[:, None, None] * k                  # sample col
+                gxn = c / (W - 1) * 2.0 - 1.0                          # normalised grid_sample coords
+                gyn = r / (H - 1) * 2.0 - 1.0
+                grid = torch.stack((gxn, gyn), dim=-1)                 # (S, H, W, 2)
+                sampled = torch.nn.functional.grid_sample(
+                    terr, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+                )[:, 0]                                                # (S, H, W) terrain along the ray
+                los = t[None] + (k * dz) * tan_elev[:, None, None]     # line-of-sight height
+                in_bounds = (r >= 0) & (r <= H - 1) & (c >= 0) & (c <= W - 1)
+                shadowed |= in_bounds & (sampled > los)
+            visible = (~shadowed).to(dtype)
+
+        # Beam-weighted (sin elevation) average of the unshadowed cosine incidence, plus a uniform
+        # diffuse skylight floor so fully shaded ground is dim, not black.
+        direct = (Us[:, None, None] * cos_inc * visible).sum(0) / Us.sum()
+        out = (diffuse + (1.0 - diffuse) * direct).clamp(0.0, 1.0)
+        return _store(out) if as_torch else out.cpu().numpy().astype(np.float32)
+
+    def flat_exposure(self) -> float:
+        """The sunlight_exposure value a flat, fully-open cell receives (no slope, no shadow).
+
+        A flat cell's surface normal points straight up, so its incidence cosine is sin(elevation)
+        for every sun sample; the beam-weighted average is then Sum(U^2)/Sum(U), plus the diffuse
+        floor. This is the reference exposure that reads as "ordinary" ground: surface_temperature
+        leaves a cell at this exposure at the unmodulated ambient profile, so flat ground stays at
+        T_REF. Pure function of the sun-sampling geometry (independent of terrain)."""
+        _, _, U = self._sun_directions()
+        if U.size == 0:
+            return self.sun_diffuse_fraction
+        direct_flat = float((U * U).sum() / U.sum())
+        return self.sun_diffuse_fraction + (1.0 - self.sun_diffuse_fraction) * direct_flat
+
+    def surface_temperature(self, elevation_m, sunlight):
+        """Baked per-cell surface (rest) temperature [K] from elevation and solar exposure.
+
+        The surface a cell settles at is its elevation ambient profile T_REF - Gamma*z, warmed or
+        cooled by how much sun it gets. The bare radiative response (absorbed solar ~ exposure,
+        emission ~ sigma*T^4) would give T ~ ambient*(exposure/flat)^(1/4) -- realistic in a vacuum,
+        but on Earth the atmosphere insulates and warm surrounding air mixes laterally, so shaded
+        ground is only "a bit cool", not lunar-cold. We model that by blending the bare radiative
+        temperature back toward the ambient air by `temp_moderation` in [0, 1]: 0 = pure radiative
+        swing, 1 = no solar effect (the old uniform profile). A flat, open cell (exposure = flat)
+        stays exactly at the ambient profile, so flat ground keeps the calibrated T_REF.
+
+        This is the surface skin temperature the radiation balance equilibrates to and the air is
+        initialised from; sunnier slopes run warmer, shaded valleys cooler.
+        """
+        ambient = self.air_temperature_profile(elevation_m)            # T_REF - Gamma*z
+        rel = sunlight / self.flat_exposure()                         # exposure relative to flat ground
+        radiative = ambient * rel ** 0.25                             # bare (vacuum) radiative response
+        m = self.sun_temp_moderation
+        return _store(ambient + (1.0 - m) * (radiative - ambient))
+
 
 def generate_map(
     gen: MapGenerator,
@@ -354,7 +529,8 @@ def generate_map(
     runtime concern applied by the environment, so maps describe the world at rest.
 
     All fields are SI: terrain [m], air_temperatures [K], mass [kg/m^2], oxygen
-    [kg/m^3], fuel [kg/m^2].
+    [kg/m^3], fuel [kg/m^2]. `sunlight` is a static dimensionless [0,1] solar-exposure field that
+    drives the baked surface (rest) temperature: sunnier cells warmer, shaded cells cooler.
     """
     # Normalised [0,1] relief is scaled to metres for the elevation; its per-cell slope
     # (rise/run) drives the vegetation preference (flat-loving grass, steep-loving trees).
@@ -362,8 +538,15 @@ def generate_map(
     terrain = relief * gen.elev_max
     slope = gen.terrain_slope(terrain)
 
-    # Air temperature from the lapse rate; oxygen from the hydrostatic air density.
-    air_temperatures = gen.air_temperature_profile(terrain)
+    # Static solar exposure [0,1]: south-facing slopes catch the sun, shadowed valleys lose it.
+    sunlight = gen.sunlight_exposure(terrain)
+
+    # Surface (rest) temperature: the elevation profile warmed/cooled by how much sun each cell
+    # gets (sunny slopes warmer, shaded valleys cooler), atmosphere-moderated. This is the radiative
+    # equilibrium the surface settles at and the temperature the air is initialised to; the runtime
+    # ground<->air radiation coupling then carries it into the air. Oxygen follows the air density.
+    surface_temperature = gen.surface_temperature(terrain, sunlight)
+    air_temperatures = surface_temperature
     oxygen = gen.oxygen_profile(terrain, air_temperatures)
 
     N = gen.num_fuel_types
@@ -419,6 +602,7 @@ def generate_map(
 
     return MapData(
         terrain=terrain_np,
+        sunlight=to_np(sunlight),
         air_temperatures=air_np,
         mass=to_np(mass),
         oxygen=oxygen_np,
@@ -438,14 +622,22 @@ def generate_map(
 def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int = 16) -> None:
     """Develop the orographic wind for each map and bake it back in (in place).
 
-    Each map is built in its level-lid rest state (uniform synoptic wind, flat free surface).
-    That is not the wind a real terrain produces, and the prognostic solver only relaxes into
-    the terrain-shaped flow over hundreds of ticks. We run that relaxation here, once, at
-    generation time: stack the rest states into a batch and step the shallow-water core `steps`
-    times (the engine is rank-agnostic, so the batch runs far faster than one map at a time),
-    then write the developed mass, air temperature and prognostic wind back into each MapData.
-    The level-lid rest mass is preserved as `mass_eq` (the open-boundary sponge target) and the
+    Each map is built in its level-lid rest state (uniform synoptic wind, flat free surface, sharp
+    sunlight air temperature). That is not the developed world a real terrain produces, and the
+    solver only relaxes into it over hundreds of ticks. We run that relaxation here, once, at
+    generation time: stack the rest states into a batch and step the FULL field physics `steps`
+    times (the engine is rank-agnostic, so the batch runs far faster than one map at a time), then
+    write the developed mass, air temperature and prognostic wind back into each MapData. The
+    level-lid rest mass is preserved as `mass_eq` (the open-boundary sponge target) and the sunlight
     rest temperature as `temp_eq`, so the runtime sponge still injects the correct free stream.
+
+    The air temperature is developed too, not reset to the sharp rest profile: the wind advects it
+    while the surface radiation balance and fuel/air coupling hold it at its sunlight range, so it
+    settles into the wind-smeared pattern it actually equilibrates to -- which is why we step
+    step_fields here, not step_dynamics (wind alone has no thermal source and would wash the air out
+    toward uniform). The map is quiescent (fuel far below ignition), so combustion stays inert. A
+    loaded map then starts already in this developed flow instead of visibly smearing over the first
+    frames.
 
     The flow is genuinely unsteady (lee/gravity waves do not settle to a frozen field), so the
     baked state is a developed snapshot, not a fixed point: it loads already terrain-shaped and
@@ -470,6 +662,7 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
         batch = maps[start:start + chunk]
         mass = torch.stack([t(m.mass) for m in batch])              # (B, H, W) level-lid rest
         air  = torch.stack([t(m.air_temperatures) for m in batch])
+        terrain = torch.stack([t(m.terrain) for m in batch])
         amb_x = t([m.ambient_wind_x for m in batch]).view(-1, 1, 1)
         amb_y = t([m.ambient_wind_y for m in batch]).view(-1, 1, 1)
         s = SimState(
@@ -479,7 +672,7 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
             fuel_temperatures=torch.stack([t(m.fuel_temperatures) for m in batch]),
             fuel=torch.stack([t(m.fuel) for m in batch]),
             oxygen=torch.stack([t(m.oxygen) for m in batch]),
-            terrain=torch.stack([t(m.terrain) for m in batch]),
+            terrain=terrain,
             temp_eq=air.clone(),                                    # rest temperature (sponge target)
             oxygen_eq=torch.stack([t(m.oxygen) for m in batch]),
             mass_eq=mass.clone(),                                   # level-lid rest mass (sponge target)
@@ -488,9 +681,18 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
             u_amb_x=amb_x,
             u_amb_y=amb_y,
             radiant_flux=torch.zeros_like(mass),
+            channel_gain=sim.compute_channel_gain(terrain, amb_x, amb_y),
         )
+        # Step the field physics (not just the wind): the wind develops the orographic flow, and the
+        # surface radiation balance + fuel/air coupling hold the air at its sunlight range while the
+        # wind advects it -- so the air settles into its developed, wind-smeared state rather than the
+        # sharp rest profile (or, under wind-only stepping, washing out toward uniform). We reuse the
+        # runtime step_fields (one source of truth) but turn off the two stages a quiescent map does
+        # not need: oxygen transport (passive -- never affects mass/wind/air) and combustion (no fire
+        # at rest). Both are ~30% / ~43% of a tick, so this is the bulk of the spin-up cost, and the
+        # baked mass/air/wind are identical to the full step (verified to round-off).
         for _ in range(steps):
-            sim.step_dynamics(s)
+            sim.step_fields(s, advance_oxygen=False, advance_fire=False)
 
         dev_mass = s.mass.cpu().numpy()
         dev_air  = s.air_temperatures.cpu().numpy()
@@ -499,6 +701,9 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
         for i, m in enumerate(batch):
             m.mass_eq = m.mass.copy()                  # the level-lid rest state -> sponge target
             m.mass = dev_mass[i].astype(np.float32)    # developed initial state
+            # Developed (wind-smeared) air temperature: the equilibrium the full physics settles
+            # into, so a loaded map starts already in its developed flow instead of the sharp
+            # sunlight rest profile that visibly smears over the first frames.
             m.air_temperatures = dev_air[i].astype(np.float32)
             m.x_wind_vel = dev_u[i].astype(np.float32)
             m.y_wind_vel = dev_v[i].astype(np.float32)
@@ -530,7 +735,11 @@ def main() -> None:
     config = load_config(args.config)
     if args.device is not None:
         config.setdefault("environment", {})["device"] = args.device
-    grid_size = int((config or {}).get("environment", {}).get("grid_size", DEFAULT_GRID_SIZE))
+    observed = int((config or {}).get("environment", {}).get("grid_size", DEFAULT_GRID_SIZE))
+    # Maps are generated at the padded physics size (observed + 2*boundary_pad): the open-boundary
+    # sponge lives in the ring, so the observed interior the env crops out is sponge-free.
+    pad = boundary_pad(config)
+    grid_size = physics_grid_size(config, observed)
     gen = MapGenerator(config)
     chunk = max(1, args.chunk)
 
@@ -538,7 +747,8 @@ def main() -> None:
     children = np.random.SeedSequence(args.seed).spawn(args.count)
     seeds = [int(c.generate_state(1)[0]) for c in children]
 
-    print(f"Generating {args.count} map(s) at {grid_size}x{grid_size} into '{args.out}/' "
+    print(f"Generating {args.count} map(s) at {grid_size}x{grid_size} "
+          f"(observed {observed}x{observed} + {pad}-cell sponge padding) into '{args.out}/' "
           f"(device={gen.device}, chunk={chunk}, spinup={gen.spinup_steps} ticks) ...", flush=True)
 
     # Process the maps in chunks: build each rest state on the device (the torch Perlin kernel and

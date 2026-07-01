@@ -104,7 +104,10 @@ def test_open_domain_carries_anomaly_downwind(make_env):
     cols = np.arange(grid)
 
     def centroid_col(env):
-        w = np.clip(to_numpy(env._mass) * (to_numpy(env._air_temperatures) - pc.T_REF), 0.0, None)
+        # Centroid over the observed interior (crop the padded sponge ring), matching `cols`.
+        mass = to_numpy(env._crop(env._mass))
+        air = to_numpy(env._crop(env._air_temperatures))
+        w = np.clip(mass * (air - pc.T_REF), 0.0, None)
         return float((w.sum(axis=0) * cols).sum() / w.sum())
 
     x0 = centroid_col(env)

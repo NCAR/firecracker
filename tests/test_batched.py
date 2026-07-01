@@ -19,8 +19,9 @@ import physics_constants as pc
 from conftest import to_numpy
 from simulation import Simulation, SimState, OBS_CHANNELS
 from map_loader import save_map
+from config import boundary_pad
 from rollout import BatchedRollout, FireDataset
-from scenarios import hot_blob, mass_gradient, off_equilibrium, uniform, build_map, make_config
+from scenarios import hot_blob, mass_gradient, off_equilibrium, uniform, build_map, make_config, pad_map
 
 
 def _batched_state(sim: Simulation, maps) -> SimState:
@@ -139,9 +140,10 @@ def test_rollout_collects_and_samples(tmp_path):
     """BatchedRollout fills its pool and serves correctly-shaped minibatches."""
     grid = 16
     config = make_config(grid_size=grid)
-    # Bake a couple of small maps the collector can sample from.
+    # Bake a couple of small maps the collector can sample from (ringed out to the physics size).
+    pad = boundary_pad(config)
     for i in range(2):
-        save_map(tmp_path / f"m_{i}.npz", build_map(grid_size=grid))
+        save_map(tmp_path / f"m_{i}.npz", pad_map(build_map(grid_size=grid), pad))
 
     roll = BatchedRollout(
         config, maps_dir=str(tmp_path), grid_size=grid,
@@ -163,7 +165,7 @@ def test_rollout_stride_subsamples(tmp_path):
     """Raising stride proportionally shrinks the pool (every stride-th frame kept)."""
     grid = 16
     config = make_config(grid_size=grid)
-    save_map(tmp_path / "m.npz", build_map(grid_size=grid))
+    save_map(tmp_path / "m.npz", pad_map(build_map(grid_size=grid), boundary_pad(config)))
 
     common = dict(maps_dir=str(tmp_path), grid_size=grid, num_envs=2, steps=12, buffer_device="cpu")
     dense = BatchedRollout(config, stride=1, **common)
@@ -179,7 +181,7 @@ def test_build_dataset_and_load(tmp_path):
     config = make_config(grid_size=grid)
     maps_dir = tmp_path / "maps"
     maps_dir.mkdir()
-    save_map(maps_dir / "m.npz", build_map(grid_size=grid))
+    save_map(maps_dir / "m.npz", pad_map(build_map(grid_size=grid), boundary_pad(make_config(grid_size=grid))))
 
     roll = BatchedRollout(
         config, maps_dir=str(maps_dir), grid_size=grid,
@@ -211,7 +213,7 @@ def test_firedataset_unions_worker_subdirs(tmp_path):
     config = make_config(grid_size=grid)
     maps_dir = tmp_path / "maps"
     maps_dir.mkdir()
-    save_map(maps_dir / "m.npz", build_map(grid_size=grid))
+    save_map(maps_dir / "m.npz", pad_map(build_map(grid_size=grid), boundary_pad(make_config(grid_size=grid))))
 
     parent = tmp_path / "data"
     rounds = 2
@@ -235,7 +237,7 @@ def test_firedataset_rejects_incompatible_sources(tmp_path):
     for grid in (16, 24):                               # different grid_size between workers
         maps_dir = tmp_path / f"maps{grid}"
         maps_dir.mkdir()
-        save_map(maps_dir / "m.npz", build_map(grid_size=grid))
+        save_map(maps_dir / "m.npz", pad_map(build_map(grid_size=grid), boundary_pad(make_config(grid_size=grid))))
         roll = BatchedRollout(
             make_config(grid_size=grid), maps_dir=str(maps_dir), grid_size=grid,
             num_envs=2, steps=2, stride=1, buffer_device="cpu", seed=0,
@@ -251,7 +253,7 @@ def test_build_dataset_refuses_overwrite(tmp_path):
     grid = 16
     maps_dir = tmp_path / "maps"
     maps_dir.mkdir()
-    save_map(maps_dir / "m.npz", build_map(grid_size=grid))
+    save_map(maps_dir / "m.npz", pad_map(build_map(grid_size=grid), boundary_pad(make_config(grid_size=grid))))
     roll = BatchedRollout(
         make_config(grid_size=grid), maps_dir=str(maps_dir), grid_size=grid,
         num_envs=2, steps=2, stride=1, buffer_device="cpu", seed=0,

@@ -59,6 +59,28 @@ slope_ref   = 0.5
 # there is no separate oxygen falloff knob any more.
 temperature_lapse_rate = 0.0065   # K/m (6.5 K per km)
 
+[sunlight]
+# Static per-cell solar exposure baked at map-generation time: how much sunlight each cell
+# receives on average, relative to a flat, fully-exposed surface (dimensionless, [0, 1]). It
+# folds in the two dominant terrain effects -- slope/aspect (in the northern hemisphere the
+# south-facing sides of mountains catch far more sun than north-facing ones) and cast shadow
+# (deep valleys and pole-facing hollows lose their direct beam to the surrounding terrain). The
+# sun is sampled along the clear-sky daily arc (hour angle) over a few seasons (declination) at
+# the configured latitude; each sample's beam is gated by a horizon ray-march for the shadowing.
+latitude_deg        = 40.0   # site latitude [deg]; positive = northern hemisphere (sun in the southern sky)
+axial_tilt_deg      = 23.44  # obliquity [deg]: seasonal declination is sampled over +/- this
+num_seasons         = 1      # declination samples (1 = equinox only; >1 spreads over +/- axial_tilt)
+num_hours           = 12     # hour-angle samples across the day (more = smoother daily integral)
+hour_half_angle_deg = 90.0   # half-arc sampled each side of solar noon (90 = sunrise to sunset)
+shadows             = true   # ray-march the terrain horizon for cast shadows (false = slope/aspect only)
+max_shadow_steps    = 0      # cap on the per-sample shadow march in cells (0 = grid size)
+diffuse_fraction    = 0.15   # isotropic skylight floor: a fully shaded cell still gets this fraction
+# Sunlight is baked into the per-cell surface (rest) temperature at generation: the elevation
+# profile warmed on sun-facing slopes and cooled in shadow. temp_moderation sets how strongly the
+# atmosphere damps the bare radiative swing: 0 = pure (vacuum) radiative response (shade gets very
+# cold), 1 = no solar effect. Earth's air insulation + lateral mixing keep shade only "a bit cool".
+temp_moderation     = 0.85
+
 [radiation]
 # Surface radiative energy balance (see docs/units.md). Sunlight is absorbed at the surface
 # (air is transparent to shortwave) and split between bare ground and fuel by a vegetation
@@ -110,7 +132,12 @@ spinup_steps    = 800     # gen_maps: solver ticks to develop the orographic win
 reduced_gravity = 0.2     # g' [m/s^2]: free-surface forcing strength (gravity-wave speed sqrt(g'*eta))
 drag_coeff      = 0.0005  # C_d [1/s]: weak interior surface friction (toward rest)
 viscosity       = 50.0    # nu [m^2/s]: eddy viscosity (smoothing)
-sponge_width    = 8       # cells: width of the boundary relaxation (open-domain inflow/outflow)
+sponge_width    = 8       # cells: width of the boundary relaxation (open-domain inflow/outflow).
+                          # Doubles as the observation padding: the physics grid is the observed
+                          # [environment].grid_size padded by sponge_width on every side (so the
+                          # sponge ring sits entirely outside the observed/rendered interior, which
+                          # stays sponge-free). Maps are generated at that padded size. An explicit
+                          # [environment].padding overrides this (e.g. 0 to disable padding).
 sponge_strength = 10.0    # [1/s]: peak edge relaxation rate toward (u_amb, rest mass)
 cfl_target      = 0.5     # max Courant number per substep (advective + gravity-wave speed)
 

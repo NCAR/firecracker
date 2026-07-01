@@ -100,8 +100,10 @@ class Simulation:
         # by the (shortwave-transparent) air: bare ground and fuel each absorb solar S_net and
         # emit longwave eps*sigma*T^4, split by a vegetation cover fraction. The air is heated
         # only by sensible exchange with the ground. S_net is anchored per-cell to the rest
-        # profile (S_net = eps*sigma*temp_eq^4), so radiative equilibrium sits at temp_eq
-        # (= T_REF - Gamma*z); the fast (small heat-capacity) fuel/ground lead, the deep air lags.
+        # profile (S_net = eps*sigma*temp_eq^4), so radiative equilibrium sits at temp_eq -- the
+        # baked surface temperature (elevation profile warmed by sun-facing exposure, cooled in
+        # shadow), so sunlit slopes settle warmer and shaded valleys cooler; the fast (small
+        # heat-capacity) fuel/ground lead, the deep air lags.
         radiation = (cfg or {}).get("radiation", {})
         self.radiation_enabled:   bool  = bool(radiation.get("enabled", True))
         self.emissivity:          float = float(radiation.get("emissivity",          pc.EMISSIVITY))
@@ -650,12 +652,13 @@ class Simulation:
         solar S_net and emits longwave eps*sigma*T^4, both weighted by its area fraction; the
         air is warmed only by sensible exchange with the ground (fuel<->air conduction stays in
         exchange_fuel_air_heat). The net flux S_net is fixed per-cell to the rest profile,
-        S_net = eps*sigma*temp_eq^4, so radiative equilibrium sits exactly at temp_eq (= T_REF
-        over flat ground): area-weighting both solar and longwave makes every body's balance
-        vanish at temp_eq. Heat capacity sets the response speed -- fine fuel (~1e3 J/m^2/K)
-        leads, the ground skin (~1e5) follows, the deep air column (~1e6) lags far behind, which
-        is why fuels heat and dry in the sun well ahead of the air. Explicit forward Euler; all
-        fluxes use the pre-step temperatures.
+        S_net = eps*sigma*temp_eq^4, so radiative equilibrium sits exactly at temp_eq. temp_eq is
+        the baked surface (rest) temperature -- the elevation profile already warmed by sun-facing
+        exposure and cooled in shadow (gen_maps.surface_temperature) -- so a sunlit slope's ground
+        and fuel equilibrate warmer and a shaded valley's cooler. Heat capacity sets the response
+        speed -- fine fuel (~1e3 J/m^2/K) leads, the ground skin (~1e5) follows, the deep air column
+        (~1e6) lags far behind, which is why fuels heat and dry in the sun well ahead of the air.
+        Explicit forward Euler; all fluxes use the pre-step temperatures.
 
         Returns (air_temperatures, fuel_temperatures, ground_temperature).
         """
@@ -993,13 +996,23 @@ class Simulation:
     # Full per-tick step + observation
     # ---------------------------------------------------------------------------
 
-    def step_fields(self, s: SimState) -> SimState:
+    def step_fields(
+        self, s: SimState, *, advance_oxygen: bool = True, advance_fire: bool = True
+    ) -> SimState:
         """Advance every field one tick (the pure physics of one env step).
 
         This is the single source of truth for the per-tick sequence — both
         FirecrackerEnv.step (single world) and BatchedRollout (B worlds) call it, so they
         can never drift apart. It carries no rendering/EMA bookkeeping. Because every op is
         rank-agnostic, the same call advances a 2-D world or a batched (B, H, W) stack.
+
+        `advance_oxygen` / `advance_fire` default to the full step. They let a caller skip the
+        oxygen transport and combustion stages -- the two costly stages that do not feed back into
+        mass, the wind, or the air temperature. The quiescent map spin-up (gen_maps.spin_up_maps)
+        turns both off: it only needs the developed mass/wind and wind-smeared air, and a rest-state
+        world has no fire, so those stages are pure wasted work there. Keeping them as flags on this
+        one method (rather than a hand-rolled subset in the generator) means the spin-up reuses the
+        exact runtime sequence and automatically inherits any future stage.
 
         The state is mutated in place and returned for convenience.
         """
@@ -1030,13 +1043,16 @@ class Simulation:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.mass
         )
 
-        s.oxygen = self.diffuse_and_advect_oxygen(s.oxygen, u_fire, v_fire)
-        # Fresh-air replenishment toward the elevation oxygen profile (combustion below
-        # still draws this down, so a vigorous fire can outpace it locally).
-        if self.relaxation_enabled:
-            s.oxygen = self.relax_to_equilibrium(s.oxygen, s.oxygen_eq, self.oxygen_rate)
+        # Oxygen transport (advection + diffusion + replenishment). Passive -- it never feeds back
+        # into mass/wind/air -- so a spin-up that only bakes those can skip it (advance_oxygen).
+        if advance_oxygen:
+            s.oxygen = self.diffuse_and_advect_oxygen(s.oxygen, u_fire, v_fire)
+            # Fresh-air replenishment toward the elevation oxygen profile (combustion below
+            # still draws this down, so a vigorous fire can outpace it locally).
+            if self.relaxation_enabled:
+                s.oxygen = self.relax_to_equilibrium(s.oxygen, s.oxygen_eq, self.oxygen_rate)
 
-        if self.fire_enabled:
+        if advance_fire and self.fire_enabled:
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
                 s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
                 u_fire, v_fire, s.terrain,
