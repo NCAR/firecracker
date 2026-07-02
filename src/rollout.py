@@ -67,7 +67,7 @@ from torch.utils.data import Dataset
 
 from config import load_config, boundary_pad
 from simulation import Simulation, SimState, obs_channel_names
-from map_loader import load_map, resolve_map, validate_against_config
+from map_loader import load_map, resolve_map, list_maps, validate_against_config
 
 DEFAULT_GRID_SIZE = 256
 
@@ -100,6 +100,10 @@ class BatchedRollout:
         buffer_dtype: str | None = None,
         spawn_fire: bool | None = None,
         seed: int | None = None,
+        map_repeats: int | None = None,
+        num_shards: int = 1,
+        shard_index: int = 0,
+        schedule_seed: int = 0,
     ):
         cfg      = config or {}
         roll_cfg = cfg.get("rollout", {})
@@ -140,6 +144,20 @@ class BatchedRollout:
         if seed is not None:
             self._gen.manual_seed(int(seed))
 
+        # Optional exhaustive-coverage schedule. When map_repeats is set, maps are drawn
+        # WITHOUT replacement from a deterministic list in which every map appears exactly
+        # `map_repeats` times, instead of the default random-with-replacement draw. Independent
+        # workers share `schedule_seed` (so they agree on one global permutation) and take a
+        # disjoint contiguous shard of it via (shard_index, num_shards); together the shards
+        # cover every map exactly `map_repeats` times. Fire ignition still uses `seed`, so each
+        # worker lights its worlds differently. `_schedule` is None in replacement mode.
+        self._schedule: list[Path] | None = None
+        self._schedule_pos = 0
+        if map_repeats is not None:
+            self._schedule = self._build_map_schedule(
+                int(map_repeats), int(num_shards), int(shard_index), int(schedule_seed)
+            )
+
         self._state: SimState | None = None
         self._pool: torch.Tensor | None = None   # (capacity, C, N, N) on buffer_device
         self._filled: int = 0                     # number of valid samples in the pool
@@ -150,6 +168,48 @@ class BatchedRollout:
     # World setup
     # -----------------------------------------------------------------------
 
+    def _build_map_schedule(
+        self, repeats: int, num_shards: int, shard_index: int, schedule_seed: int
+    ) -> list[Path]:
+        """This worker's ordered slice of the global exhaustive-coverage schedule.
+
+        The global schedule is every map in `maps_dir` repeated `repeats` times, then shuffled
+        with `schedule_seed`. All workers build the identical permutation and each takes the
+        contiguous chunk for its `shard_index`, so across `num_shards` workers every map is used
+        exactly `repeats` times. The chunk length must be divisible so shards are equal-sized.
+        """
+        if repeats < 1:
+            raise ValueError(f"map_repeats must be >= 1, got {repeats}")
+        if not 0 <= shard_index < num_shards:
+            raise ValueError(f"shard_index {shard_index} out of range for num_shards {num_shards}")
+        maps = list_maps(self._maps_dir)
+        if not maps:
+            raise FileNotFoundError(
+                f"No maps found in '{self._maps_dir}' for exhaustive schedule; generate some first."
+            )
+        full = np.repeat(np.arange(len(maps)), repeats)      # each map index, `repeats` times
+        perm = np.random.default_rng(schedule_seed).permutation(full)
+        if len(perm) % num_shards != 0:
+            raise ValueError(
+                f"schedule length {len(perm)} (= {len(maps)} maps x {repeats}) is not divisible "
+                f"by num_shards {num_shards}; choose factors that divide evenly."
+            )
+        shard_len = len(perm) // num_shards
+        sel = perm[shard_index * shard_len:(shard_index + 1) * shard_len]
+        return [maps[j] for j in sel]
+
+    def _next_scheduled_map(self) -> Path:
+        """Pop the next map from this worker's schedule (used only in exhaustive mode)."""
+        if self._schedule_pos >= len(self._schedule):
+            raise RuntimeError(
+                f"Map schedule exhausted after {self._schedule_pos} draws; this worker's shard "
+                f"holds {len(self._schedule)} maps but the run asked for more "
+                f"(rounds x num_envs). Reduce rounds/num_envs or raise map_repeats."
+            )
+        path = self._schedule[self._schedule_pos]
+        self._schedule_pos += 1
+        return path
+
     def reset(self) -> None:
         """(Re)load `B` worlds from the maps dir and build the batched simulation state."""
         fields = {k: [] for k in ("terrain", "air_temperatures", "temp_eq", "oxygen",
@@ -157,8 +217,12 @@ class BatchedRollout:
                                   "fuel", "fuel_temperatures")}
         amb_x, amb_y = [], []
         for _ in range(self.num_envs):
-            # Sample with replacement so num_envs can exceed the number of map files.
-            path = resolve_map(self._maps_dir, None, self._np_rng)
+            if self._schedule is not None:
+                # Exhaustive mode: consume the next map from this worker's schedule.
+                path = self._next_scheduled_map()
+            else:
+                # Sample with replacement so num_envs can exceed the number of map files.
+                path = resolve_map(self._maps_dir, None, self._np_rng)
             m = load_map(path)
             validate_against_config(m, self._sim_size, self._sim.fuel_type_names)
             for k in fields:
@@ -325,6 +389,19 @@ class BatchedRollout:
         for p in existing:
             p.unlink()
 
+        # In exhaustive mode the schedule must hold exactly rounds x num_envs maps so every
+        # map is used its full `repeats` times with none left over or reused. Rewind the cursor
+        # past the constructor's initial reset() so round 0 starts at the top of the schedule.
+        if self._schedule is not None:
+            needed = rounds * self.num_envs
+            if len(self._schedule) != needed:
+                raise ValueError(
+                    f"Exhaustive schedule has {len(self._schedule)} maps for this worker but "
+                    f"rounds x num_envs = {rounds} x {self.num_envs} = {needed}; they must match "
+                    f"for exact coverage. Adjust rounds, num_envs, num_shards, or map_repeats."
+                )
+            self._schedule_pos = 0
+
         samples_per_shard = None
         for r in range(rounds):
             self.reset()                                   # fresh worlds each round
@@ -436,6 +513,16 @@ def main() -> None:
     parser.add_argument("--spawn-fire", action="store_true", help="ignite each world at reset")
     parser.add_argument("--seed", type=int, default=None, help="seed for map selection / ignition")
     parser.add_argument("--overwrite", action="store_true", help="replace existing shards in --out")
+    parser.add_argument("--map-repeats", type=int, default=None,
+                        help="exhaustive mode: use every map exactly this many times "
+                             "(without replacement) instead of random sampling with replacement")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="exhaustive mode: total number of workers sharing the schedule")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="exhaustive mode: this worker's index in [0, num-shards)")
+    parser.add_argument("--schedule-seed", type=int, default=0,
+                        help="exhaustive mode: shared seed all workers use to permute the "
+                             "global schedule (must match across workers)")
     args = parser.parse_args()
 
     roll = BatchedRollout(
@@ -447,6 +534,10 @@ def main() -> None:
         buffer_dtype=args.buffer_dtype,
         spawn_fire=True if args.spawn_fire else None,
         seed=args.seed,
+        map_repeats=args.map_repeats,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+        schedule_seed=args.schedule_seed,
     )
     print(
         f"Building {args.rounds} shard(s) of {roll.capacity} samples "
