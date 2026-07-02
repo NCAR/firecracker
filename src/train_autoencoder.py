@@ -85,8 +85,11 @@ def build_dataset_if_needed(args: argparse.Namespace, config: dict) -> None:
     defaults to the 65,536-sample layout documented in the module docstring.
     """
     data_dir = Path(args.data)
-    meta = data_dir / "meta.json"
-    if meta.exists() and not args.build:
+    # A dataset is "present" either flat (meta.json in data_dir) or nested (one subdir per
+    # source, each with its own meta.json) -- the multi-GPU generation layout FireDataset
+    # unions. Recognise both so pointing --data at a nested parent doesn't trigger a rebuild.
+    present = (data_dir / "meta.json").exists() or any(data_dir.glob("*/meta.json"))
+    if present and not args.build:
         return  # dataset already present and no rebuild requested
 
     roll = BatchedRollout(
