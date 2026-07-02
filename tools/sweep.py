@@ -15,21 +15,29 @@ injects a per-run `--out` and `--seed`, and pins each to a device.
 
 Device packing
 --------------
-Training always runs on CUDA. A single GPU is assumed: `--per-gpu` runs share it
-concurrently (each gets `--device cuda`) and the rest queue until a slot frees. Which
-physical card is used is left to the usual `CUDA_VISIBLE_DEVICES` — set it before launching
-to pin the sweep to one of several A100s.
+Training always runs on CUDA. `--gpus G` spreads the replicates across G cards and
+`--per-gpu M` sets how many share each card concurrently; run i is pinned to gpu `i % G`
+by exporting a single-device `CUDA_VISIBLE_DEVICES` into its subprocess (so the trainer's
+`--device cuda` lands on that physical card as cuda:0), and the rest queue until a slot on
+their gpu frees. With `--gpus 1` this reduces to the old single-card behaviour. Omit
+`--replicas` to train exactly `G * M` runs (one full packing). Every run shares the same
+architecture and training args — only the seed differs — so the average is a replicate
+study across all G*M seeds regardless of which card each ran on.
+
+The parent `CUDA_VISIBLE_DEVICES` (e.g. the 4 cards PBS allocated) is honoured: gpu index
+g selects the g-th entry of that list, so this works unchanged inside a PBS job that was
+given a subset of the node's GPUs.
 
 Everything after a `--` is forwarded verbatim to every training run, so the full
 train_autoencoder.py CLI is available:
 
-    # 8 replicates of one architecture, 4 sharing the GPU, into runs/lat1024/run_00..07:
-    python tools/sweep.py --replicas 8 --per-gpu 4 --out runs/lat1024 -- \
+    # 16 replicates over 4 GPUs, 4 sharing each card, into runs/lat1024/run_00..15:
+    python tools/sweep.py --gpus 4 --per-gpu 4 --out runs/lat1024 -- \
         --data data/fire --epochs 50 --amp \
         --channels 8,16,32,64,128,256,512,1024
 
     # Inspect the per-run commands without launching (works anywhere, no GPU needed):
-    python tools/sweep.py --replicas 8 --per-gpu 4 --out runs/lat1024 --dry-run -- \
+    python tools/sweep.py --gpus 4 --per-gpu 4 --out runs/lat1024 --dry-run -- \
         --data data/fire --epochs 50
 
 When the runs finish, every `run_*/metrics.csv` is aggregated into `<out>/summary.csv`
@@ -41,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 import time
@@ -48,6 +57,21 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SRC = _ROOT / "src"
+
+# The device list this launcher inherited (what PBS/cgroups exposed, or unset). A run pinned
+# to logical gpu `g` gets the g-th entry, so indices stay valid inside a partial allocation.
+_PARENT_CVD = [d for d in (os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",") if d]
+
+
+def _gpu_token(gpu: int) -> str:
+    """CUDA_VISIBLE_DEVICES value pinning a subprocess to logical gpu `gpu`.
+
+    If the parent already restricts visibility (a PBS GPU allocation), index into that list
+    so `gpu` selects the g-th allocated card; otherwise fall back to the bare index.
+    """
+    if gpu < len(_PARENT_CVD):
+        return _PARENT_CVD[gpu]
+    return str(gpu)
 
 
 def build_command(passthrough: list[str], out_dir: Path, seed: int) -> list[str]:
@@ -95,17 +119,35 @@ def aggregate(out_root: Path) -> None:
     epochs = sorted(by_epoch)
     with summary_path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["epoch", "n", "train_mean", "train_std", "val_mean", "val_std"])
+        w.writerow(["epoch", "n", "train_mean", "train_std", "val_mean", "val_std", "val_sem"])
         rows = []
         for e in epochs:
             tr = np.array(by_epoch[e]["train"])
             va = np.array(by_epoch[e]["val"])
-            row = [e, tr.size,
+            sem = va.std(ddof=1) / np.sqrt(va.size) if va.size > 1 else 0.0
+            row = [e, va.size,
                    f"{tr.mean():.6f}", f"{tr.std():.6f}",
-                   f"{va.mean():.6f}", f"{va.std():.6f}"]
+                   f"{va.mean():.6f}", f"{va.std():.6f}", f"{sem:.6f}"]
             w.writerow(row)
             rows.append((e, va.mean(), va.std()))
     print(f"aggregate: {len(run_dirs)} run(s) -> {summary_path}")
+
+    # Headline for "how good is this config": each replicate's best (min) val loss, then the
+    # mean and standard error of that best across replicates. sem = std / sqrt(n) is the
+    # uncertainty on the mean and is what shrinks as you add more seeds.
+    best = []
+    for d in run_dirs:
+        with (d / "metrics.csv").open(newline="") as f:
+            vals = [float(r["val_loss"]) for r in csv.DictReader(f)]
+        if vals:
+            best.append(min(vals))
+    b = np.array(best)
+    if b.size:
+        std = b.std(ddof=1) if b.size > 1 else 0.0
+        sem = std / np.sqrt(b.size) if b.size > 1 else 0.0
+        print(f"aggregate: best-val over {b.size} replicate(s): "
+              f"mean {b.mean():.6f}  std {std:.6f}  sem {sem:.6f}  "
+              f"[min {b.min():.6f}, max {b.max():.6f}]")
 
     try:
         import matplotlib
@@ -143,10 +185,13 @@ def main() -> None:
         description="Train replicate world models in parallel and average their curves.",
         epilog="All args after `--` are forwarded to src/train_autoencoder.py.",
     )
-    parser.add_argument("--replicas", type=int, default=8,
-                        help="number of seeded replicate runs to train (default: 8)")
+    parser.add_argument("--gpus", type=int, default=1,
+                        help="GPUs to spread runs across; run i is pinned to gpu i%%gpus "
+                             "(default: 1)")
+    parser.add_argument("--replicas", type=int, default=None,
+                        help="number of seeded replicate runs to train (default: gpus*per_gpu)")
     parser.add_argument("--per-gpu", type=int, default=4,
-                        help="replicate runs sharing the GPU at once (default: 4)")
+                        help="replicate runs sharing EACH gpu at once (default: 4)")
     parser.add_argument("--out", default="runs/sweep",
                         help="root dir; runs land in <out>/run_NN (default: runs/sweep)")
     parser.add_argument("--seed-base", type=int, default=0,
@@ -167,56 +212,73 @@ def main() -> None:
         aggregate(out_root)
         return
 
+    if args.gpus < 1:
+        parser.error("--gpus must be >= 1")
+    replicas = args.replicas if args.replicas is not None else args.gpus * args.per_gpu
+
     # argparse.REMAINDER keeps the leading "--"; drop it.
     passthrough = args.train_args[1:] if args.train_args[:1] == ["--"] else args.train_args
 
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Build the full work queue: (index, seed, out_dir, command).
-    queue: list[tuple[int, int, Path, list[str]]] = []
-    for i in range(args.replicas):
+    # Build the full work queue: (index, seed, gpu, out_dir, command). Runs are round-robined
+    # onto gpus so an uneven replicas count still spreads evenly across the cards.
+    queue: list[tuple[int, int, int, Path, list[str]]] = []
+    for i in range(replicas):
         seed = args.seed_base + i
+        gpu = i % args.gpus
         run_dir = out_root / f"run_{i:02d}"
         cmd = build_command(passthrough, run_dir, seed)
-        queue.append((i, seed, run_dir, cmd))
+        queue.append((i, seed, gpu, run_dir, cmd))
 
-    print(f"sweep: {args.replicas} replicate(s), {args.per_gpu} sharing the GPU at once; "
-          f"out '{out_root}/'")
+    print(f"sweep: {replicas} replicate(s) across {args.gpus} gpu(s), "
+          f"{args.per_gpu} per gpu; out '{out_root}/'")
     if args.dry_run:
-        for i, seed, run_dir, cmd in queue:
-            print(f"  run_{i:02d} (seed {seed}): {' '.join(cmd)}")
+        for i, seed, gpu, run_dir, cmd in queue:
+            print(f"  run_{i:02d} (seed {seed}, gpu {gpu} -> CUDA_VISIBLE_DEVICES="
+                  f"{_gpu_token(gpu)}): {' '.join(cmd)}")
         return
 
     pending = list(queue)
-    free = args.per_gpu  # concurrency budget: this many runs share the GPU at once
+    free = [args.per_gpu] * args.gpus  # per-gpu concurrency budget
     running: dict[int, dict] = {}
     failures: list[tuple[int, int]] = []
 
     def launch(run):
-        i, seed, run_dir, cmd = run
+        i, seed, gpu, run_dir, cmd = run
         run_dir.mkdir(parents=True, exist_ok=True)
         log = (run_dir / "train.log").open("w")
-        print(f"  start run_{i:02d} (seed {seed}) -> {run_dir}/train.log")
-        proc = subprocess.Popen(cmd, cwd=_ROOT, stdout=log, stderr=subprocess.STDOUT)
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = _gpu_token(gpu)
+        print(f"  start run_{i:02d} (seed {seed}) on gpu {gpu} "
+              f"[CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}] -> {run_dir}/train.log")
+        proc = subprocess.Popen(cmd, cwd=_ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
         return {"proc": proc, "log": log, "run": run}
 
     while pending or running:
-        while pending and free > 0:
-            rec = launch(pending.pop(0))
-            running[id(rec["proc"])] = rec
-            free -= 1
+        # Launch any pending run whose assigned gpu has a free slot; keep the rest queued.
+        still: list = []
+        for run in pending:
+            gpu = run[2]
+            if free[gpu] > 0:
+                rec = launch(run)
+                running[id(rec["proc"])] = rec
+                free[gpu] -= 1
+            else:
+                still.append(run)
+        pending = still
         time.sleep(args.poll)
         for key, rec in list(running.items()):
             rc = rec["proc"].poll()
             if rc is None:
                 continue
             rec["log"].close()
-            i = rec["run"][0]
+            i, gpu = rec["run"][0], rec["run"][2]
             status = "ok" if rc == 0 else f"FAILED (exit {rc})"
-            print(f"  done  run_{i:02d}: {status}")
+            print(f"  done  run_{i:02d} (gpu {gpu}): {status}")
             if rc != 0:
                 failures.append((i, rc))
-            free += 1
+            free[gpu] += 1
             del running[key]
 
     print(f"sweep: all runs finished ({len(failures)} failed).")
