@@ -235,6 +235,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._x_wind_vel: np.ndarray | None = None
         self._y_wind_vel: np.ndarray | None = None
         self._fuel: np.ndarray | None = None
+        self._initial_canopy_fuel: torch.Tensor | None = None  # per-cell original canopy load (for bole occlusion)
         self._oxygen: np.ndarray | None = None
         self._mass: np.ndarray | None = None   # boundary-layer areal mass [kg/m^2]
         self._mass_eq: torch.Tensor | None = None   # rest-state mass (open-boundary sponge target)
@@ -375,6 +376,12 @@ class FirecrackerEnv(gymnasium.Env):
         self._mass              = self._to_tensor(m.mass)      # developed (spun-up) initial mass
         self._mass_eq           = self._to_tensor(m.mass_eq)   # level-lid rest state -> sponge target
         self._fuel              = self._to_tensor(m.fuel)
+        # Snapshot the original per-cell canopy load now, before any burning thins it; the fire
+        # view uses it to reveal the bole once a cell's canopy drops below a fraction of this.
+        canopy_axes = [i for i, n in enumerate(self._sim.fuel_type_names) if n == "tree_canopy"]
+        self._initial_canopy_fuel = (
+            self._fuel[canopy_axes].sum(dim=0).clone() if canopy_axes else None
+        )
         self._fuel_temperatures = self._to_tensor(m.fuel_temperatures)
         # Surface skin starts at the rest temperature profile (radiative-equilibrium target).
         self._ground_temperature = self._temp_eq.clone()
@@ -774,11 +781,16 @@ class FirecrackerEnv(gymnasium.Env):
         self._wind_speed_surface = build_wind_speed_surface(
             wx, wy, self._pixel_scale, self._wind_speed_display_max
         )
+        initial_canopy_fuel = (
+            _to_numpy(self._crop(self._initial_canopy_fuel))
+            if self._initial_canopy_fuel is not None else None
+        )
         self._fire_surface = build_fire_surface(
             fuel_temps, fuel, oxygen, self._pixel_scale,
             ignition_thresholds, self._sim.fuel_burnt_threshold,
             self._sim.fuel_type_names,
             self._show_fire_overlay and self._sim.fire_enabled,
+            initial_canopy_fuel,
         )
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(

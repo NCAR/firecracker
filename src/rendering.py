@@ -41,11 +41,17 @@ GREEN_CHANNEL: int = 1
 VEGETATION_COLORS: dict[str, tuple[float, float, float]] = {
     "tree":        (0.0,  1.0, 0.0),   # green
     "tree_canopy": (0.0,  1.0, 0.0),   # green (a tree's fine fuel)
-    "tree_bole":   (0.0,  1.0, 0.0),   # green (a tree's coarse fuel)
+    "tree_bole":   (0.5,  0.4, 0.3),   # brown (a tree's coarse fuel); only shown through a thin canopy
     "grass":       (0.75, 1.0, 0.0),   # yellow-green
     "shrub":       (0.5,  0.75, 0.25), # muted olive-green (woody scrub)
 }
 DEFAULT_VEGETATION_COLOR: tuple[float, float, float] = (0.0, 1.0, 0.0)
+
+# A tree's bole (trunk/coarse fuel) is occluded by its canopy: its brown only shows through once
+# the co-located canopy's fuel fraction (normalised by the map's peak canopy loading, like every
+# other type's brightness) drops below this. Below it the bole reads as brown; at/above it the
+# bole contributes nothing and the cell reads as green canopy.
+TREE_BOLE_CANOPY_FRACTION: float = 0.10
 
 # Biome view: one flat color per non-overlapping vegetation biome (see gen_maps.classify_biomes),
 # taken straight from the fire-view vegetation hue of the fuel that dominates each biome — woodland
@@ -418,6 +424,7 @@ def build_fire_surface(
     fuel_burnt_threshold: float,
     fuel_type_names: list[str],          # (N,) names, aligned with fuel/ignition axis 0
     show_fire_overlay: bool = True,
+    initial_canopy_fuel: np.ndarray | None = None,  # (H, W) each cell's original canopy load (for bole occlusion)
 ) -> pygame.Surface:
     rows, cols = fuel_temperatures.shape[1], fuel_temperatures.shape[2]
     rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
@@ -444,6 +451,23 @@ def build_fire_surface(
     )  # (N, 3)
     type_max = fuel.max(axis=(1, 2), keepdims=True)            # (N, 1, 1) per-type peak
     normalized = np.divide(fuel, type_max, out=np.zeros_like(fuel), where=type_max > 0.0)
+
+    # The bole hides behind the canopy: only let its brown contribute once that cell's canopy has
+    # burned down to below TREE_BOLE_CANOPY_FRACTION of the canopy load it *originally* carried
+    # (per-cell, not a map-wide peak). While the canopy is still fuller than that it occludes the
+    # bole, so zero the bole's contribution there. Needs the map's original canopy load; without
+    # it the bole just blends in normally.
+    bole_idx = [i for i, n in enumerate(fuel_type_names) if n == "tree_bole"]
+    canopy_idx = [i for i, n in enumerate(fuel_type_names) if n == "tree_canopy"]
+    if bole_idx and canopy_idx and initial_canopy_fuel is not None:
+        canopy_now = fuel[canopy_idx].sum(axis=0)                    # (H, W) current canopy load
+        # Multiplicative form (vs. dividing) avoids a divide-by-zero where no canopy ever grew;
+        # there initial_canopy_fuel == 0 marks the cell occluded, but the bole load is 0 there
+        # too, so zeroing it changes nothing.
+        occluded = canopy_now >= TREE_BOLE_CANOPY_FRACTION * initial_canopy_fuel
+        for b in bole_idx:
+            normalized[b][occluded] = 0.0   # normalized[b] is a view, so this writes back
+
     color_accum = np.tensordot(normalized, type_colors, axes=([0], [0]))  # (H, W, 3) in [0, ~]
     rgb[:] = (np.clip(color_accum, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
 
