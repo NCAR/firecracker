@@ -74,13 +74,16 @@ def _gpu_token(gpu: int) -> str:
     return str(gpu)
 
 
-def build_command(passthrough: list[str], out_dir: Path, seed: int) -> list[str]:
+def build_command(
+    passthrough: list[str], out_dir: Path, seed: int, extra: list[str] | None = None
+) -> list[str]:
     """Assemble a train_autoencoder.py invocation: shared args plus this run's out/seed.
 
-    The launcher owns `--out`, `--seed` and `--device` (always cuda); strip any
-    user-supplied copies so they don't collide on the command line.
+    The launcher owns `--out`, `--seed`, `--device` (always cuda) and, for a W&B run, the
+    per-run `--wandb-group`/`--wandb-name`; strip any user-supplied copies so the launcher's
+    values (passed via `extra`) don't collide on the command line.
     """
-    drop = {"--out", "--seed", "--device"}
+    drop = {"--out", "--seed", "--device", "--wandb-group", "--wandb-name"}
     cmd = [sys.executable, str(_SRC / "train_autoencoder.py")]
     skip_next = False
     for tok in passthrough:
@@ -93,6 +96,7 @@ def build_command(passthrough: list[str], out_dir: Path, seed: int) -> list[str]
             continue
         cmd.append(tok)
     cmd += ["--out", str(out_dir), "--seed", str(seed), "--device", "cuda"]
+    cmd += extra or []
     return cmd
 
 
@@ -196,6 +200,9 @@ def main() -> None:
                         help="root dir; runs land in <out>/run_NN (default: runs/sweep)")
     parser.add_argument("--seed-base", type=int, default=0,
                         help="seed of the first replicate; run i uses seed-base+i (default: 0)")
+    parser.add_argument("--wandb-group", default=None,
+                        help="W&B group shared by every replicate (so they aggregate); only "
+                             "used when `--wandb` is in the forwarded args. Default: <out> name")
     parser.add_argument("--poll", type=float, default=2.0,
                         help="seconds between scheduler polls (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
@@ -221,6 +228,11 @@ def main() -> None:
 
     out_root.mkdir(parents=True, exist_ok=True)
 
+    # When the forwarded args enable W&B, give every replicate a shared group (so W&B can
+    # average the runs) and a distinct, seed-tagged name.
+    wandb_on = "--wandb" in passthrough
+    wandb_group = args.wandb_group or out_root.name
+
     # Build the full work queue: (index, seed, gpu, out_dir, command). Runs are round-robined
     # onto gpus so an uneven replicas count still spreads evenly across the cards.
     queue: list[tuple[int, int, int, Path, list[str]]] = []
@@ -228,7 +240,9 @@ def main() -> None:
         seed = args.seed_base + i
         gpu = i % args.gpus
         run_dir = out_root / f"run_{i:02d}"
-        cmd = build_command(passthrough, run_dir, seed)
+        extra = (["--wandb-group", wandb_group, "--wandb-name", f"run_{i:02d}_seed{seed}"]
+                 if wandb_on else None)
+        cmd = build_command(passthrough, run_dir, seed, extra)
         queue.append((i, seed, gpu, run_dir, cmd))
 
     print(f"sweep: {replicas} replicate(s) across {args.gpus} gpu(s), "

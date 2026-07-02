@@ -3,3 +3,4 @@ torch
 pygame
 gymnasium
 pytest
+wandb

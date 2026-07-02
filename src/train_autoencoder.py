@@ -46,6 +46,11 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, random_split
 
+try:
+    import wandb
+except ImportError:  # optional dependency; only needed when --wandb is passed
+    wandb = None
+
 from autoencoder import ConvAutoencoder
 from config import load_config
 from rollout import BatchedRollout, FireDataset
@@ -214,6 +219,20 @@ def main() -> None:
                         help="print the train loss every N steps (0 to silence)")
     parser.add_argument("--device", help="torch device override, e.g. cuda or cpu")
     parser.add_argument("--seed", type=int, default=0, help="seed for rollout + train/val split")
+    # Weights & Biases (optional). Replicate runs share --wandb-group so W&B can average them.
+    parser.add_argument("--wandb", action="store_true",
+                        help="log config + per-epoch metrics to Weights & Biases")
+    parser.add_argument("--wandb-project", default="firecracker-autoencoder",
+                        help="W&B project name (default: firecracker-autoencoder)")
+    parser.add_argument("--wandb-entity", default=None,
+                        help="W&B entity (team/user); default from your W&B login")
+    parser.add_argument("--wandb-group", default=None,
+                        help="W&B group; shared across replicate runs so they aggregate")
+    parser.add_argument("--wandb-name", default=None,
+                        help="W&B run name (default: derived from the seed)")
+    parser.add_argument("--wandb-mode", default=None,
+                        choices=("online", "offline", "disabled"),
+                        help="W&B mode; default online, or honour $WANDB_MODE if set")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -285,6 +304,33 @@ def main() -> None:
         "latent_dim": model.latent_dim,
     }
 
+    # Optional Weights & Biases run. `run` is None when --wandb is not passed, which turns
+    # every log call below into a no-op. Replicates share --wandb-group so W&B averages them.
+    run = None
+    if args.wandb:
+        if wandb is None:
+            raise SystemExit("--wandb was passed but wandb is not installed (pip install wandb)")
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            group=args.wandb_group,
+            name=args.wandb_name or f"seed{args.seed}",
+            mode=args.wandb_mode,
+            config={
+                **model_config,
+                "seed": args.seed,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "amp": scaler is not None,
+                "val_frac": args.val_frac,
+                "n_train": n_train,
+                "n_val": n_val,
+                "params": n_params,
+            },
+        )
+
     def save_checkpoint(path: Path, epoch: int, val_loss: float) -> None:
         torch.save(
             {
@@ -326,9 +372,22 @@ def main() -> None:
         if args.save_interval and epoch % args.save_interval == 0:
             save_checkpoint(out_dir / f"epoch_{epoch:03d}.pt", epoch, val_loss)
 
+        if run is not None:
+            run.log({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "best_val": best_val,
+                "lr": optimizer.param_groups[0]["lr"],
+                "epoch_seconds": dt,
+            }, step=epoch)
+
     metrics_file.close()
     save_checkpoint(out_dir / "last.pt", args.epochs, best_val)
     print(f"done. best val loss {best_val:.6f}; checkpoints in '{out_dir}/'.")
+    if run is not None:
+        run.summary["best_val"] = best_val
+        run.finish()
 
 
 if __name__ == "__main__":
