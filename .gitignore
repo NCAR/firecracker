@@ -219,3 +219,7 @@ __marimo__/
 
 # Generated map data
 maps/
+
+# Cluster launch/job scripts — kept on the cluster; not portable across clusters
+*.sh
+*.pbs

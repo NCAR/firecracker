@@ -28,6 +28,21 @@ The parent `CUDA_VISIBLE_DEVICES` (e.g. the 4 cards PBS allocated) is honoured: 
 g selects the g-th entry of that list, so this works unchanged inside a PBS job that was
 given a subset of the node's GPUs.
 
+CPU binding (`--bind`, on by default)
+-------------------------------------
+When several lanes share a node they otherwise float across the whole allocation, so the
+kernel scheduler and the RAM loader's prefetch threads contend for the same cores. On a
+dual-socket box that contention is uneven: lanes whose GPU hangs off the smaller NUMA node
+get starved and lag by whole epochs (observed on Casper's V100 nodes, where PBS grants 18
+cores on node 0 but only 14 on node 1). `--bind` pins each lane to a *disjoint*, NUMA-local
+slice of the allocated cores via `numactl --physcpubind ... --membind <node>`, so no lane is
+starved and every lane's host memory stays on its GPU's socket. Each NUMA node's cores are
+split as evenly as possible among the lanes on that node; because the socket core counts can
+differ, lanes on a smaller node get proportionally fewer cores (this cannot be equalised
+without forcing cross-socket memory access, which is the very cost we avoid). Binding is
+skipped with a warning if `numactl` is missing or the topology can't be read; disable it with
+`--no-bind`.
+
 Everything after a `--` is forwarded verbatim to every training run, so the full
 train_autoencoder.py CLI is available:
 
@@ -50,9 +65,11 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import shutil
 import subprocess
 import sys
 import time
+from glob import glob
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -72,6 +89,134 @@ def _gpu_token(gpu: int) -> str:
     if gpu < len(_PARENT_CVD):
         return _PARENT_CVD[gpu]
     return str(gpu)
+
+
+def _parse_cpulist(text: str) -> list[int]:
+    """Expand a Linux cpulist ("0-3,8,10-11") into [0,1,2,3,8,10,11]."""
+    cpus: list[int] = []
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-")
+            cpus.extend(range(int(lo), int(hi) + 1))
+        else:
+            cpus.append(int(part))
+    return cpus
+
+
+def _numa_topology(allocated: set[int]) -> dict[int, list[int]]:
+    """Map each NUMA node to the allocated cpus that live on it.
+
+    Only cpus the job actually holds (its cpuset) are kept, so a node the allocation doesn't
+    reach drops out. Returns {} if the sysfs NUMA layout can't be read.
+    """
+    topo: dict[int, list[int]] = {}
+    for node_dir in sorted(glob("/sys/devices/system/node/node[0-9]*")):
+        try:
+            node = int(os.path.basename(node_dir)[len("node"):])
+            node_cpus = _parse_cpulist(open(os.path.join(node_dir, "cpulist")).read())
+        except (OSError, ValueError):
+            continue
+        here = sorted(c for c in node_cpus if c in allocated)
+        if here:
+            topo[node] = here
+    return topo
+
+
+def _gpu_numa_nodes(tokens: list[str]) -> dict[str, int]:
+    """Map each CUDA_VISIBLE_DEVICES token (physical gpu) to its NUMA node via sysfs.
+
+    Uses `nvidia-smi` to resolve index/uuid -> PCI bus id, then reads the device's
+    `numa_node`. Returns {} if nvidia-smi is unavailable or any node reads as -1/unknown.
+    """
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return {}
+    try:
+        out = subprocess.run(
+            [smi, "--query-gpu=index,uuid,pci.bus_id", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+    by_key: dict[str, str] = {}  # index and uuid both -> bus id
+    for line in out.strip().splitlines():
+        idx, uuid, bus = (x.strip() for x in line.split(","))
+        by_key[idx] = bus
+        by_key[uuid] = bus
+
+    nodes: dict[str, int] = {}
+    for token in tokens:
+        bus = by_key.get(token)
+        if bus is None:
+            return {}
+        # nvidia-smi pads the PCI domain to 8 hex digits ("00000000:89:00.0"); sysfs uses 4.
+        parts = bus.lower().split(":")
+        sysbus = f"{parts[0][-4:]}:{parts[1]}:{parts[2]}"
+        try:
+            node = int(open(f"/sys/bus/pci/devices/{sysbus}/numa_node").read().strip())
+        except (OSError, ValueError):
+            return {}
+        if node < 0:
+            return {}
+        nodes[token] = node
+    return nodes
+
+
+def _even_chunks(items: list[int], n: int) -> list[list[int]]:
+    """Split `items` into `n` contiguous chunks whose sizes differ by at most one."""
+    q, r = divmod(len(items), n)
+    chunks, start = [], 0
+    for k in range(n):
+        size = q + (1 if k < r else 0)
+        chunks.append(items[start:start + size])
+        start += size
+    return chunks
+
+
+def compute_bindings(
+    queue: list[tuple[int, int, int, Path, list[str]]], gpus: int
+) -> dict[int, list[str]]:
+    """Return {lane_index: numactl prefix} pinning each lane to disjoint, NUMA-local cores.
+
+    Lanes are grouped by the NUMA node their gpu sits on; each node's allocated cores are
+    split evenly (see `_even_chunks`) among the lanes sharing it, and each lane gets
+    `numactl --physcpubind=<its cores> --membind=<node>`. Returns {} — meaning "run unbound" —
+    if the cpuset, NUMA topology, or gpu->node map can't be resolved, or if any node has
+    fewer allocated cores than lanes (which would leave a lane with no cpu).
+    """
+    try:
+        allocated = set(os.sched_getaffinity(0))
+    except AttributeError:  # not Linux
+        return {}
+    if not allocated:
+        return {}
+    topo = _numa_topology(allocated)
+    if not topo:
+        return {}
+    gpu_node = _gpu_numa_nodes([_gpu_token(g) for g in range(gpus)])
+    if not gpu_node:
+        return {}
+
+    # Bucket lanes by the NUMA node of their assigned gpu, preserving lane order.
+    lanes_by_node: dict[int, list[int]] = {}
+    for i, _seed, gpu, _out, _cmd in queue:
+        node = gpu_node.get(_gpu_token(gpu))
+        if node is None or node not in topo:
+            return {}
+        lanes_by_node.setdefault(node, []).append(i)
+
+    binds: dict[int, list[str]] = {}
+    for node, lanes in lanes_by_node.items():
+        cores = topo[node]
+        if len(cores) < len(lanes):
+            return {}  # can't give every lane at least one core; bail to unbound
+        for lane, chunk in zip(lanes, _even_chunks(cores, len(lanes))):
+            cpus = ",".join(str(c) for c in chunk)
+            binds[lane] = ["numactl", f"--physcpubind={cpus}", f"--membind={node}"]
+    return binds
 
 
 def build_command(
@@ -205,6 +350,11 @@ def main() -> None:
                              "used when `--wandb` is in the forwarded args. Default: <out> name")
     parser.add_argument("--poll", type=float, default=2.0,
                         help="seconds between scheduler polls (default: 2)")
+    parser.add_argument("--bind", dest="bind", action="store_true", default=True,
+                        help="pin each lane to disjoint, NUMA-local cores via numactl "
+                             "(default: on; auto-skipped if numactl/topology unavailable)")
+    parser.add_argument("--no-bind", dest="bind", action="store_false",
+                        help="disable CPU binding; let lanes float across the allocation")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the per-run commands and exit without launching")
     parser.add_argument("--aggregate-only", action="store_true",
@@ -245,12 +395,27 @@ def main() -> None:
         cmd = build_command(passthrough, run_dir, seed, extra)
         queue.append((i, seed, gpu, run_dir, cmd))
 
+    # Pin each lane to disjoint, NUMA-local cores so lanes sharing a socket don't starve one
+    # another. compute_bindings returns {} (run unbound) when the flag is off or the topology
+    # can't be resolved; each lane's numactl prefix is prepended to its command below.
+    binds: dict[int, list[str]] = {}
+    if args.bind:
+        if shutil.which("numactl") is None:
+            print("sweep: --bind requested but numactl not found; running unbound.")
+        else:
+            binds = compute_bindings(queue, args.gpus)
+            if not binds:
+                print("sweep: --bind requested but CPU/NUMA topology unresolved; "
+                      "running unbound.")
+
     print(f"sweep: {replicas} replicate(s) across {args.gpus} gpu(s), "
-          f"{args.per_gpu} per gpu; out '{out_root}/'")
+          f"{args.per_gpu} per gpu; out '{out_root}/'"
+          + (f"; cpu-bound to {len(binds)} numactl slice(s)" if binds else "; unbound"))
     if args.dry_run:
         for i, seed, gpu, run_dir, cmd in queue:
+            full = binds.get(i, []) + cmd
             print(f"  run_{i:02d} (seed {seed}, gpu {gpu} -> CUDA_VISIBLE_DEVICES="
-                  f"{_gpu_token(gpu)}): {' '.join(cmd)}")
+                  f"{_gpu_token(gpu)}): {' '.join(full)}")
         return
 
     pending = list(queue)
@@ -264,9 +429,13 @@ def main() -> None:
         log = (run_dir / "train.log").open("w")
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = _gpu_token(gpu)
+        prefix = binds.get(i, [])
+        full = prefix + cmd
+        bind_note = f" [{' '.join(prefix)}]" if prefix else ""
         print(f"  start run_{i:02d} (seed {seed}) on gpu {gpu} "
-              f"[CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}] -> {run_dir}/train.log")
-        proc = subprocess.Popen(cmd, cwd=_ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
+              f"[CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}]{bind_note} "
+              f"-> {run_dir}/train.log")
+        proc = subprocess.Popen(full, cwd=_ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
         return {"proc": proc, "log": log, "run": run}
 
     while pending or running:
