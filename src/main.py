@@ -153,6 +153,88 @@ def run_headless(config: dict, map_name: str | None = None, maps_dir: str | None
     env.close()
 
 
+def run_comparison(
+    config: dict,
+    model_spec: str,
+    map_name: str | None = None,
+    maps_dir: str | None = None,
+) -> None:
+    """Run the world alongside a trained autoencoder's reconstruction of it, in a three-panel
+    window (physics | reconstruction | per-cell error). The env is driven in rgb_array mode so the
+    ComparisonViewer owns the single composited window; the run loop mirrors run() otherwise.
+    """
+    # Imported lazily so the normal viewer doesn't pull in torch/the model stack unless --model.
+    from model_viewer import ComparisonViewer, load_model, resolve_model_path
+
+    env = FirecrackerEnv(
+        config=config, render_mode="rgb_array", map_name=map_name, maps_dir=maps_dir
+    )
+
+    model_path = resolve_model_path(model_spec)
+    model, model_config = load_model(model_path, env._sim.device)
+    # The model reconstructs a fixed observation shape; refuse a config whose grid or fuel-derived
+    # channel count doesn't match what it was trained on rather than crash inside the forward pass.
+    if model_config["grid_size"] != env.grid_size:
+        raise SystemExit(
+            f"model was trained on grid_size={model_config['grid_size']} but this config uses "
+            f"{env.grid_size}; pass a matching --config."
+        )
+    if model_config["in_channels"] != len(env.obs_channels):
+        raise SystemExit(
+            f"model expects {model_config['in_channels']} observation channels but this config's "
+            f"fuel types give {len(env.obs_channels)}; the fuel_types must match the trained model."
+        )
+    print(f"Loaded model: {model_path}  (arch={model_config.get('arch', 'shuffle')}, "
+          f"channels={tuple(model_config['channels'])}, latent_dim={model_config['latent_dim']}, "
+          f"standardized={'channel_mean' in model_config})")
+
+    viewer = ComparisonViewer(env, model, model_config)
+
+    step_interval = 1.0 / env._sim.simulation_steps_per_second
+
+    print_config_info(env)
+
+    log_episodes = bool((config or {}).get("environment", {}).get("print_episode_info", True))
+
+    episode = 0
+    obs, info = env.reset()
+    episode += 1
+    if log_episodes:
+        print_episode_info(info, f"Episode {episode} — start")
+
+    last_step_time = time.monotonic()
+
+    while env._running:
+        now = time.monotonic()
+
+        if env._step_once:
+            env._step_once = False
+            obs, reward, terminated, truncated, info = env.step(None)
+            last_step_time = now
+            if terminated or truncated:
+                if log_episodes:
+                    print_episode_info(info, f"Episode {episode} — end")
+                break
+
+        if not env._paused and now - last_step_time >= step_interval:
+            obs, reward, terminated, truncated, info = env.step(None)
+            last_step_time = now
+            if terminated or truncated:
+                if log_episodes:
+                    print_episode_info(info, f"Episode {episode} — end")
+                break
+
+        if env._reset_requested:
+            obs, info = env.reset()
+            episode += 1
+            last_step_time = time.monotonic()
+
+        viewer.render()
+
+    viewer.close()
+    env.close()
+
+
 def run(config: dict, map_name: str | None = None, maps_dir: str | None = None) -> None:
     env = FirecrackerEnv(
         config=config, render_mode="human", map_name=map_name, maps_dir=maps_dir
@@ -236,6 +318,20 @@ if __name__ == "__main__":
         "--headless", action="store_true",
         help="run with no window and no real-time throttle (fastest; runs to max_steps)",
     )
+    parser.add_argument(
+        "--model", metavar="PATH",
+        help="load a trained autoencoder checkpoint (a .pt file, a directory to take best.pt from, "
+             "or a name resolved under models/) and show its reconstruction beside the physics view",
+    )
     args = parser.parse_args()
-    runner = run_headless if args.headless else run
-    runner(load_config(args.config), map_name=args.map, maps_dir=args.maps_dir)
+
+    if args.model and args.headless:
+        parser.error("--model needs a window to draw into; it can't be combined with --headless.")
+
+    config = load_config(args.config)
+    if args.model:
+        run_comparison(config, args.model, map_name=args.map, maps_dir=args.maps_dir)
+    elif args.headless:
+        run_headless(config, map_name=args.map, maps_dir=args.maps_dir)
+    else:
+        run(config, map_name=args.map, maps_dir=args.maps_dir)
