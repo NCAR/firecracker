@@ -43,6 +43,7 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, random_split
@@ -54,6 +55,7 @@ except ImportError:  # optional dependency; only needed when --wandb is passed
 
 from autoencoder import ConvAutoencoder
 from config import load_config
+from ram_loader import RamBatchLoader
 from rollout import BatchedRollout, FireDataset
 from strided_autoencoder import StridedConvAutoencoder
 
@@ -246,7 +248,12 @@ def main() -> None:
                              "0.1-0.5 is where robustness actually engages (default: 1.0)")
     parser.add_argument("--val-frac", type=float, default=0.05,
                         help="fraction of samples held out for validation")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader worker processes (only used by --loader dataloader)")
+    parser.add_argument("--loader", choices=("ram", "dataloader"), default="ram",
+                        help="'ram' (default): thread-prefetched in-RAM batch loader, no worker "
+                             "processes (safe under heavy packing, no shared-memory crash). "
+                             "'dataloader': stock torch DataLoader with --num-workers workers")
     parser.add_argument("--amp", action="store_true",
                         help="use mixed-precision autocast + GradScaler (CUDA only)")
     # Model
@@ -307,24 +314,37 @@ def main() -> None:
     n_total = len(dataset)
     n_val = max(1, int(round(n_total * args.val_frac)))
     n_train = n_total - n_val
-    gen = torch.Generator().manual_seed(args.seed)
-    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=gen)
     print(
         f"dataset: {n_total} samples ({in_channels}x{grid_size}x{grid_size}) "
-        f"-> {n_train} train / {n_val} val"
+        f"-> {n_train} train / {n_val} val  [loader={args.loader}]"
     )
 
     pin = device.type == "cuda"
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=pin, drop_last=True,
-        persistent_workers=args.num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin,
-        persistent_workers=args.num_workers > 0,
-    )
+    if args.loader == "ram":
+        # Seeded index split (mirrors random_split's role) + thread-prefetched batch loaders.
+        perm = np.random.default_rng(args.seed).permutation(n_total)
+        val_idx, train_idx = perm[:n_val], perm[n_val:]
+        train_loader = RamBatchLoader(
+            dataset, train_idx, args.batch_size, shuffle=True, seed=args.seed,
+            drop_last=True, pin_memory=pin,
+        )
+        val_loader = RamBatchLoader(
+            dataset, val_idx, args.batch_size, shuffle=False, seed=args.seed,
+            drop_last=False, pin_memory=pin,
+        )
+    else:
+        gen = torch.Generator().manual_seed(args.seed)
+        train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=gen)
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=pin, drop_last=True,
+            persistent_workers=args.num_workers > 0,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            persistent_workers=args.num_workers > 0,
+        )
 
     # 2. Model / optimiser ----------------------------------------------------
     # Pass only the settings that were resolved; None lets the constructor default apply.

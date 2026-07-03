@@ -499,6 +499,23 @@ class FireDataset(Dataset):
         # memory — cheap (one C x N x N slice) and safe for in-place transforms downstream.
         return torch.from_numpy(np.array(self._shard(shard)[offset]))
 
+    def get_batch(self, indices) -> torch.Tensor:
+        """Fetch many samples at once as a single (B, C, N, N) tensor, in the given order.
+
+        Groups the requested global indices by shard and reads each shard's samples in one
+        memmap fancy-index into a preallocated buffer — far less per-sample Python/allocation
+        overhead than B separate __getitem__ calls plus a collate. Used by RamBatchLoader to
+        serve whole batches without DataLoader worker processes (and their shared memory).
+        """
+        indices = np.asarray(indices, dtype=np.int64)
+        shard_ids, offsets = np.divmod(indices, self.per_shard)
+        ref = self._shard(int(shard_ids[0]))
+        out = np.empty((indices.shape[0], *ref.shape[1:]), dtype=ref.dtype)
+        for s in np.unique(shard_ids):
+            mask = shard_ids == s
+            out[mask] = self._shard(int(s))[offsets[mask]]
+        return torch.from_numpy(out)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a static sharded Firecracker dataset for pretraining")
