@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import time
 from pathlib import Path
 
@@ -128,10 +129,21 @@ def run_epoch(
     log_interval: int,
     epoch: int,
     tag: str,
-) -> float:
+    max_grad_norm: float = 0.0,
+    extra_loss_fn: nn.Module | None = None,
+) -> tuple[float, float, float, float]:
     """Run one pass over `loader`. Trains when `optimizer` is given, else evaluates.
 
-    Returns the sample-weighted mean reconstruction loss over the epoch.
+    When training with `max_grad_norm > 0`, gradients are clipped to that global L2 norm
+    (after unscaling under AMP). The clipper returns the *pre-clip* total norm, which we
+    track to expose gradient spikes.
+
+    `extra_loss_fn`, if given, is evaluated (no grad) alongside the primary loss so a common
+    yardstick (e.g. reconstruction MSE) can be reported regardless of the training `loss_fn`.
+
+    Returns `(mean_loss, grad_norm_mean, grad_norm_max, extra_mean)`; grad-norm stats are the
+    pre-clip totals over the epoch (0.0 for an eval pass), and `extra_mean` is NaN when
+    `extra_loss_fn` is None.
     """
     training = optimizer is not None
     model.train(training)
@@ -139,6 +151,10 @@ def run_epoch(
 
     total_loss = 0.0
     total_seen = 0
+    extra_sum = 0.0
+    gnorm_sum = 0.0
+    gnorm_max = 0.0
+    gnorm_steps = 0
     grad_ctx = torch.enable_grad() if training else torch.no_grad()
     with grad_ctx:
         for step, batch in enumerate(loader):
@@ -150,18 +166,36 @@ def run_epoch(
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 x_hat, _ = model(x)
                 loss = loss_fn(x_hat, x)
+                if extra_loss_fn is not None:
+                    extra = extra_loss_fn(x_hat, x)
 
             if training:
                 if use_amp:
                     scaler.scale(loss).backward()
+                    # Unscale before clipping so the norm/threshold are in real units.
+                    if max_grad_norm > 0:
+                        scaler.unscale_(optimizer)
+                        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        gnorm_val = float(gnorm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
+                    if max_grad_norm > 0:
+                        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        gnorm_val = float(gnorm)
                     optimizer.step()
+                # Skip non-finite norms: under AMP a scaled-gradient overflow yields an inf/nan
+                # norm and the scaler skips that step, so it isn't a real (taken) update.
+                if max_grad_norm > 0 and math.isfinite(gnorm_val):
+                    gnorm_sum += gnorm_val
+                    gnorm_max = max(gnorm_max, gnorm_val)
+                    gnorm_steps += 1
 
             n = x.shape[0]
             total_loss += loss.item() * n
+            if extra_loss_fn is not None:
+                extra_sum += extra.item() * n
             total_seen += n
             if training and log_interval and step % log_interval == 0:
                 print(
@@ -169,7 +203,10 @@ def run_epoch(
                     f"loss {loss.item():.6f}"
                 )
 
-    return total_loss / max(total_seen, 1)
+    mean_loss = total_loss / max(total_seen, 1)
+    gnorm_mean = gnorm_sum / max(gnorm_steps, 1)
+    extra_mean = extra_sum / max(total_seen, 1) if extra_loss_fn is not None else float("nan")
+    return mean_loss, gnorm_mean, gnorm_max, extra_mean
 
 
 def main() -> None:
@@ -192,8 +229,21 @@ def main() -> None:
     # Optimisation
     parser.add_argument("--epochs", type=int, default=50, help="training epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="minibatch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="AdamW learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay")
+    parser.add_argument("--adam-eps", type=float, default=1e-3,
+                        help="AdamW epsilon; a larger floor on the update denominator guards "
+                             "against oversized steps when a param's second moment collapses "
+                             "(sparse/intermittent gradients)")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                        help="clip gradients to this global L2 norm each step (0 disables)")
+    parser.add_argument("--loss", choices=("mse", "huber"), default="mse",
+                        help="reconstruction loss: 'mse' (default) or 'huber' (robust, bounds "
+                             "the gradient of large residuals)")
+    parser.add_argument("--huber-delta", type=float, default=1.0,
+                        help="Huber transition point (only for --loss huber); residuals below it "
+                             "are quadratic, above it linear. For this data's ~[-1.2,1.2] scale, "
+                             "0.1-0.5 is where robustness actually engages (default: 1.0)")
     parser.add_argument("--val-frac", type=float, default=0.05,
                         help="fraction of samples held out for validation")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes")
@@ -289,8 +339,13 @@ def main() -> None:
     print(f"model: arch={arch} channels={tuple(model.channels)} conv_latent={conv_shape} "
           f"latent_dim={model.latent_dim} params={n_params:,}")
 
-    loss_fn = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_fn = nn.HuberLoss(delta=args.huber_delta) if args.loss == "huber" else nn.MSELoss()
+    # A loss-independent yardstick: always report validation reconstruction MSE so runs trained
+    # with different --loss (mse vs huber) are directly comparable. Redundant with val_loss when
+    # --loss mse, but cheap (val is a small held-out split, evaluated without gradients).
+    val_mse_fn = nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay, eps=args.adam_eps)
     scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
 
     out_dir = Path(args.out)
@@ -323,6 +378,10 @@ def main() -> None:
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
+                "adam_eps": args.adam_eps,
+                "max_grad_norm": args.max_grad_norm,
+                "loss": args.loss,
+                "huber_delta": args.huber_delta if args.loss == "huber" else None,
                 "amp": scaler is not None,
                 "val_frac": args.val_frac,
                 "n_train": n_train,
@@ -348,21 +407,30 @@ def main() -> None:
     metrics_path = out_dir / "metrics.csv"
     metrics_file = metrics_path.open("w", newline="")
     metrics_writer = csv.writer(metrics_file)
-    metrics_writer.writerow(["epoch", "train_loss", "val_loss", "seconds"])
+    metrics_writer.writerow(
+        ["epoch", "train_loss", "val_loss", "val_mse",
+         "grad_norm_mean", "grad_norm_max", "seconds"]
+    )
 
     # 3. Train ----------------------------------------------------------------
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss = run_epoch(model, train_loader, device, loss_fn, optimizer, scaler,
-                               args.log_interval, epoch, "train")
-        val_loss = run_epoch(model, val_loader, device, loss_fn, None, None, 0, epoch, "val")
+        train_loss, gnorm_mean, gnorm_max, _ = run_epoch(
+            model, train_loader, device, loss_fn, optimizer, scaler,
+            args.log_interval, epoch, "train", max_grad_norm=args.max_grad_norm,
+        )
+        val_loss, _, _, val_mse = run_epoch(
+            model, val_loader, device, loss_fn, None, None, 0, epoch, "val",
+            extra_loss_fn=val_mse_fn,
+        )
         dt = time.time() - t0
         print(
-            f"epoch {epoch:3d}/{args.epochs}  train {train_loss:.6f}  "
-            f"val {val_loss:.6f}  ({dt:.1f}s)"
+            f"epoch {epoch:3d}/{args.epochs}  train {train_loss:.6f}  val {val_loss:.6f}  "
+            f"val_mse {val_mse:.6f}  grad_norm(mean {gnorm_mean:.3f}, max {gnorm_max:.3f})  ({dt:.1f}s)"
         )
-        metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{dt:.2f}"])
+        metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_mse:.6f}",
+                                 f"{gnorm_mean:.6f}", f"{gnorm_max:.6f}", f"{dt:.2f}"])
         metrics_file.flush()
 
         if val_loss < best_val:
@@ -377,7 +445,10 @@ def main() -> None:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "val_mse": val_mse,
                 "best_val": best_val,
+                "grad_norm_mean": gnorm_mean,
+                "grad_norm_max": gnorm_max,
                 "lr": optimizer.param_groups[0]["lr"],
                 "epoch_seconds": dt,
             }, step=epoch)
