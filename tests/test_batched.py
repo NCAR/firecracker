@@ -20,8 +20,16 @@ from conftest import to_numpy
 from simulation import Simulation, SimState, obs_channel_names
 from map_loader import save_map
 from config import boundary_pad
-from rollout import BatchedRollout, FireDataset
-from scenarios import hot_blob, mass_gradient, off_equilibrium, uniform, build_map, make_config, pad_map
+from rollout import (
+    BatchedRollout,
+    FireDataset,
+    bake_normalization,
+    compute_channel_stats,
+    ensure_channel_stats,
+)
+from scenarios import (
+    hot_blob, mass_gradient, off_equilibrium, uniform, build_map, make_config, pad_map, ramp_terrain,
+)
 
 
 def _batched_state(sim: Simulation, maps) -> SimState:
@@ -248,6 +256,106 @@ def test_firedataset_rejects_incompatible_sources(tmp_path):
         roll.build_dataset(parent / f"g{grid}", rounds=1)
     with pytest.raises(ValueError):
         FireDataset(parent)
+
+
+def _build_small_dataset(tmp_path, *, nested=False):
+    """Build a tiny multi-shard dataset (float32 for tight stats) and return its root dir."""
+    grid = 16
+    config = make_config(grid_size=grid)
+    maps_dir = tmp_path / "maps"
+    maps_dir.mkdir()
+    # Ramped terrain so the terrain channel isn't spatially constant -- every channel then has
+    # real variance, so standardisation drives each to a genuine unit std (not the constant-channel
+    # no-op guard).
+    terrain = (ramp_terrain(grid) * 300.0).astype(np.float32)
+    save_map(maps_dir / "m.npz", pad_map(build_map(grid_size=grid, terrain=terrain),
+                                          boundary_pad(config)))
+
+    def build(out, seed):
+        BatchedRollout(
+            config, maps_dir=str(maps_dir), grid_size=grid, num_envs=4, steps=8, stride=2,
+            buffer_device="cpu", buffer_dtype="float32", spawn_fire=True, seed=seed,
+        ).build_dataset(out, rounds=3)
+
+    root = tmp_path / "data"
+    if nested:
+        for w in range(3):
+            build(root / f"w{w}", seed=w)
+    else:
+        build(root, seed=0)
+    return root
+
+
+def test_bake_normalization_zero_mean_unit_std(tmp_path):
+    """bake_normalization rewrites the shards so FireDataset (raw read) yields ~N(0,1) per channel."""
+    root = _build_small_dataset(tmp_path, nested=True)
+    n_ch = int(FireDataset(root).meta["num_channels"])
+    assert not FireDataset(root).is_normalized                # raw dataset, not yet flagged
+
+    summary = bake_normalization(root, max_samples=None, workers=3, verbose=False)  # parallel pool
+    assert summary["baked"] == 3 and (root / "stats.json").is_file()
+
+    ds = FireDataset(root)                                    # served values are already standardized
+    assert ds.is_normalized
+    batch = ds.get_batch(np.arange(len(ds)))                 # (N, C, H, W), no read-time transform
+    per_ch = batch.to(torch.float64).permute(1, 0, 2, 3).reshape(n_ch, -1)
+    torch.testing.assert_close(per_ch.mean(dim=1), torch.zeros(n_ch, dtype=torch.float64),
+                               atol=1e-4, rtol=0)
+    torch.testing.assert_close(per_ch.std(dim=1, unbiased=False),
+                               torch.ones(n_ch, dtype=torch.float64), atol=1e-4, rtol=0)
+    # __getitem__ and get_batch read the same baked values.
+    torch.testing.assert_close(ds[0], batch[0])
+
+
+def test_bake_normalization_idempotent(tmp_path):
+    """Re-baking an already-normalized dataset is a no-op (doesn't double-scale)."""
+    root = _build_small_dataset(tmp_path)
+    bake_normalization(root, max_samples=None, verbose=False)
+    before = FireDataset(root).get_batch(np.arange(8)).clone()
+    summary = bake_normalization(root, max_samples=None, verbose=False)   # second pass
+    assert summary["baked"] == 0 and summary["skipped"] == 1
+    torch.testing.assert_close(FireDataset(root).get_batch(np.arange(8)), before)
+
+
+def test_channel_stats_match_manual_over_union(tmp_path):
+    """Stats over a nested (multi-worker) dataset match a direct mean/std of the raw union."""
+    root = _build_small_dataset(tmp_path, nested=True)
+    ds = FireDataset(root)
+    mean, std = compute_channel_stats(ds, max_samples=None)
+
+    allx = ds.get_batch(np.arange(len(ds))).to(torch.float64)      # raw, un-normalized
+    ref_mean = allx.mean(dim=(0, 2, 3))
+    ref_std = allx.std(dim=(0, 2, 3), unbiased=False)
+    np.testing.assert_allclose(mean, ref_mean.numpy(), atol=1e-6)
+    np.testing.assert_allclose(std, ref_std.numpy(), atol=1e-6)
+
+
+def test_channel_stats_sampling_approximates_full(tmp_path):
+    """A capped random-sample estimate is close to the full-set stats and records its provenance."""
+    root = _build_small_dataset(tmp_path, nested=True)   # 3 workers x 3 shards x 8 = 72 samples
+    ds = FireDataset(root)
+    n = len(ds)
+
+    full_mean, full_std = compute_channel_stats(ds, max_samples=None)
+    samp_mean, samp_std = compute_channel_stats(ds, max_samples=n // 2, seed=0)
+    # Subset estimate tracks the full one (loose tolerance -- it's a random half of a tiny set).
+    np.testing.assert_allclose(samp_mean, full_mean, atol=0.2)
+    np.testing.assert_allclose(samp_std, full_std, atol=0.2)
+
+    # Budget is met by reading whole shards, so the recorded count rounds up to a shard multiple.
+    stats = ensure_channel_stats(root, max_samples=n // 2, verbose=False)
+    assert stats["total_samples"] == n
+    assert stats["n_samples"] % ds.per_shard == 0
+    assert n // 2 <= stats["n_samples"] < n
+
+
+def test_unbaked_dataset_serves_raw(tmp_path):
+    """An un-baked dataset is not flagged normalized and serves the raw shard values verbatim."""
+    root = _build_small_dataset(tmp_path)
+    ds = FireDataset(root)
+    assert not ds.is_normalized
+    raw = np.load(sorted(root.glob("shard_*.npy"))[0])
+    np.testing.assert_allclose(to_numpy(ds[0]), raw[0])
 
 
 def test_build_dataset_refuses_overwrite(tmp_path):

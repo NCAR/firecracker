@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import time
 from pathlib import Path
@@ -73,6 +74,20 @@ def _resolve_device(name: str | None) -> torch.device:
     if name:
         return torch.device(name)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _load_channel_stats(data_dir: str) -> dict | None:
+    """The per-channel mean/std baked into this dataset (its `stats.json`), or None if absent.
+
+    Recorded in the checkpoint so an inference/eval script can standardise raw inputs the same way
+    the training shards were standardised (and de-normalize reconstructions)."""
+    path = Path(data_dir) / "stats.json"
+    if not path.is_file():
+        return None
+    stats = json.loads(path.read_text())
+    if "channel_mean" not in stats or "channel_std" not in stats:
+        return None
+    return stats
 
 
 def _parse_channels(spec: str) -> tuple[int, ...]:
@@ -244,8 +259,9 @@ def main() -> None:
                              "the gradient of large residuals)")
     parser.add_argument("--huber-delta", type=float, default=1.0,
                         help="Huber transition point (only for --loss huber); residuals below it "
-                             "are quadratic, above it linear. For this data's ~[-1.2,1.2] scale, "
-                             "0.1-0.5 is where robustness actually engages (default: 1.0)")
+                             "are quadratic, above it linear. With per-channel standardisation the "
+                             "inputs are ~unit-variance (roughly [-3,3]), so 0.5-1.0 is where "
+                             "robustness starts to engage (default: 1.0)")
     parser.add_argument("--val-frac", type=float, default=0.05,
                         help="fraction of samples held out for validation")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -309,6 +325,15 @@ def main() -> None:
     # 1. Dataset --------------------------------------------------------------
     build_dataset_if_needed(args, config)
     dataset = FireDataset(args.data)
+    # Normalization is baked into the shards offline (tools/normalize_dataset.py) so the training
+    # hot path stays a plain memmap copy. Warn if the data hasn't been standardized; the applied
+    # per-channel mean/std travel in <data>/stats.json (recorded in the checkpoint for inference).
+    channel_stats = _load_channel_stats(args.data)
+    if dataset.is_normalized:
+        print(f"input: per-channel zero-mean/unit-std baked into shards ('{args.data}')")
+    else:
+        print(f"WARNING: dataset at '{args.data}' is not marked normalized; train on standardized "
+              f"data by baking it first: python tools/normalize_dataset.py --data {args.data}")
     grid_size = int(dataset.meta["grid_size"])
     in_channels = int(dataset.meta["num_channels"])
     n_total = len(dataset)
@@ -378,6 +403,11 @@ def main() -> None:
         "channels": list(model.channels),
         "latent_dim": model.latent_dim,
     }
+    # Carry the input standardisation so inference/eval can reproduce the exact channel scaling
+    # the model was trained under (the transform baked into the shards; absent if none was found).
+    if channel_stats is not None:
+        model_config["channel_mean"] = channel_stats["channel_mean"]
+        model_config["channel_std"] = channel_stats["channel_std"]
 
     # Optional Weights & Biases run. `run` is None when --wandb is not passed, which turns
     # every log call below into a no-op. Replicates share --wandb-group so W&B averages them.

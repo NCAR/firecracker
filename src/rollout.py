@@ -59,6 +59,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +76,9 @@ DEFAULT_GRID_SIZE = 256
 # Filenames used by build_dataset / FireDataset for an on-disk sharded dataset.
 _META_NAME = "meta.json"
 _SHARD_GLOB = "shard_*.npy"
+# Per-channel standardisation stats (mean/std) sit at the dataset root, next to meta.json for a
+# flat dataset or above the per-worker subdirs for a nested one — see compute_channel_stats.
+_STATS_NAME = "stats.json"
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -446,6 +451,12 @@ class FireDataset(Dataset):
     worker after fork), so the OS pages samples in on demand and the dataset can far exceed
     RAM. Each item is one C x N x N observation. Samples are stored grouped by world within a
     shard (and by source across subdirs), so shuffle in the DataLoader for I.I.D. minibatches.
+
+    Standardisation is *baked into the shards* offline (tools/normalize_dataset.py rewrites each
+    sample to the per-channel z-score `(x - mean) / std`), not applied on read: every shard is read
+    hundreds of times over a training run, so paying the scale once at prep time keeps the hot path
+    a plain memmap copy. A normalised dataset carries `"normalized": true` in its meta and the
+    applied mean/std in a root `stats.json`; `FireDataset.is_normalized` reports the flag.
     """
 
     def __init__(self, root: str | Path):
@@ -470,6 +481,7 @@ class FireDataset(Dataset):
         ref = {k: self.meta.get(k) for k in keys}
 
         self.shard_paths: list[Path] = []
+        self._all_normalized = True                 # true only if every source is flagged normalised
         for d in source_dirs:
             meta = json.loads((d / _META_NAME).read_text())
             mism = {k: meta.get(k) for k in keys if meta.get(k) != ref[k]}
@@ -478,10 +490,16 @@ class FireDataset(Dataset):
                     f"Dataset source {d} is incompatible with {source_dirs[0]}: "
                     f"{mism} != {{{', '.join(f'{k}: {ref[k]!r}' for k in mism)}}}."
                 )
+            self._all_normalized &= bool(meta.get("normalized", False))
             self.shard_paths.extend(sorted(d.glob(meta.get("shard_glob", _SHARD_GLOB))))
         if not self.shard_paths:
             raise FileNotFoundError(f"No shards found under {self.root}.")
         self._mmaps: list[np.ndarray | None] = [None] * len(self.shard_paths)
+
+    @property
+    def is_normalized(self) -> bool:
+        """Whether the on-disk shards have been standardised (every source meta flags it)."""
+        return self._all_normalized
 
     def __len__(self) -> int:
         return self.per_shard * len(self.shard_paths)
@@ -507,6 +525,14 @@ class FireDataset(Dataset):
         overhead than B separate __getitem__ calls plus a collate. Used by RamBatchLoader to
         serve whole batches without DataLoader worker processes (and their shared memory).
         """
+        return torch.from_numpy(self._raw_batch(indices))
+
+    def _raw_batch(self, indices) -> np.ndarray:
+        """Grouped-by-shard fancy read of the requested samples as a (B, C, N, N) numpy array.
+
+        Groups the global indices by shard so each shard is read in a single memmap fancy-index
+        into a preallocated buffer. Shared by get_batch and compute_channel_stats.
+        """
         indices = np.asarray(indices, dtype=np.int64)
         shard_ids, offsets = np.divmod(indices, self.per_shard)
         ref = self._shard(int(shard_ids[0]))
@@ -514,7 +540,259 @@ class FireDataset(Dataset):
         for s in np.unique(shard_ids):
             mask = shard_ids == s
             out[mask] = self._shard(int(s))[offsets[mask]]
-        return torch.from_numpy(out)
+        return out
+
+
+def plan_stat_shards(dataset: FireDataset, max_samples: int | None, seed: int) -> np.ndarray:
+    """Which shard indices compute_channel_stats will read for a given `max_samples` budget.
+
+    Sampling is done at *shard* granularity: reading a few whole shards sequentially is far cheaper
+    on a capacity-tuned parallel filesystem than scattering `max_samples` single-sample reads
+    across all shards (random 1 MB reads over hundreds of GB). Each shard already spans many worlds
+    x timesteps, so a random subset of shards covers the value distribution well. Picks the fewest
+    whole shards that meet the budget; returns all shards when the budget covers the whole set.
+    """
+    n_shards = len(dataset.shard_paths)
+    if max_samples is None or n_shards * dataset.per_shard <= max_samples:
+        return np.arange(n_shards)
+    k = min(n_shards, max(1, -(-max_samples // dataset.per_shard)))   # ceil(max_samples/per_shard)
+    return np.sort(np.random.default_rng(seed).choice(n_shards, size=k, replace=False))
+
+
+def compute_channel_stats(
+    dataset: FireDataset, *, max_samples: int | None = 10_000, seed: int = 0, chunk: int = 256
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate per-channel mean and std for zero-mean/unit-std scaling of `dataset`.
+
+    The full set is far too large to read in its entirety (hundreds of GB), so — unless it fits the
+    `max_samples` budget — stats are estimated from a random subset of whole shards (see
+    plan_stat_shards) read sequentially. Each channel is reduced over the read observations and both
+    spatial axes, so with a 256x256 grid even ~10k samples give each channel ~6.5e8 values: the
+    mean/std estimates are tight to several significant figures, which is all standardisation needs.
+    Pass `max_samples=None` to read every shard.
+
+    Raw (pre-standardisation) values are accumulated in float64 in `chunk`-sample slices so no large
+    float64 buffer is materialised. std uses the population (biased) estimator; a channel whose read
+    values never vary gets std=1 so standardising it is a safe no-op rather than a divide-by-zero.
+
+    Returns `(mean, std)`, each a float64 array of length num_channels.
+    """
+    n_ch = int(dataset.meta["num_channels"])
+    if len(dataset) == 0:
+        raise ValueError(f"Dataset at {dataset.root} is empty; cannot compute channel stats.")
+    shard_sel = plan_stat_shards(dataset, max_samples, seed)
+
+    count = 0                                    # total scalars seen per channel (samples * H * W)
+    s1 = np.zeros(n_ch, dtype=np.float64)         # sum per channel
+    s2 = np.zeros(n_ch, dtype=np.float64)         # sum of squares per channel
+    for si in shard_sel:
+        shard = dataset._shard(int(si))           # (per_shard, C, H, W) memmap
+        m, _, h, w = shard.shape
+        for start in range(0, m, chunk):          # sequential slices of one shard
+            arr = np.asarray(shard[start:start + chunk], dtype=np.float64)
+            s1 += arr.sum(axis=(0, 2, 3))
+            s2 += (arr * arr).sum(axis=(0, 2, 3))
+            count += arr.shape[0] * h * w
+
+    mean = s1 / count
+    var = np.maximum(s2 / count - mean * mean, 0.0)   # clamp tiny negatives from rounding
+    std = np.sqrt(var)
+    std[std < 1e-8] = 1.0                              # constant channel -> unit scale (no-op)
+    return mean, std
+
+
+def write_channel_stats(
+    root: str | Path, mean: np.ndarray, std: np.ndarray, *, channels: list[str] | None = None,
+    n_samples: int | None = None, total_samples: int | None = None,
+) -> dict:
+    """Write per-channel mean/std to `root`/stats.json (the transform baked in by normalize_dataset).
+
+    `n_samples`/`total_samples` (when given) record how many observations the estimate drew and
+    how many the dataset holds, for provenance. Returns the stats dict that was written.
+    """
+    stats = {
+        "channel_mean": [float(x) for x in mean],
+        "channel_std":  [float(x) for x in std],
+    }
+    if channels is not None:
+        stats["channels"] = list(channels)
+    if n_samples is not None:
+        stats["n_samples"] = int(n_samples)
+    if total_samples is not None:
+        stats["total_samples"] = int(total_samples)
+    # Atomic publish: write to a temp file then rename, so a concurrent reader (e.g. a sibling
+    # trainer in a replicate sweep) sees either no file or the complete one, never a torn write.
+    root = Path(root)
+    tmp = root / f".{_STATS_NAME}.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps(stats, indent=2))
+    os.replace(tmp, root / _STATS_NAME)
+    return stats
+
+
+def ensure_channel_stats(
+    root: str | Path, *, recompute: bool = False, max_samples: int | None = 10_000,
+    seed: int = 0, chunk: int = 256, verbose: bool = True,
+) -> dict:
+    """Compute + write `root`/stats.json if missing (or `recompute`), else load the existing one.
+
+    Idempotent: the first call over a freshly built dataset estimates the stats from up to
+    `max_samples` random observations (see compute_channel_stats) and caches them; later calls just
+    read the file back. Returns the stats dict.
+    """
+    stats_path = Path(root) / _STATS_NAME
+    if stats_path.is_file() and not recompute:
+        return json.loads(stats_path.read_text())
+    ds = FireDataset(root)                                 # read raw values to measure them
+    n = len(ds)
+    shard_sel = plan_stat_shards(ds, max_samples, seed)
+    n_used = int(len(shard_sel) * ds.per_shard)
+    if verbose:
+        scope = (f"all {n}" if n_used == n
+                 else f"{n_used} ({len(shard_sel)} random shards) of {n}")
+        print(f"estimating channel stats from {scope} samples in '{root}' ...")
+    mean, std = compute_channel_stats(ds, max_samples=max_samples, seed=seed, chunk=chunk)
+    stats = write_channel_stats(
+        root, mean, std, channels=list(ds.meta.get("channels", [])),
+        n_samples=n_used, total_samples=n,
+    )
+    if verbose:
+        names = stats.get("channels") or [f"ch{i}" for i in range(len(mean))]
+        for name, mu, sd in zip(names, mean, std):
+            print(f"  {name:<18} mean {mu:+.4g}  std {sd:.4g}")
+    return stats
+
+
+def _dataset_sources(root: Path) -> list[Path]:
+    """The source dirs of a dataset: `root` itself if flat, else its per-worker subdirs."""
+    if (root / _META_NAME).is_file():
+        return [root]
+    return [p.parent for p in sorted(root.glob(f"*/{_META_NAME}"))]
+
+
+def _drop_page_cache(path: str) -> None:
+    """Flush `path` and drop its page-cache pages (best effort, Linux only).
+
+    Baking rewrites hundreds of GB; without this the freshly written pages pile up as dirty cache
+    faster than the filesystem flushes them, and under a memory cgroup that climbs to the limit and
+    OOM-kills the job. Fsyncing then advising DONTNEED turns those pages clean and evicts them, so a
+    many-worker bake stays within a bounded resident footprint. A no-op where fadvise is absent."""
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)                                     # dirty -> clean so DONTNEED can evict
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _bake_shard(job: tuple) -> int:
+    """Rewrite one shard to standardised values into its temp path; returns the sample count.
+
+    `mean`/`std` are (1, C, 1, 1) float32. The float32 working buffer is bounded to `chunk` samples;
+    the output keeps the shard's stored dtype. Reads the pristine original (never mutated here) and
+    writes a sibling temp file, so the source dir is only swapped in once all its shards are baked.
+    Each shard's read and written pages are dropped from cache afterwards to bound memory use.
+    """
+    src_path, tmp_path, mean, std, chunk, dtype_str = job
+    dtype = np.dtype(dtype_str)
+    raw = np.load(src_path, mmap_mode="r")                   # (m, C, H, W), read-only
+    n = int(raw.shape[0])
+    out = np.empty(raw.shape, dtype=dtype)
+    for start in range(0, n, chunk):
+        block = np.asarray(raw[start:start + chunk], dtype=np.float32)
+        out[start:start + chunk] = ((block - mean) / std).astype(dtype)
+    np.save(tmp_path, out)
+    del raw, out                                             # release the mmap + output buffer
+    _drop_page_cache(tmp_path)                               # evict the just-written pages
+    _drop_page_cache(src_path)                               # evict the read-in original pages
+    return n
+
+
+def bake_normalization(
+    root: str | Path, *, max_samples: int | None = 10_000, seed: int = 0, chunk: int = 256,
+    workers: int = 1, keep_backup: bool = False, verbose: bool = True,
+) -> dict:
+    """Standardise a dataset on disk: rewrite every shard to the per-channel z-score (x-mean)/std.
+
+    Estimates (or reuses) the per-channel stats -> `root`/stats.json, then rewrites every shard to
+    standardised values in the stored dtype and flags each source meta `"normalized": true`, so
+    FireDataset serves already-scaled data with no per-read cost. Individual shards are baked in
+    parallel across `workers` processes (I/O-bound; scale it to the node's cpus). Idempotent:
+    already-flagged sources are skipped, so a re-run (or requeued job) is a safe no-op.
+
+    Safe/resumable: each source's shards are baked from the pristine originals into a sibling
+    `<src>.norm.tmp`, and the directory is swapped in only once all its shards are written — an
+    interrupted run never leaves half-scaled shards live. Returns a summary dict.
+    """
+    root = Path(root)
+    sources = _dataset_sources(root)
+    if not sources:
+        raise FileNotFoundError(f"No dataset found at {root} to normalize.")
+
+    def flagged(d: Path) -> bool:
+        return bool(json.loads((d / _META_NAME).read_text()).get("normalized", False))
+
+    pending = [d for d in sources if not flagged(d)]
+    if not pending:
+        if verbose:
+            print(f"all {len(sources)} source(s) already normalized; nothing to do.")
+        return {"baked": 0, "skipped": len(sources), "sources": len(sources), "shards": 0}
+    if len(pending) < len(sources) and not (root / _STATS_NAME).is_file():
+        # Some sources baked, some raw, and no cached stats -> a fresh estimate would be measured
+        # from a mix of scaled and unscaled shards. Refuse rather than bake a wrong transform.
+        raise RuntimeError(
+            f"{root} is partially normalized ({len(sources) - len(pending)}/{len(sources)} sources) "
+            f"but has no {_STATS_NAME}; re-stage the raw dataset and bake it in one pass."
+        )
+
+    # Stats are measured from the (still-raw) data; reuses stats.json when already present.
+    stats = ensure_channel_stats(root, max_samples=max_samples, seed=seed, chunk=chunk,
+                                 verbose=verbose)
+    mean = np.asarray(stats["channel_mean"], dtype=np.float32).reshape(1, -1, 1, 1)
+    std = np.asarray(stats["channel_std"], dtype=np.float32).reshape(1, -1, 1, 1)
+
+    # Fan out one task per shard (across all pending sources) into fresh per-source temp dirs.
+    plans = []          # (source_dir, tmp_dir, meta)
+    tasks = []          # per-shard bake jobs for the worker pool
+    for d in pending:
+        meta = json.loads((d / _META_NAME).read_text())
+        shards = sorted(d.glob(meta.get("shard_glob", _SHARD_GLOB)))
+        tmp = d.parent / (d.name + ".norm.tmp")
+        if tmp.exists():                                     # clear a stale tmp from an aborted run
+            shutil.rmtree(tmp)
+        tmp.mkdir()
+        plans.append((d, tmp, meta))
+        for sp in shards:
+            tasks.append((str(sp), str(tmp / sp.name), mean, std, chunk, meta["dtype"]))
+
+    if verbose:
+        print(f"baking {len(tasks)} shard(s) across {len(pending)} source(s) "
+              f"with {workers} worker(s) ...")
+    if workers > 1 and len(tasks) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=min(workers, len(tasks))) as ex:
+            n_samples = sum(ex.map(_bake_shard, tasks))
+    else:
+        n_samples = sum(_bake_shard(t) for t in tasks)
+
+    # All shards baked -> finalise each source: flag its meta, then swap the dir in atomically.
+    for d, tmp, meta in plans:
+        (tmp / _META_NAME).write_text(json.dumps({**meta, "normalized": True}, indent=2))
+        bak = d.parent / (d.name + ".raw.bak")
+        if bak.exists():
+            shutil.rmtree(bak)
+        os.replace(d, bak)                                   # move raw original aside
+        os.replace(tmp, d)                                   # move baked dir into place
+        if not keep_backup:
+            shutil.rmtree(bak)
+        if verbose:
+            print(f"  {d.name}: baked")
+    return {"baked": len(pending), "skipped": len(sources) - len(pending),
+            "sources": len(sources), "shards": len(tasks), "samples": n_samples}
 
 
 def main() -> None:
