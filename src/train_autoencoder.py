@@ -70,23 +70,13 @@ from config import load_config
 from ram_loader import RamBatchLoader
 from rollout import BatchedRollout, FireDataset
 from strided_autoencoder import StridedConvAutoencoder
-from strided_vae import StridedConvVAE
-from vae import ConvVAE
 
-# Selectable autoencoder architectures. All share the same constructor signature. The plain
-# autoencoders use a (reconstruction, latent) forward contract; the VAE variants (arch names in
-# VAE_ARCHS) instead return (reconstruction, latent, mu, logvar) and add a KL term to the loss
-# (weighted by --beta). --arch picks one by key.
+# Selectable autoencoder architectures. All share the same constructor signature and the same
+# (reconstruction, latent) forward contract. --arch picks one by key.
 ARCHITECTURES = {
     "shuffle": ConvAutoencoder,         # pixel-unshuffle/shuffle resampling
     "strided": StridedConvAutoencoder,  # 2x2 stride-2 conv / transposed-conv resampling
-    "shuffle-vae": ConvVAE,             # variational, pixel-unshuffle/shuffle resampling
-    "strided-vae": StridedConvVAE,      # variational, 2x2 stride-2 conv resampling
 }
-
-# Architectures with a probabilistic bottleneck: their forward returns (x_hat, z, mu, logvar)
-# and training adds beta * KL(N(mu, sigma^2) || N(0, I)) to the reconstruction loss.
-VAE_ARCHS = frozenset({"shuffle-vae", "strided-vae"})
 
 # Names accepted by --weight-dtype, mapped to the torch dtype the model's params/compute run in.
 # Mirrored (by string) into the checkpoint's model_config so eval/inference rebuilds the same dtype.
@@ -191,9 +181,7 @@ def run_epoch(
     tag: str,
     max_grad_norm: float = 0.0,
     extra_loss_fn: nn.Module | None = None,
-    is_vae: bool = False,
-    beta: float = 0.0,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float]:
     """Run one pass over `loader`. Trains when `optimizer` is given, else evaluates.
 
     When training with `max_grad_norm > 0`, gradients are clipped to that global L2 norm
@@ -203,13 +191,9 @@ def run_epoch(
     `extra_loss_fn`, if given, is evaluated (no grad) alongside the primary loss so a common
     yardstick (e.g. reconstruction MSE) can be reported regardless of the training `loss_fn`.
 
-    When `is_vae`, the model's forward returns `(x_hat, z, mu, logvar)` and the optimised loss is
-    the reconstruction loss plus `beta * model.kl_divergence(mu, logvar)`; the plain KL term is
-    tracked and returned so it can be reported separately.
-
-    Returns `(mean_loss, grad_norm_mean, grad_norm_max, extra_mean, kl_mean)`; grad-norm stats
-    are the pre-clip totals over the epoch (0.0 for an eval pass), `extra_mean` is NaN when
-    `extra_loss_fn` is None, and `kl_mean` is NaN when `is_vae` is False.
+    Returns `(mean_loss, grad_norm_mean, grad_norm_max, extra_mean)`; grad-norm stats
+    are the pre-clip totals over the epoch (0.0 for an eval pass), and `extra_mean` is NaN when
+    `extra_loss_fn` is None.
     """
     training = optimizer is not None
     model.train(training)
@@ -221,7 +205,6 @@ def run_epoch(
     total_loss = 0.0
     total_seen = 0
     extra_sum = 0.0
-    kl_sum = 0.0
     gnorm_sum = 0.0
     gnorm_max = 0.0
     gnorm_steps = 0
@@ -237,9 +220,6 @@ def run_epoch(
                 out = model(x)
                 x_hat = out[0]
                 loss = loss_fn(x_hat, x)
-                if is_vae:
-                    kl = model.kl_divergence(out[2], out[3])  # out == (x_hat, z, mu, logvar)
-                    loss = loss + beta * kl
                 if extra_loss_fn is not None:
                     extra = extra_loss_fn(x_hat, x)
 
@@ -270,8 +250,6 @@ def run_epoch(
             total_loss += loss.item() * n
             if extra_loss_fn is not None:
                 extra_sum += extra.item() * n
-            if is_vae:
-                kl_sum += kl.item() * n
             total_seen += n
             if training and log_interval and step % log_interval == 0:
                 print(
@@ -282,8 +260,7 @@ def run_epoch(
     mean_loss = total_loss / max(total_seen, 1)
     gnorm_mean = gnorm_sum / max(gnorm_steps, 1)
     extra_mean = extra_sum / max(total_seen, 1) if extra_loss_fn is not None else float("nan")
-    kl_mean = kl_sum / max(total_seen, 1) if is_vae else float("nan")
-    return mean_loss, gnorm_mean, gnorm_max, extra_mean, kl_mean
+    return mean_loss, gnorm_mean, gnorm_max, extra_mean
 
 
 def main() -> None:
@@ -341,13 +318,8 @@ def main() -> None:
                              "CPU. Recorded in the checkpoint for eval/inference")
     # Model
     parser.add_argument("--arch", choices=tuple(ARCHITECTURES), default=None,
-                        help="autoencoder architecture: 'shuffle'/'strided' (pixel-shuffle vs "
-                             "2x2 stride-2 conv resampling) or their variational '-vae' variants "
-                             "(add a KL term, weighted by --beta); default from [autoencoder].arch")
-    parser.add_argument("--beta", type=float, default=1.0,
-                        help="KL weight for the '-vae' architectures (beta-VAE): the loss is "
-                             "reconstruction + beta * KL(posterior || N(0, I)). Ignored by the "
-                             "non-variational archs (default: 1.0)")
+                        help="autoencoder architecture: 'shuffle' (pixel-shuffle) or 'strided' "
+                             "(2x2 stride-2 conv) resampling; default from [autoencoder].arch")
     parser.add_argument("--channels", type=_parse_channels, default=None,
                         help="encoder channel widths per downsample stage; the last is the conv "
                              "channel count before flattening, e.g. 16,32,64,128,256,512; default "
@@ -456,12 +428,10 @@ def main() -> None:
     if latent_dim is not None:
         model_kwargs["latent_dim"] = latent_dim
     model = ARCHITECTURES[arch](**model_kwargs).to(device=device, dtype=weight_dtype)
-    is_vae = arch in VAE_ARCHS
     n_params = sum(p.numel() for p in model.parameters())
     conv_shape = f"{model.conv_channels}x{model.conv_spatial}x{model.conv_spatial}"
-    vae_note = f" beta={args.beta}" if is_vae else ""
     print(f"model: arch={arch} channels={tuple(model.channels)} conv_latent={conv_shape} "
-          f"latent_dim={model.latent_dim} params={n_params:,}{vae_note}")
+          f"latent_dim={model.latent_dim} params={n_params:,}")
 
     loss_fn = nn.HuberLoss(delta=args.huber_delta) if args.loss == "huber" else nn.MSELoss()
     # A loss-independent yardstick: always report validation reconstruction MSE so runs trained
@@ -485,9 +455,6 @@ def main() -> None:
         # on CPU, which is lossless from bfloat16). AMP trains float32 weights, so record float32.
         "weight_dtype": str(weight_dtype).removeprefix("torch."),
     }
-    # The KL weight the VAE was trained under (informational; not needed to rebuild the model).
-    if is_vae:
-        model_config["beta"] = args.beta
     # Carry the input standardisation so inference/eval can reproduce the exact channel scaling
     # the model was trained under (the transform baked into the shards; absent if none was found).
     if channel_stats is not None:
@@ -517,7 +484,6 @@ def main() -> None:
                 "max_grad_norm": args.max_grad_norm,
                 "loss": args.loss,
                 "huber_delta": args.huber_delta if args.loss == "huber" else None,
-                "beta": args.beta if is_vae else None,
                 "amp": scaler is not None,
                 "val_frac": args.val_frac,
                 "n_train": n_train,
@@ -544,7 +510,7 @@ def main() -> None:
     metrics_file = metrics_path.open("w", newline="")
     metrics_writer = csv.writer(metrics_file)
     metrics_writer.writerow(
-        ["epoch", "train_loss", "val_loss", "val_mse", "train_kl", "val_kl",
+        ["epoch", "train_loss", "val_loss", "val_mse",
          "grad_norm_mean", "grad_norm_max", "seconds"]
     )
 
@@ -552,24 +518,21 @@ def main() -> None:
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss, gnorm_mean, gnorm_max, _, train_kl = run_epoch(
+        train_loss, gnorm_mean, gnorm_max, _ = run_epoch(
             model, train_loader, device, loss_fn, optimizer, scaler,
             args.log_interval, epoch, "train", max_grad_norm=args.max_grad_norm,
-            is_vae=is_vae, beta=args.beta,
         )
-        val_loss, _, _, val_mse, val_kl = run_epoch(
+        val_loss, _, _, val_mse = run_epoch(
             model, val_loader, device, loss_fn, None, None, 0, epoch, "val",
-            extra_loss_fn=val_mse_fn, is_vae=is_vae, beta=args.beta,
+            extra_loss_fn=val_mse_fn,
         )
         dt = time.time() - t0
-        kl_note = f"  train_kl {train_kl:.4f}  val_kl {val_kl:.4f}" if is_vae else ""
         print(
             f"epoch {epoch:3d}/{args.epochs}  train {train_loss:.6f}  val {val_loss:.6f}  "
-            f"val_mse {val_mse:.6f}{kl_note}  "
+            f"val_mse {val_mse:.6f}  "
             f"grad_norm(mean {gnorm_mean:.3f}, max {gnorm_max:.3f})  ({dt:.1f}s)"
         )
         metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_mse:.6f}",
-                                 f"{train_kl:.6f}", f"{val_kl:.6f}",
                                  f"{gnorm_mean:.6f}", f"{gnorm_max:.6f}", f"{dt:.2f}"])
         metrics_file.flush()
 
@@ -586,8 +549,6 @@ def main() -> None:
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_mse": val_mse,
-                "train_kl": train_kl,
-                "val_kl": val_kl,
                 "best_val": best_val,
                 "grad_norm_mean": gnorm_mean,
                 "grad_norm_max": gnorm_max,

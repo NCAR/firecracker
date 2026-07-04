@@ -39,8 +39,6 @@ import torch
 import physics_constants as pc
 from autoencoder import ConvAutoencoder
 from strided_autoencoder import StridedConvAutoencoder
-from strided_vae import StridedConvVAE
-from vae import ConvVAE
 from firecracker_env import FirecrackerEnv, ViewMode, TARGET_FPS
 from simulation import OBS_CHANNELS_PRE, OBS_CHANNELS_POST, obs_channel_names
 from rendering import (
@@ -59,8 +57,6 @@ from rendering import (
 ARCHITECTURES = {
     "shuffle": ConvAutoencoder,
     "strided": StridedConvAutoencoder,
-    "shuffle-vae": ConvVAE,
-    "strided-vae": StridedConvVAE,
 }
 
 # Weight dtypes a checkpoint may be saved in (see train_autoencoder.WEIGHT_DTYPES). Checkpoints
@@ -227,9 +223,7 @@ class ComparisonViewer:
         # reconstruction back to float32 for the de-standardisation math and rendering.
         model_dtype = next(self.model.parameters()).dtype
         with torch.no_grad():
-            # VAE forwards return (x_hat, z, mu, logvar); the plain AEs return (x_hat, z). Take
-            # the reconstruction either way. In eval mode the VAE decodes the posterior mean, so
-            # this stays deterministic.
+            # The autoencoder forward returns (x_hat, z); take the reconstruction.
             x_hat = self.model(x_in.unsqueeze(0).to(model_dtype))[0]
         x_hat = x_hat.squeeze(0).float()
         recon = x_hat * self.std + self.mean if self.mean is not None else x_hat
