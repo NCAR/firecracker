@@ -67,6 +67,7 @@ except ImportError:  # optional dependency; only needed when --wandb is passed
 
 from autoencoder import ConvAutoencoder
 from config import load_config
+from losses import MSSSIML1Loss
 from ram_loader import RamBatchLoader
 from rollout import BatchedRollout, FireDataset
 from strided_autoencoder import StridedConvAutoencoder
@@ -291,14 +292,24 @@ def main() -> None:
                              "(sparse/intermittent gradients)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                         help="clip gradients to this global L2 norm each step (0 disables)")
-    parser.add_argument("--loss", choices=("mse", "huber"), default="mse",
-                        help="reconstruction loss: 'mse' (default) or 'huber' (robust, bounds "
-                             "the gradient of large residuals)")
+    parser.add_argument("--loss", choices=("mse", "huber", "ms-ssim+l1"), default="mse",
+                        help="reconstruction loss: 'mse' (default), 'huber' (robust, bounds the "
+                             "gradient of large residuals), or 'ms-ssim+l1' (multi-scale structural "
+                             "similarity + L1; rewards preserving local contrast/structure, so it "
+                             "penalises blur that mse tolerates). val_mse is always logged so the "
+                             "three are comparable")
     parser.add_argument("--huber-delta", type=float, default=1.0,
                         help="Huber transition point (only for --loss huber); residuals below it "
                              "are quadratic, above it linear. With per-channel standardisation the "
                              "inputs are ~unit-variance (roughly [-3,3]), so 0.5-1.0 is where "
                              "robustness starts to engage (default: 1.0)")
+    parser.add_argument("--ms-ssim-alpha", type=float, default=0.84,
+                        help="(only for --loss ms-ssim+l1) weight on the MS-SSIM term vs L1: "
+                             "alpha*(1-MS-SSIM) + (1-alpha)*L1 (default: 0.84, per Zhao et al.)")
+    parser.add_argument("--ms-ssim-data-range", type=float, default=6.0,
+                        help="(only for --loss ms-ssim+l1) SSIM dynamic range L for its C1/C2 "
+                             "constants; the inputs are per-channel standardised, so ~6.0 (a +/-3 "
+                             "sigma span) suits them (default: 6.0)")
     parser.add_argument("--val-frac", type=float, default=0.05,
                         help="fraction of samples held out for validation")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -433,10 +444,15 @@ def main() -> None:
     print(f"model: arch={arch} channels={tuple(model.channels)} conv_latent={conv_shape} "
           f"latent_dim={model.latent_dim} params={n_params:,}")
 
-    loss_fn = nn.HuberLoss(delta=args.huber_delta) if args.loss == "huber" else nn.MSELoss()
+    if args.loss == "huber":
+        loss_fn: nn.Module = nn.HuberLoss(delta=args.huber_delta)
+    elif args.loss == "ms-ssim+l1":
+        loss_fn = MSSSIML1Loss(data_range=args.ms_ssim_data_range, alpha=args.ms_ssim_alpha)
+    else:
+        loss_fn = nn.MSELoss()
     # A loss-independent yardstick: always report validation reconstruction MSE so runs trained
-    # with different --loss (mse vs huber) are directly comparable. Redundant with val_loss when
-    # --loss mse, but cheap (val is a small held-out split, evaluated without gradients).
+    # with different --loss (mse / huber / ms-ssim+l1) are directly comparable. Redundant with
+    # val_loss when --loss mse, but cheap (val is a small held-out split, evaluated without grads).
     val_mse_fn = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay, eps=args.adam_eps)
@@ -484,6 +500,8 @@ def main() -> None:
                 "max_grad_norm": args.max_grad_norm,
                 "loss": args.loss,
                 "huber_delta": args.huber_delta if args.loss == "huber" else None,
+                "ms_ssim_alpha": args.ms_ssim_alpha if args.loss == "ms-ssim+l1" else None,
+                "ms_ssim_data_range": args.ms_ssim_data_range if args.loss == "ms-ssim+l1" else None,
                 "amp": scaler is not None,
                 "val_frac": args.val_frac,
                 "n_train": n_train,
