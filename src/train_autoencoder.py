@@ -21,7 +21,18 @@ C x N x N tensor (C = 4 + one channel per fuel type, N = 256), already normalise
 build_observation; the exact channel count travels in the dataset meta.
 
 At N=256, C=5 the full set is ~86 GB in float32 / ~43 GB in float16 on disk, so --buffer-dtype
-defaults to float16 for the dataset; the model still trains in float32.
+defaults to float16 for the dataset.
+
+Model precision
+---------------
+--weight-dtype selects the dtype the model's parameters (and forward/backward compute) run in:
+bfloat16 (default) halves weight + activation memory and, on Ampere/Hopper (A100/H100), runs on
+the bf16 tensor cores for a speedup, while bf16's f32-range exponent avoids the underflow that
+makes pure float16 training diverge. float16 is available (fastest on V100, whose tensor cores are
+fp16-only) but is numerically fragile with AdamW; float32 keeps the old full-precision behavior.
+On CPU (no GPU) half precision is slow / partially unsupported, so the trainer auto-falls back to
+float32 there. The chosen dtype is recorded in the checkpoint so eval/inference rebuilds it the
+same way (and likewise up-casts to float32 on CPU, which is lossless from bf16).
 
 Quick use
 ---------
@@ -76,6 +87,28 @@ ARCHITECTURES = {
 # Architectures with a probabilistic bottleneck: their forward returns (x_hat, z, mu, logvar)
 # and training adds beta * KL(N(mu, sigma^2) || N(0, I)) to the reconstruction loss.
 VAE_ARCHS = frozenset({"shuffle-vae", "strided-vae"})
+
+# Names accepted by --weight-dtype, mapped to the torch dtype the model's params/compute run in.
+# Mirrored (by string) into the checkpoint's model_config so eval/inference rebuilds the same dtype.
+WEIGHT_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _resolve_weight_dtype(name: str, device: torch.device) -> torch.dtype:
+    """Map a --weight-dtype name to a torch dtype, falling back to float32 on CPU.
+
+    Half precision (float16/bfloat16) is slow and partially unimplemented on CPU, so a half
+    request there is downgraded to float32 (with a note) rather than run slowly or error out.
+    """
+    dtype = WEIGHT_DTYPES[name]
+    if dtype is not torch.float32 and device.type == "cpu":
+        print(f"note: --weight-dtype {name} requested but device is CPU; "
+              f"training in float32 (half precision is slow/unsupported on CPU).")
+        return torch.float32
+    return dtype
 
 
 def _resolve_device(name: str | None) -> torch.device:
@@ -181,6 +214,9 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     use_amp = scaler is not None and device.type == "cuda"
+    # Feed inputs in the model's own parameter dtype (float32 / float16 / bfloat16). Under AMP the
+    # params are float32 and autocast handles the per-op down-cast, so f32 inputs are correct there.
+    param_dtype = next(model.parameters()).dtype
 
     total_loss = 0.0
     total_seen = 0
@@ -192,8 +228,8 @@ def run_epoch(
     grad_ctx = torch.enable_grad() if training else torch.no_grad()
     with grad_ctx:
         for step, batch in enumerate(loader):
-            # Shards may be stored in float16; the model trains in float32.
-            x = batch.to(device=device, dtype=torch.float32, non_blocking=True)
+            # Shards may be stored in float16; move them to the model's param dtype (see above).
+            x = batch.to(device=device, dtype=param_dtype, non_blocking=True)
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
@@ -295,7 +331,14 @@ def main() -> None:
                              "processes (safe under heavy packing, no shared-memory crash). "
                              "'dataloader': stock torch DataLoader with --num-workers workers")
     parser.add_argument("--amp", action="store_true",
-                        help="use mixed-precision autocast + GradScaler (CUDA only)")
+                        help="use mixed-precision autocast + GradScaler (CUDA only). Keeps float32 "
+                             "master weights; mutually exclusive with a half --weight-dtype")
+    parser.add_argument("--weight-dtype", choices=tuple(WEIGHT_DTYPES), default="bfloat16",
+                        help="dtype for the model's parameters + forward/backward compute: "
+                             "'bfloat16' (default; half memory, stable, tensor-core accelerated on "
+                             "A100/H100), 'float16' (fastest on V100 but numerically fragile with "
+                             "AdamW), or 'float32' (full precision). Auto-downgraded to float32 on "
+                             "CPU. Recorded in the checkpoint for eval/inference")
     # Model
     parser.add_argument("--arch", choices=tuple(ARCHITECTURES), default=None,
                         help="autoencoder architecture: 'shuffle'/'strided' (pixel-shuffle vs "
@@ -339,7 +382,13 @@ def main() -> None:
     config = load_config(args.config)
     device = _resolve_device(args.device)
     torch.manual_seed(args.seed)
-    print(f"device: {device}")
+    # AMP (float32 master weights + autocast) and a half --weight-dtype are two different low-
+    # precision strategies; combining them (a GradScaler over already-half params) is incoherent.
+    if args.amp and WEIGHT_DTYPES[args.weight_dtype] is not torch.float32:
+        raise SystemExit("--amp keeps float32 master weights and cannot be combined with "
+                         f"--weight-dtype {args.weight_dtype}; pass one or the other.")
+    weight_dtype = _resolve_weight_dtype(args.weight_dtype, device)
+    print(f"device: {device}  weight-dtype: {str(weight_dtype).removeprefix('torch.')}")
 
     # Model architecture: CLI flags override the [autoencoder] config, which in turn overrides
     # the model constructor defaults. `channels`/`latent_dim` are read from the per-arch subtable.
@@ -406,7 +455,7 @@ def main() -> None:
         model_kwargs["channels"] = channels
     if latent_dim is not None:
         model_kwargs["latent_dim"] = latent_dim
-    model = ARCHITECTURES[arch](**model_kwargs).to(device)
+    model = ARCHITECTURES[arch](**model_kwargs).to(device=device, dtype=weight_dtype)
     is_vae = arch in VAE_ARCHS
     n_params = sum(p.numel() for p in model.parameters())
     conv_shape = f"{model.conv_channels}x{model.conv_spatial}x{model.conv_spatial}"
@@ -432,6 +481,9 @@ def main() -> None:
         "grid_size": grid_size,
         "channels": list(model.channels),
         "latent_dim": model.latent_dim,
+        # The dtype the weights are saved in; eval rebuilds the model in it (or up-casts to float32
+        # on CPU, which is lossless from bfloat16). AMP trains float32 weights, so record float32.
+        "weight_dtype": str(weight_dtype).removeprefix("torch."),
     }
     # The KL weight the VAE was trained under (informational; not needed to rebuild the model).
     if is_vae:

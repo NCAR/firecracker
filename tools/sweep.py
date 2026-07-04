@@ -48,7 +48,7 @@ train_autoencoder.py CLI is available:
 
     # 16 replicates over 4 GPUs, 4 sharing each card, into runs/lat1024/run_00..15:
     python tools/sweep.py --gpus 4 --per-gpu 4 --out runs/lat1024 -- \
-        --data data/fire --epochs 50 --amp \
+        --data data/fire --epochs 50 --weight-dtype bfloat16 \
         --channels 8,16,32,64,128,256,512,1024
 
     # Inspect the per-run commands without launching (works anywhere, no GPU needed):

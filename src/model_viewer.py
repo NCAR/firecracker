@@ -63,6 +63,14 @@ ARCHITECTURES = {
     "strided-vae": StridedConvVAE,
 }
 
+# Weight dtypes a checkpoint may be saved in (see train_autoencoder.WEIGHT_DTYPES). Checkpoints
+# from before --weight-dtype existed have no such key and load as float32.
+WEIGHT_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
 # View modes whose field is fully recoverable from the observation channels, so the reconstruction
 # panel can render them. Every other mode draws from non-observed state and gets a placeholder.
 RECONSTRUCTABLE: frozenset[ViewMode] = frozenset({
@@ -122,12 +130,19 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
     if arch not in ARCHITECTURES:
         raise SystemExit(f"'{path}' names unknown arch '{arch}'; expected one of {list(ARCHITECTURES)}.")
 
+    # Rebuild in the dtype the weights were trained in, except on CPU: half precision is slow /
+    # partially unimplemented there, so up-cast to float32 (lossless from bfloat16). load_state_dict
+    # copies each saved tensor with Tensor.copy_, which casts dtype, so a bf16 checkpoint widens
+    # cleanly into an f32 model.
+    saved_dtype = WEIGHT_DTYPES.get(cfg.get("weight_dtype", "float32"), torch.float32)
+    load_dtype = torch.float32 if device.type == "cpu" else saved_dtype
+
     model = ARCHITECTURES[arch](
         in_channels=cfg["in_channels"],
         grid_size=cfg["grid_size"],
         channels=tuple(cfg["channels"]),
         latent_dim=cfg["latent_dim"],
-    ).to(device)
+    ).to(device=device, dtype=load_dtype)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     return model, cfg
@@ -208,12 +223,15 @@ class ComparisonViewer:
         gt = self.env._observation()                               # (C, H, W) normalized-OBS
         x = torch.from_numpy(gt).to(self.device)
         x_in = (x - self.mean) / self.std if self.mean is not None else x
+        # Feed the model in its own weight dtype (bf16/f16 on GPU; f32 on CPU) then widen the
+        # reconstruction back to float32 for the de-standardisation math and rendering.
+        model_dtype = next(self.model.parameters()).dtype
         with torch.no_grad():
             # VAE forwards return (x_hat, z, mu, logvar); the plain AEs return (x_hat, z). Take
             # the reconstruction either way. In eval mode the VAE decodes the posterior mean, so
             # this stays deterministic.
-            x_hat = self.model(x_in.unsqueeze(0))[0]
-        x_hat = x_hat.squeeze(0)
+            x_hat = self.model(x_in.unsqueeze(0).to(model_dtype))[0]
+        x_hat = x_hat.squeeze(0).float()
         recon = x_hat * self.std + self.mean if self.mean is not None else x_hat
         recon = recon.detach().cpu().numpy().astype(np.float32)    # (C, H, W) normalized-OBS
 
