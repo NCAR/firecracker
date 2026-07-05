@@ -30,6 +30,8 @@ from map_loader import load_map, resolve_map, validate_against_config
 from rendering import (
     DISPLAY_TEMP_FLOOR_K,
     DISPLAY_MIN_TEMP_SPAN_K,
+    FUEL_TEMP_DISPLAY_MIN_K,
+    FUEL_TEMP_DISPLAY_MAX_K,
     FIRE_COLOR_TEMP_SPAN_K,
     KELVIN_TO_CELSIUS,
     LEGEND_PANEL_WIDTH,
@@ -259,12 +261,13 @@ class FirecrackerEnv(gymnasium.Env):
         # labels the exact range its (cached) field was normalised over. Each is the live max
         # over all cells. Set in _rebuild_surfaces_if_dirty; the defaults keep a legend valid
         # before the first build.
-        # Air/fuel temperature windows auto-range to the live field (floor = coldest cell, ceiling =
-        # hottest, min-span clamped). Defaults hold until the first surface build.
+        # The air-temperature window auto-ranges to the live field (floor = coldest cell, ceiling =
+        # hottest, min-span clamped); its default holds until the first surface build. The fuel-
+        # temperature window is fixed (see build), so it uses the fixed bounds from the start.
         self._air_temp_display_min: float = DISPLAY_TEMP_FLOOR_K
         self._air_temp_display_max: float = DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
-        self._fuel_temp_display_min: float = DISPLAY_TEMP_FLOOR_K
-        self._fuel_temp_display_max: float = DISPLAY_TEMP_FLOOR_K + DISPLAY_MIN_TEMP_SPAN_K
+        self._fuel_temp_display_min: float = FUEL_TEMP_DISPLAY_MIN_K
+        self._fuel_temp_display_max: float = FUEL_TEMP_DISPLAY_MAX_K
         self._radiant_flux_display_max: float = 0.0
         self._pressure_display_max: float = 0.0
         self._terrain_display_max: float = 0.0
@@ -762,8 +765,10 @@ class FirecrackerEnv(gymnasium.Env):
         hottest_fuel = fuel_temps.max(axis=0)                     # per-cell hottest fuel (the fuel view)
         self._air_temp_display_min = float(temp.min())
         self._air_temp_display_max = max(self._air_temp_display_min + DISPLAY_MIN_TEMP_SPAN_K, float(temp.max()))
-        self._fuel_temp_display_min = float(hottest_fuel.min())
-        self._fuel_temp_display_max = max(self._fuel_temp_display_min + DISPLAY_MIN_TEMP_SPAN_K, float(hottest_fuel.max()))
+        # The fuel-temperature view uses a fixed window (unlike the auto-ranging air-temp view above)
+        # so a flame's color reads the same temperature every frame and across models in the viewer.
+        self._fuel_temp_display_min = FUEL_TEMP_DISPLAY_MIN_K
+        self._fuel_temp_display_max = FUEL_TEMP_DISPLAY_MAX_K
         self._radiant_flux_display_max = float(radiant_flux.max())
         self._pressure_display_max = float(pressure_field.max())
         self._terrain_display_max = float(terrain.max())

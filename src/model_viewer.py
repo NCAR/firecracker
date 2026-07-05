@@ -1,31 +1,35 @@
 """
 model_viewer.py
 
-Side-by-side visualiser for a trained autoencoder against the live physics simulation.
+Side-by-side visualiser for one or more trained autoencoders against the live physics simulation.
 
-Given a checkpoint (models/best.pt or similar), this loads the model, rebuilds its architecture
-from the config embedded in the checkpoint, and runs the interactive world alongside the model's
-reconstruction of it. Three panels are drawn per frame:
+Given one or more checkpoints (models/best.pt or similar), this loads each model, rebuilds its
+architecture from the config embedded in the checkpoint, and runs the interactive world alongside
+the models' reconstructions of it. One panel is drawn per model, next to the physics view:
 
     Physics        the ground-truth simulation view (exactly what the normal viewer shows)
-    Reconstruction the same view rebuilt from the autoencoder's output
-    Error          per-cell |physics - reconstruction| for the shown field, as a heatmap
+    Model          the same view rebuilt from an autoencoder's output (one panel per model)
 
-so you can eyeball how faithfully the model reproduces each observation channel.
+so you can eyeball how faithfully each model reproduces the shown observation channel, and — with
+two models — compare them against each other directly.
+
+Press TAB to flip the model panels between their reconstruction and a per-cell |physics - model|
+error heatmap for the shown field (the physics panel is unaffected). With more than one model the
+error panels share a color scale so their magnitudes are directly comparable.
 
 The autoencoder only ever sees the world-model *observation* — the normalized stack of
 fuel_temperature, one fuel_<type> mass channel per fuel type, terrain, and the two near-surface
 wind components (see Simulation.build_observation). Only views backed by those channels can be
 reconstructed (fuel temperature, terrain, wind speed, fire); other views (air temperature, oxygen,
-pressure, radiant heat, ...) draw from state that is not in the observation, so the reconstruction
-panel shows a "not in observation" placeholder for them while the physics panel still renders.
+pressure, radiant heat, ...) draw from state that is not in the observation, so the model panel
+shows a "not in observation" placeholder for them while the physics panel still renders.
 
 The observation is doubly normalized on the way into the model: build_observation applies the affine
 OBS_NORM windows (roughly [0, 1] per channel), then training z-scores each channel to zero mean /
 unit variance using stats carried in the checkpoint (channel_mean / channel_std). Both transforms
 are inverted here so the reconstruction lands back in physical units for rendering.
 
-Invoked via `python src/main.py --model models/best.pt`; see main.run_comparison.
+Invoked via `python src/main.py --model models/best.pt [more.pt ...]`; see main.run_comparison.
 """
 
 from __future__ import annotations
@@ -67,8 +71,8 @@ WEIGHT_DTYPES = {
     "bfloat16": torch.bfloat16,
 }
 
-# View modes whose field is fully recoverable from the observation channels, so the reconstruction
-# panel can render them. Every other mode draws from non-observed state and gets a placeholder.
+# View modes whose field is fully recoverable from the observation channels, so the model panel
+# can render them. Every other mode draws from non-observed state and gets a placeholder.
 RECONSTRUCTABLE: frozenset[ViewMode] = frozenset({
     ViewMode.FUEL_TEMPERATURE,
     ViewMode.TERRAIN,
@@ -144,20 +148,49 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
     return model, cfg
 
 
+class _ModelPanel:
+    """One loaded autoencoder plus the per-model state the viewer keeps for it: its de-standardising
+    z-score stats and the cached reconstruction (in both normalized-OBS and physical units)."""
+
+    def __init__(self, model: torch.nn.Module, config: dict, name: str, device: torch.device) -> None:
+        self.model = model
+        self.config = config
+        self.name = name
+        # Per-channel z-score the model was trained under (if the dataset was standardized). Kept on
+        # the device so the (de)standardisation is a cheap broadcast around the forward pass.
+        mean = config.get("channel_mean")
+        std = config.get("channel_std")
+        if mean is not None and std is not None:
+            self.mean = torch.tensor(mean, dtype=torch.float32, device=device)[:, None, None]
+            self.std = torch.tensor(std, dtype=torch.float32, device=device)[:, None, None]
+        else:
+            self.mean = self.std = None
+        self.recon_obs: np.ndarray | None = None   # (C, H, W) normalized-OBS reconstruction
+        self.recon_phys: np.ndarray | None = None  # (C, H, W) reconstruction in physical units
+
+
 class ComparisonViewer:
-    """Owns the pygame window and composites the physics / reconstruction / error panels.
+    """Owns the pygame window and composites the physics panel beside one panel per model.
 
     The env is driven in rgb_array mode (it builds no window of its own); this viewer reuses the
-    env's surface builders and event handling for the physics panel, runs the model to fill the
-    reconstruction panel, and draws the per-cell error between them.
+    env's surface builders and event handling for the physics panel, runs each model to fill its
+    panel, and — when TAB is toggled — draws the per-cell error between each model and the physics.
     """
 
-    def __init__(self, env: FirecrackerEnv, model: torch.nn.Module, model_config: dict) -> None:
+    def __init__(self, env: FirecrackerEnv, models: list[tuple[torch.nn.Module, dict, str]]) -> None:
         self.env = env
-        self.model = model
         self.device = env._sim.device
         self.scale = env._pixel_scale
         self.sim_px = env.grid_size * self.scale
+
+        self.panels = [_ModelPanel(m, cfg, name, self.device) for (m, cfg, name) in models]
+        self.n_models = len(self.panels)
+        self.n_panels = 1 + self.n_models   # physics + one per model
+
+        # TAB flips the model panels between reconstruction and error; edge-detected against the
+        # held-key snapshot in render() so it toggles once per press rather than every frame held.
+        self._show_error = False
+        self._tab_prev = False
 
         n_fuel = env._sim.num_fuel_types
         self.n_fuel = n_fuel
@@ -179,30 +212,18 @@ class ComparisonViewer:
         self.offsets = np.array([w[0] for w in windows], dtype=np.float32)
         self.scales = np.array([w[1] for w in windows], dtype=np.float32)
 
-        # Per-channel z-score the model was trained under (if the dataset was standardized). Kept on
-        # the device so the (de)standardisation is a cheap broadcast around the forward pass.
-        mean = model_config.get("channel_mean")
-        std = model_config.get("channel_std")
-        if mean is not None and std is not None:
-            self.mean = torch.tensor(mean, dtype=torch.float32, device=self.device)[:, None, None]
-            self.std = torch.tensor(std, dtype=torch.float32, device=self.device)[:, None, None]
-        else:
-            self.mean = self.std = None
-
-        # Fuel display params reused by the reconstruction FIRE surface.
+        # Fuel display params reused by each model panel's FIRE surface.
         self.ignition_thresholds = env._sim.ignition_thresholds.detach().cpu().numpy().reshape(-1)
         self.fuel_burnt_threshold = env._sim.fuel_burnt_threshold
         self.fuel_type_names = list(env._sim.fuel_type_names)
 
-        # Cached model outputs, refreshed whenever the world advances (see render()).
+        # Cached ground-truth observation, refreshed whenever the world advances (see render()).
         self._gt_obs: np.ndarray | None = None       # (C, H, W) normalized-OBS ground truth
-        self._recon_obs: np.ndarray | None = None    # (C, H, W) normalized-OBS reconstruction
-        self._recon_phys: np.ndarray | None = None   # (C, H, W) reconstruction in physical units
 
         pygame.init()
         pygame.font.init()
         pygame.display.set_caption("Firecracker — model reconstruction")
-        width = 3 * self.sim_px + 4 * PAD + LEGEND_PANEL_WIDTH
+        width = self.n_panels * self.sim_px + (self.n_panels + 1) * PAD + LEGEND_PANEL_WIDTH
         height = TITLE_H + self.sim_px + PAD
         self._screen = pygame.display.set_mode((width, height))
         self._clock = pygame.time.Clock()
@@ -214,34 +235,34 @@ class ComparisonViewer:
     # -- model -----------------------------------------------------------------
 
     def _compute_reconstruction(self) -> None:
-        """Run the model on the current observation, caching the reconstruction in both
-        normalized-OBS space (for the error panel) and physical units (for rendering)."""
+        """Run every model on the current observation, caching each reconstruction in both
+        normalized-OBS space (for the error panels) and physical units (for rendering)."""
         gt = self.env._observation()                               # (C, H, W) normalized-OBS
         x = torch.from_numpy(gt).to(self.device)
-        x_in = (x - self.mean) / self.std if self.mean is not None else x
-        # Feed the model in its own weight dtype (bf16/f16 on GPU; f32 on CPU) then widen the
-        # reconstruction back to float32 for the de-standardisation math and rendering.
-        model_dtype = next(self.model.parameters()).dtype
-        with torch.no_grad():
-            # The autoencoder forward returns (x_hat, z); take the reconstruction.
-            x_hat = self.model(x_in.unsqueeze(0).to(model_dtype))[0]
-        x_hat = x_hat.squeeze(0).float()
-        recon = x_hat * self.std + self.mean if self.mean is not None else x_hat
-        recon = recon.detach().cpu().numpy().astype(np.float32)    # (C, H, W) normalized-OBS
-
         self._gt_obs = gt
-        self._recon_obs = recon
-        self._recon_phys = recon * self.scales[:, None, None] + self.offsets[:, None, None]
+        for p in self.panels:
+            x_in = (x - p.mean) / p.std if p.mean is not None else x
+            # Feed the model in its own weight dtype (bf16/f16 on GPU; f32 on CPU) then widen the
+            # reconstruction back to float32 for the de-standardisation math and rendering.
+            model_dtype = next(p.model.parameters()).dtype
+            with torch.no_grad():
+                # The autoencoder forward returns (x_hat, z); take the reconstruction.
+                x_hat = p.model(x_in.unsqueeze(0).to(model_dtype))[0]
+            x_hat = x_hat.squeeze(0).float()
+            recon = x_hat * p.std + p.mean if p.mean is not None else x_hat
+            recon = recon.detach().cpu().numpy().astype(np.float32)  # (C, H, W) normalized-OBS
+            p.recon_obs = recon
+            p.recon_phys = recon * self.scales[:, None, None] + self.offsets[:, None, None]
 
     # -- reconstruction / error surfaces --------------------------------------
 
-    def _recon_surface(self, mode: ViewMode) -> pygame.Surface | None:
-        """Build the reconstruction-panel surface for `mode` from the cached model output, reusing
-        the physics panel's display windows so equal colors mean equal values. Returns None for
-        modes not backed by the observation (the caller draws a placeholder)."""
+    def _recon_surface(self, mode: ViewMode, panel: _ModelPanel) -> pygame.Surface | None:
+        """Build a model panel's reconstruction surface for `mode` from the cached model output,
+        reusing the physics panel's display windows so equal colors mean equal values. Returns None
+        for modes not backed by the observation (the caller draws a placeholder)."""
         if mode not in RECONSTRUCTABLE:
             return None
-        env, phys, scale = self.env, self._recon_phys, self.scale
+        env, phys, scale = self.env, panel.recon_phys, self.scale
         if mode == ViewMode.FUEL_TEMPERATURE:
             return build_color_surface(
                 phys[self.i_fuel_temp], scale,
@@ -267,10 +288,10 @@ class ComparisonViewer:
             env._show_fire_overlay and env._sim.fire_enabled,
         )
 
-    def _error_field(self, mode: ViewMode) -> np.ndarray:
+    def _error_field(self, mode: ViewMode, panel: _ModelPanel) -> np.ndarray:
         """Per-cell reconstruction error (normalized-OBS units) for the shown field: the channel(s)
         backing the mode when it is reconstructable, else the mean absolute error over all channels."""
-        gt, rc = self._gt_obs, self._recon_obs
+        gt, rc = self._gt_obs, panel.recon_obs
         if mode == ViewMode.FUEL_TEMPERATURE:
             return np.abs(gt[self.i_fuel_temp] - rc[self.i_fuel_temp])
         if mode == ViewMode.TERRAIN:
@@ -288,6 +309,14 @@ class ComparisonViewer:
         surf.blit(text, text.get_rect(center=(self.sim_px // 2, self.sim_px // 2)))
         return surf
 
+    def _model_title(self, i: int, mode: ViewMode) -> str:
+        base = "Model" if self.n_models == 1 else f"Model {i + 1}"
+        return base if mode in RECONSTRUCTABLE else f"{base} (n/a)"
+
+    def _error_title(self, i: int, error: np.ndarray) -> str:
+        base = "Error" if self.n_models == 1 else f"Error {i + 1}"
+        return f"{base}   mean {float(error.mean()):.3f}  max {float(error.max()):.3f}"
+
     # -- frame -----------------------------------------------------------------
 
     def render(self) -> None:
@@ -300,40 +329,45 @@ class ComparisonViewer:
         # right-click ignition). It reads the global pygame event queue and mouse, so it works
         # against this viewer's window with the physics panel anchored at the origin.
         env._running, env._current_mode, fire_click = env._handle_events()
+        # env._handle_events drains and pumps the event queue but doesn't touch TAB; read TAB from
+        # the (now-current) held-key snapshot and edge-detect it into the reconstruction/error flip.
+        tab_down = pygame.key.get_pressed()[pygame.K_TAB]
+        if tab_down and not self._tab_prev:
+            self._show_error = not self._show_error
+        self._tab_prev = tab_down
         if fire_click is not None:
             env._spawn_fire_patch(*fire_click)
             env._surfaces_dirty = True
             dirty = True
             env._rebuild_surfaces_if_dirty()
-        if dirty or self._recon_phys is None:
+        if dirty or self._gt_obs is None:
             self._compute_reconstruction()
 
         mode = env._current_mode
         self._screen.fill(BG)
 
-        phys_surface = env._surface_for_mode()
-        recon_surface = self._recon_surface(mode)
-        if recon_surface is None:
-            recon_surface = self._placeholder_surface()
+        xs = [PAD + i * (self.sim_px + PAD) for i in range(self.n_panels)]
+        self._blit_panel(env._surface_for_mode(), xs[0], "Physics")
 
-        error = self._error_field(mode)
-        err_max = float(error.max())
-        err_surface = build_color_surface(error, self.scale, 0.0, err_max, heat_colormap)
-
-        xs = [PAD + i * (self.sim_px + PAD) for i in range(3)]
-        self._blit_panel(phys_surface, xs[0], "Physics")
-        recon_title = "Reconstruction" if mode in RECONSTRUCTABLE else "Reconstruction (n/a)"
-        self._blit_panel(recon_surface, xs[1], recon_title)
-        self._blit_panel(
-            err_surface, xs[2],
-            f"Error   mean {float(error.mean()):.3f}  max {err_max:.3f}",
-        )
+        if self._show_error:
+            # Share one color scale across the model panels so their error magnitudes are comparable.
+            errors = [self._error_field(mode, p) for p in self.panels]
+            err_max = max((float(e.max()) for e in errors), default=0.0)
+            for i, error in enumerate(errors):
+                surface = build_color_surface(error, self.scale, 0.0, err_max, heat_colormap)
+                self._blit_panel(surface, xs[i + 1], self._error_title(i, error))
+        else:
+            for i, panel in enumerate(self.panels):
+                surface = self._recon_surface(mode, panel)
+                if surface is None:
+                    surface = self._placeholder_surface()
+                self._blit_panel(surface, xs[i + 1], self._model_title(i, mode))
 
         # Shared legend for the physics/reconstruction color scale (both use the same window).
         panel = build_legend_panel(
             env._legend_specs(), self.sim_px, self._legend_font, self._legend_title_font
         )
-        self._screen.blit(panel, (xs[2] + self.sim_px + PAD, TITLE_H))
+        self._screen.blit(panel, (xs[-1] + self.sim_px + PAD, TITLE_H))
 
         pygame.display.flip()
         self._clock.tick(TARGET_FPS)

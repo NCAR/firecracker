@@ -80,10 +80,10 @@ _WIND_DISPLAY_THRESHOLD:       float = 1e-4
 # pre-first-frame default window, before any field has been measured.
 DISPLAY_TEMP_FLOOR_K:    float = 290.0
 DISPLAY_MIN_TEMP_SPAN_K: float = 10.0
-# Kelvin above ignition that spans the fire-overlay color ramp (ignition -> +span). Sized to
-# the SI flame band: ignition ~550-600 K up through a sustained ~1540 K front to ~2400 K peaks,
-# so the ramp resolves flame structure instead of saturating just above ignition.
-FIRE_COLOR_TEMP_SPAN_K:  float = 1600.0
+# Kelvin above ignition that spans the fire-overlay color ramp (ignition -> +span). With the min
+# ignition threshold at ~573 K (300 C), a 600 K span runs the ramp from ~300 C up to ~900 C; hotter
+# cells clamp at the top of the ramp. Widen this to resolve more structure in the hottest flames.
+FIRE_COLOR_TEMP_SPAN_K:  float = 600.0
 
 # Oxygen views map a fixed window [floor, ceiling] of O2 partial density [kg/m^3] onto the
 # grayscale ramp: at/below the floor renders fully scarce (white), at/above the ceiling fully
@@ -127,6 +127,13 @@ LEGEND_TEXT:   tuple[int, int, int] = (220, 220, 220)
 
 # Kelvin -> Celsius offset, for temperature tick labels.
 KELVIN_TO_CELSIUS: float = 273.15
+
+# The fuel-temperature view uses a fixed color window instead of auto-ranging, so a flame's color
+# maps to the same temperature every frame (and across models in the comparison viewer). The band
+# runs from 0 C up to 1000 C; hotter cells clamp to the ceiling. Stored in Kelvin, the unit of the
+# underlying field (only the colorbar tick labels are rendered back in Celsius).
+FUEL_TEMP_DISPLAY_MIN_K: float = 0.0 + KELVIN_TO_CELSIUS
+FUEL_TEMP_DISPLAY_MAX_K: float = 1000.0 + KELVIN_TO_CELSIUS
 
 # ---------------------------------------------------------------------------
 # Colormaps
