@@ -68,7 +68,7 @@ except ImportError:  # optional dependency; only needed when --wandb is passed
 from autoencoder import ConvAutoencoder
 from config import load_config
 from losses import MSSSIML1Loss
-from ram_loader import RamBatchLoader
+from ram_loader import RamBatchLoader, prewarm_shards
 from rollout import BatchedRollout, FireDataset
 from strided_autoencoder import StridedConvAutoencoder
 
@@ -318,6 +318,12 @@ def main() -> None:
                         help="'ram' (default): thread-prefetched in-RAM batch loader, no worker "
                              "processes (safe under heavy packing, no shared-memory crash). "
                              "'dataloader': stock torch DataLoader with --num-workers workers")
+    parser.add_argument("--prewarm", action=argparse.BooleanOptionalAction, default=True,
+                        help="stream all shards sequentially in a background thread at startup to "
+                             "warm the OS page cache, overlapping the first epoch (default: on). "
+                             "Avoids the ~30-min epoch-1 tax from a shuffled first read faulting "
+                             "pages in random order off the parallel filesystem. --no-prewarm "
+                             "disables it")
     parser.add_argument("--amp", action="store_true",
                         help="use mixed-precision autocast + GradScaler (CUDA only). Keeps float32 "
                              "master weights; mutually exclusive with a half --weight-dtype")
@@ -393,6 +399,12 @@ def main() -> None:
     # 1. Dataset --------------------------------------------------------------
     build_dataset_if_needed(args, config)
     dataset = FireDataset(args.data)
+    # Decouple the first read of the data from training: stream all shards sequentially into the
+    # (node-shared) page cache on a background thread so epoch 1 overlaps the load instead of
+    # driving scattered random reads off GLADE. Fire-and-forget -- the thread is a daemon.
+    if args.prewarm:
+        print(f"prewarm: streaming {len(dataset.shard_paths)} shards into page cache (background)")
+        prewarm_shards(dataset)
     # Normalization is baked into the shards offline (tools/normalize_dataset.py) so the training
     # hot path stays a plain memmap copy. Warn if the data hasn't been standardized; the applied
     # per-channel mean/std travel in <data>/stats.json (recorded in the checkpoint for inference).

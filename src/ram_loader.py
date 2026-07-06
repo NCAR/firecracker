@@ -27,6 +27,33 @@ import numpy as np
 import torch
 
 
+def prewarm_shards(dataset, *, block: int = 8 << 20) -> threading.Thread:
+    """Stream every shard front-to-back in a background thread to fault its pages into the
+    OS page cache, decoupling the first read of the data from the training loop.
+
+    Without this, the shuffled first epoch is the first touch of every page and drives a storm
+    of scattered random reads across the (memmapped) shards on the parallel filesystem -- the
+    ~30-minute epoch-1 tax. A plain sequential read of each shard is far cheaper on GLADE than
+    that random access, and the page cache is shared node-wide, so one prewarm pass warms the
+    cache for every trainer packed on the node. Reading whole files as raw bytes (no npy parse)
+    releases the GIL, so the prewarm overlaps GPU compute: launch it right after the dataset is
+    built and epoch 1 races the prewarm, finding pages progressively warm.
+
+    Returns the started daemon thread (join() to block until the cache is warm, or ignore it to
+    let the prewarm overlap training). `block` is the sequential read chunk in bytes.
+    """
+
+    def run() -> None:
+        for p in dataset.shard_paths:
+            with open(p, "rb", buffering=0) as f:
+                while f.read(block):
+                    pass
+
+    thread = threading.Thread(target=run, name="prewarm", daemon=True)
+    thread.start()
+    return thread
+
+
 class RamBatchLoader:
     """Thread-prefetched batch loader over a FireDataset's memmapped shards.
 
