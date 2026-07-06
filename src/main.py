@@ -324,6 +324,10 @@ if __name__ == "__main__":
         help="run with no window and no real-time throttle (fastest; runs to max_steps)",
     )
     parser.add_argument(
+        "--steps", type=int, metavar="N",
+        help="run for N steps then truncate (overrides [environment].max_steps)",
+    )
+    parser.add_argument(
         "--model", metavar="PATH", nargs="+",
         help="load one or more trained autoencoder checkpoints (each a .pt file, a directory to "
              "take best.pt from, or a name resolved under models/) and show their reconstructions "
@@ -336,6 +340,10 @@ if __name__ == "__main__":
         parser.error("--model needs a window to draw into; it can't be combined with --headless.")
 
     config = load_config(args.config)
+    if args.steps is not None:
+        if args.steps < 1:
+            parser.error(f"--steps must be >= 1, got {args.steps}")
+        config.setdefault("environment", {})["max_steps"] = args.steps
     if args.model:
         run_comparison(config, args.model, map_name=args.map, maps_dir=args.maps_dir)
     elif args.headless:
