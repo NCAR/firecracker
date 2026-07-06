@@ -338,6 +338,10 @@ def main() -> None:
     parser.add_argument("--latent-dim", type=int, default=None,
                         help="width of the dense latent vector the flattened feature map "
                              "projects to; default from [autoencoder.<arch>].latent_dim")
+    parser.add_argument("--normalize-latent", action=argparse.BooleanOptionalAction, default=None,
+                        help="L2-normalize the latent to unit magnitude (project onto the unit "
+                             "hypersphere). --no-normalize-latent disables it; default from "
+                             "[autoencoder.<arch>].normalize_latent (on if unset)")
     # Bookkeeping
     parser.add_argument("--out", default="checkpoints", help="dir to write checkpoints into")
     parser.add_argument("--save-interval", type=int, default=5,
@@ -381,6 +385,10 @@ def main() -> None:
     channels = args.channels if args.channels is not None else arch_cfg.get("channels")
     channels = tuple(channels) if channels is not None else None
     latent_dim = args.latent_dim if args.latent_dim is not None else arch_cfg.get("latent_dim")
+    normalize_latent = (
+        args.normalize_latent if args.normalize_latent is not None
+        else arch_cfg.get("normalize_latent")
+    )
 
     # 1. Dataset --------------------------------------------------------------
     build_dataset_if_needed(args, config)
@@ -438,11 +446,14 @@ def main() -> None:
         model_kwargs["channels"] = channels
     if latent_dim is not None:
         model_kwargs["latent_dim"] = latent_dim
+    if normalize_latent is not None:
+        model_kwargs["normalize_latent"] = normalize_latent
     model = ARCHITECTURES[arch](**model_kwargs).to(device=device, dtype=weight_dtype)
     n_params = sum(p.numel() for p in model.parameters())
     conv_shape = f"{model.conv_channels}x{model.conv_spatial}x{model.conv_spatial}"
     print(f"model: arch={arch} channels={tuple(model.channels)} conv_latent={conv_shape} "
-          f"latent_dim={model.latent_dim} params={n_params:,}")
+          f"latent_dim={model.latent_dim} normalize_latent={model.normalize_latent} "
+          f"params={n_params:,}")
 
     if args.loss == "huber":
         loss_fn: nn.Module = nn.HuberLoss(delta=args.huber_delta)
@@ -467,6 +478,7 @@ def main() -> None:
         "grid_size": grid_size,
         "channels": list(model.channels),
         "latent_dim": model.latent_dim,
+        "normalize_latent": model.normalize_latent,
         # The dtype the weights are saved in; eval rebuilds the model in it (or up-casts to float32
         # on CPU, which is lossless from bfloat16). AMP trains float32 weights, so record float32.
         "weight_dtype": str(weight_dtype).removeprefix("torch."),

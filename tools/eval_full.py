@@ -31,6 +31,8 @@ def build_model(mc: dict, device: torch.device, dtype: torch.dtype) -> nn.Module
     m = ARCHITECTURES[mc["arch"]](
         in_channels=mc["in_channels"], grid_size=mc["grid_size"],
         channels=tuple(mc["channels"]), latent_dim=mc["latent_dim"],
+        # Absent in pre-normalization checkpoints; they were trained without it.
+        normalize_latent=mc.get("normalize_latent", False),
     )
     return m.to(device=device, dtype=dtype)
 

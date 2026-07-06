@@ -38,6 +38,7 @@ Quick use:
 from typing import Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -143,6 +144,9 @@ class ConvAutoencoder(nn.Module):
                      conv channel count before flattening; len(channels) sets how far H/W halve.
         latent_dim:  width of the dense latent vector the flattened feature map projects to.
         activation:  activation module class used between conv layers.
+        normalize_latent: L2-normalize the latent so every vector has unit magnitude (lies on the
+                     unit hypersphere). On by default; makes cosine similarity the natural latent
+                     metric for the downstream world-model objectives.
 
     The encoder produces a `(channels[-1], N // 2**len(channels), N // 2**len(channels))`
     feature map, which is flattened and projected by a linear layer to a `latent_dim` vector.
@@ -157,6 +161,7 @@ class ConvAutoencoder(nn.Module):
         channels: Sequence[int] = (16, 32, 64, 128, 256, 512),
         latent_dim: int = 256,
         activation: type[nn.Module] = nn.ReLU,
+        normalize_latent: bool = True,
     ) -> None:
         super().__init__()
         n_stages = len(channels)
@@ -172,6 +177,7 @@ class ConvAutoencoder(nn.Module):
         self.conv_spatial = grid_size // (2 ** n_stages)
         self.flat_dim = self.conv_channels * self.conv_spatial * self.conv_spatial
         self.latent_dim = latent_dim
+        self.normalize_latent = normalize_latent
 
         self.encoder = Encoder(in_channels, channels, activation)
         self.to_latent = nn.Linear(self.flat_dim, latent_dim)
@@ -179,9 +185,16 @@ class ConvAutoencoder(nn.Module):
         self.decoder = Decoder(in_channels, channels, activation)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Map a B x C x N x N batch to its B x latent_dim latent vector."""
+        """Map a B x C x N x N batch to its B x latent_dim latent vector.
+
+        With `normalize_latent`, the vector is L2-normalized to unit magnitude (projected onto the
+        unit hypersphere); the decoder's `from_latent` layer learns to rescale it.
+        """
         h = self.encoder(x)
-        return self.to_latent(h.flatten(1))
+        z = self.to_latent(h.flatten(1))
+        if self.normalize_latent:
+            z = F.normalize(z, dim=-1)
+        return z
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Map a B x latent_dim latent vector back to a B x C x N x N reconstruction."""
