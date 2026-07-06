@@ -70,6 +70,7 @@ from torch.utils.data import Dataset
 from config import load_config, boundary_pad
 from simulation import Simulation, SimState, obs_channel_names
 from map_loader import load_map, resolve_map, list_maps, validate_against_config
+from gen_maps import MapGenerator
 
 DEFAULT_GRID_SIZE = 256
 
@@ -117,6 +118,11 @@ class BatchedRollout:
         maps_cfg = cfg.get("maps", {})
 
         self._sim = Simulation(config)
+        # Reuses the map generator's elementwise biome classifier (thresholds only, no device/noise)
+        # to label each world's cells for the one-hot biome observation channels, sharing one source
+        # of truth with fuel placement -- the same thing FirecrackerEnv does for the BIOME view.
+        self._biome_gen = MapGenerator(config)
+        self._biome_onehot: torch.Tensor | None = None   # (B, N_biome, N, N) static per-world one-hot
 
         # Explicit constructor args win over config, which wins over code defaults.
         self.num_envs       = int(num_envs       if num_envs       is not None else roll_cfg.get("num_envs",       64))
@@ -272,6 +278,12 @@ class BatchedRollout:
             radiant_flux=torch.zeros_like(mass),
             channel_gain=channel_gain,
         )
+        # One-hot vegetation biome per world for the observation, classified over the padded grid
+        # from the same terrain + rest surface temperature the generator used at bake time.
+        # classify_biomes is elementwise, so this stacks straight into (B, N_biome, N, N); the
+        # sponge ring crops off in observe() alongside the other channels.
+        wood, grass, shrub = self._biome_gen.classify_biomes(terrain, self._state.temp_eq)
+        self._biome_onehot = torch.stack([wood, grass, shrub], dim=1).to(self._sim.dtype)
         if self._spawn_fire:
             self._ignite()
         self._filled = 0
@@ -320,7 +332,10 @@ class BatchedRollout:
         # falling back to the prognostic wind when no channeling layer is present.
         wind_x = s.x_wind_fire if s.x_wind_fire is not None else s.x_wind_vel
         wind_y = s.y_wind_fire if s.y_wind_fire is not None else s.y_wind_vel
-        obs = Simulation.build_observation(s.fuel_temperatures, s.fuel, s.terrain, wind_x, wind_y)
+        obs = Simulation.build_observation(
+            s.air_temperatures, s.fuel_temperatures, s.fuel, s.terrain, wind_x, wind_y,
+            self._biome_onehot, self._sim.ignition_thresholds,
+        )
         if self._pad == 0:
             return obs
         p, g = self._pad, self.grid_size

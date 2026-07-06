@@ -17,10 +17,11 @@ Press TAB to flip the model panels between their reconstruction and a per-cell |
 error heatmap for the shown field (the physics panel is unaffected). With more than one model the
 error panels share a color scale so their magnitudes are directly comparable.
 
-The autoencoder only ever sees the world-model *observation* — the normalized stack of
-fuel_temperature, one fuel_<type> mass channel per fuel type, terrain, and the two near-surface
-wind components (see Simulation.build_observation). Only views backed by those channels can be
-reconstructed (fuel temperature, terrain, wind speed, fire); other views (air temperature, oxygen,
+The autoencoder only ever sees the world-model *observation* — the normalized stack of air
+temperature, one fuel_temperature_<type> channel and one fuel_<type> mass channel per fuel type,
+terrain, the two near-surface wind components, the one-hot vegetation biome, and a binary ignited
+mask (see Simulation.build_observation). Only views backed by those channels can be reconstructed
+(air temperature, fuel temperature, terrain, wind speed, fire, biome); other views (oxygen,
 pressure, radiant heat, ...) draw from state that is not in the observation, so the model panel
 shows a "not in observation" placeholder for them while the physics panel still renders.
 
@@ -44,13 +45,16 @@ import physics_constants as pc
 from autoencoder import ConvAutoencoder
 from strided_autoencoder import StridedConvAutoencoder
 from firecracker_env import FirecrackerEnv, ViewMode, TARGET_FPS
-from simulation import OBS_CHANNELS_PRE, OBS_CHANNELS_POST, obs_channel_names
+from simulation import (
+    OBS_CHANNELS_PRE, OBS_CHANNELS_POST, OBS_CHANNELS_BIOME, OBS_CHANNEL_IGNITED, obs_channel_names,
+)
 from rendering import (
     LEGEND_PANEL_WIDTH,
     build_color_surface,
     build_terrain_surface,
     build_wind_speed_surface,
     build_fire_surface,
+    build_biome_surface,
     build_legend_panel,
     heat_colormap,
 )
@@ -74,10 +78,12 @@ WEIGHT_DTYPES = {
 # View modes whose field is fully recoverable from the observation channels, so the model panel
 # can render them. Every other mode draws from non-observed state and gets a placeholder.
 RECONSTRUCTABLE: frozenset[ViewMode] = frozenset({
+    ViewMode.TEMPERATURE,
     ViewMode.FUEL_TEMPERATURE,
     ViewMode.TERRAIN,
     ViewMode.WIND_SPEED,
     ViewMode.FIRE,
+    ViewMode.BIOME,
 })
 
 # Layout constants for the composited window.
@@ -196,20 +202,28 @@ class ComparisonViewer:
 
         n_fuel = env._sim.num_fuel_types
         self.n_fuel = n_fuel
-        # Observation channel layout (see obs_channel_names): fuel_temperature, then one fuel_<type>
-        # mass channel per fuel type, then terrain, wind_x, wind_y.
-        self.i_fuel_temp = 0
-        self.i_fuel = slice(1, 1 + n_fuel)
-        self.i_terrain = 1 + n_fuel
-        self.i_wind_x = 2 + n_fuel
-        self.i_wind_y = 3 + n_fuel
+        # Observation channel layout (see obs_channel_names): air_temperature, then one
+        # fuel_temperature_<type> channel per fuel type, then one fuel_<type> mass channel per fuel
+        # type, then terrain, wind_x, wind_y, the one-hot biome channels, and the ignited mask.
+        n_biome = len(OBS_CHANNELS_BIOME)
+        self.i_air_temp = 0
+        self.i_fuel_temp = slice(1, 1 + n_fuel)
+        self.i_fuel = slice(1 + n_fuel, 1 + 2 * n_fuel)
+        self.i_terrain = 1 + 2 * n_fuel
+        self.i_wind_x = 2 + 2 * n_fuel
+        self.i_wind_y = 3 + 2 * n_fuel
+        self.i_biome = slice(4 + 2 * n_fuel, 4 + 2 * n_fuel + n_biome)
+        self.i_ignited = 4 + 2 * n_fuel + n_biome
 
         # Affine OBS_NORM windows used by build_observation, per channel, for inverting back to
         # physical units. Order and values must mirror Simulation.build_observation exactly.
         windows = (
             [pc.OBS_NORM[c] for c in OBS_CHANNELS_PRE]
+            + [pc.OBS_NORM["fuel_temperature"]] * n_fuel
             + [pc.OBS_NORM["fuel"]] * n_fuel
             + [pc.OBS_NORM[c] for c in OBS_CHANNELS_POST]
+            + [pc.OBS_NORM["biome"]] * n_biome
+            + [pc.OBS_NORM[OBS_CHANNEL_IGNITED]]
         )
         self.offsets = np.array([w[0] for w in windows], dtype=np.float32)
         self.scales = np.array([w[1] for w in windows], dtype=np.float32)
@@ -265,9 +279,14 @@ class ComparisonViewer:
         if mode not in RECONSTRUCTABLE:
             return None
         env, phys, scale = self.env, panel.recon_phys, self.scale
+        if mode == ViewMode.TEMPERATURE:
+            return build_color_surface(
+                phys[self.i_air_temp], scale,
+                env._air_temp_display_min, env._air_temp_display_max,
+            )
         if mode == ViewMode.FUEL_TEMPERATURE:
             return build_color_surface(
-                phys[self.i_fuel_temp], scale,
+                phys[self.i_fuel_temp].max(axis=0), scale,
                 env._fuel_temp_display_min, env._fuel_temp_display_max,
             )
         if mode == ViewMode.TERRAIN:
@@ -276,14 +295,18 @@ class ComparisonViewer:
             return build_wind_speed_surface(
                 phys[self.i_wind_x], phys[self.i_wind_y], scale, env._wind_speed_display_max,
             )
-        # FIRE: the observation carries per-type fuel mass and the hottest fuel temperature (but not
-        # per-type fuel temps or oxygen). Vegetation coloring needs only the mass; the burning
-        # overlay is approximated by broadcasting the hottest temperature across types with oxygen
-        # assumed present, so the reconstructed flame footprint reads against the physics panel.
+        if mode == ViewMode.BIOME:
+            # The one-hot biome channels are a soft distribution in the reconstruction; collapse
+            # them to a hard per-cell label with argmax so the categorical view matches the physics
+            # panel (0 woodland / 1 grassland / 2 shrubland, in OBS_CHANNELS_BIOME order).
+            return build_biome_surface(phys[self.i_biome].argmax(axis=0), scale)
+        # FIRE: the observation carries per-type fuel mass and per-type fuel temperature (but not
+        # oxygen). Vegetation coloring needs only the mass; the burning overlay reads the per-type
+        # temperatures directly with oxygen assumed present, so the reconstructed flame footprint
+        # reads against the physics panel.
         fuel = phys[self.i_fuel]
-        hottest = phys[self.i_fuel_temp]
-        fuel_temps = np.broadcast_to(hottest, fuel.shape)
-        oxygen = np.ones(hottest.shape, dtype=np.float32)
+        fuel_temps = phys[self.i_fuel_temp]
+        oxygen = np.ones(fuel.shape[1:], dtype=np.float32)
         return build_fire_surface(
             fuel_temps, fuel, oxygen, scale,
             self.ignition_thresholds, self.fuel_burnt_threshold, self.fuel_type_names,
@@ -294,14 +317,18 @@ class ComparisonViewer:
         """Per-cell reconstruction error (normalized-OBS units) for the shown field: the channel(s)
         backing the mode when it is reconstructable, else the mean absolute error over all channels."""
         gt, rc = self._gt_obs, panel.recon_obs
+        if mode == ViewMode.TEMPERATURE:
+            return np.abs(gt[self.i_air_temp] - rc[self.i_air_temp])
         if mode == ViewMode.FUEL_TEMPERATURE:
-            return np.abs(gt[self.i_fuel_temp] - rc[self.i_fuel_temp])
+            return np.abs(gt[self.i_fuel_temp] - rc[self.i_fuel_temp]).mean(axis=0)
         if mode == ViewMode.TERRAIN:
             return np.abs(gt[self.i_terrain] - rc[self.i_terrain])
         if mode == ViewMode.WIND_SPEED:
             return np.hypot(gt[self.i_wind_x] - rc[self.i_wind_x], gt[self.i_wind_y] - rc[self.i_wind_y])
         if mode == ViewMode.FIRE:
             return np.abs(gt[self.i_fuel] - rc[self.i_fuel]).mean(axis=0)
+        if mode == ViewMode.BIOME:
+            return np.abs(gt[self.i_biome] - rc[self.i_biome]).mean(axis=0)
         return np.abs(gt - rc).mean(axis=0)
 
     def _placeholder_surface(self) -> pygame.Surface:

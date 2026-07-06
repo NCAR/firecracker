@@ -44,6 +44,9 @@ WIND_REF_M_S:   float = 30.0                # solver's peak-wind calibration tar
 # is intentionally not clamped: flames legitimately exceed the temperature window (they
 # ride a little above 1) rather than saturating the model's view of fire.
 OBS_NORM: dict[str, tuple[float, float]] = {
+    # rest air temperature (~T_REF) -> ~0; a ~1300 K hot plume -> ~1. Air stays well below flame
+    # temperature (unlike the fuel channels), so it gets a tighter window for better resolution.
+    "air_temperature":  (T_REF, 1000.0),
     # rest air/fuel temperature (~T_REF) -> ~0; a ~2300 K flame -> ~1.
     "fuel_temperature": (T_REF, 2000.0),
     # bare ground -> 0; dense forest (~FUEL_REF) -> ~1.
@@ -53,6 +56,10 @@ OBS_NORM: dict[str, tuple[float, float]] = {
     # near-surface fire wind components [m/s]: signed, calm -> 0, a ~30 m/s peak -> ~+/-1.
     "wind_x":           (0.0, WIND_REF_M_S),
     "wind_y":           (0.0, WIND_REF_M_S),
+    # one-hot vegetation biome channels are already 0/1, so the window is the identity.
+    "biome":            (0.0, 1.0),
+    # binary "ignited"/burning mask is already 0/1, so the window is the identity.
+    "ignited":          (0.0, 1.0),
 }
 
 # --- Default discretisation scales -----------------------------------------

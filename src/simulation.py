@@ -21,22 +21,41 @@ import physics_constants as pc
 _MAX_DIFFUSION_COEFF: float = 0.2
 
 # Observation channels, in order, produced by Simulation.build_observation. Each is a single
-# (H, W) field. The stack is the hottest fuel temperature (reduced across types with amax), then
-# one vegetation-mass channel per configured fuel type (fuel_<name>), then terrain and the two
-# near-surface wind components. Because the per-fuel-type channels make the count depend on the
-# configured fuel types, callers derive the ordered names via obs_channel_names(fuel_type_names)
-# rather than reading a fixed tuple. OBS_CHANNELS_PRE/POST are the type-independent channels that
-# bracket the fuel block; every fuel_<name> channel is normalized by the shared "fuel" window in
-# physics_constants.OBS_NORM.
-OBS_CHANNELS_PRE:  tuple[str, ...] = ("fuel_temperature",)
+# (H, W) field. The stack is the near-surface air temperature, then one temperature channel per
+# configured fuel type (fuel_temperature_<name>), then one vegetation-mass channel per fuel type
+# (fuel_<name>), then terrain, the two near-surface wind components, the one-hot vegetation biome
+# (one biome_<name> channel per biome), and finally a binary "ignited" mask. Because the
+# per-fuel-type channels make the count depend on the configured fuel types, callers derive the
+# ordered names via obs_channel_names(fuel_type_names) rather than reading a fixed tuple.
+# OBS_CHANNELS_PRE/POST are the type-independent channels that bracket the two fuel blocks; every
+# fuel_temperature_<name> channel shares the "fuel_temperature" window and every fuel_<name> channel
+# the "fuel" window in physics_constants.OBS_NORM. The biome and ignited channels are already 0/1,
+# so they share the identity "biome" / "ignited" windows.
+OBS_CHANNELS_PRE:  tuple[str, ...] = ("air_temperature",)
 OBS_CHANNELS_POST: tuple[str, ...] = ("terrain", "wind_x", "wind_y")
+# The three non-overlapping vegetation biomes, in the label order gen_maps.classify_biomes returns
+# (0 woodland / 1 grassland / 2 shrubland); one one-hot observation channel per biome.
+BIOME_NAMES: tuple[str, ...] = ("woodland", "grassland", "shrubland")
+OBS_CHANNELS_BIOME: tuple[str, ...] = tuple(f"biome_{n}" for n in BIOME_NAMES)
+# Trailing binary mask: 1 where any fuel type at the cell is at/above its own ignition threshold
+# (i.e. the cell is burning), 0 otherwise. Matches the "burning" test used for rendering and stats.
+OBS_CHANNEL_IGNITED: str = "ignited"
 
 
 def obs_channel_names(fuel_type_names: list[str]) -> tuple[str, ...]:
     """The ordered observation channel names for a run with these fuel types: the fixed pre
-    channels, one fuel_<name> channel per fuel type (in fuel_type_names order), then the fixed
-    post channels. Matches the channel order produced by Simulation.build_observation."""
-    return OBS_CHANNELS_PRE + tuple(f"fuel_{n}" for n in fuel_type_names) + OBS_CHANNELS_POST
+    channels (air temperature), one fuel_temperature_<name> channel per fuel type, then one
+    fuel_<name> mass channel per fuel type (both in fuel_type_names order), then the fixed post
+    channels, the one-hot biome channels, and the trailing ignited mask. Matches the channel order
+    produced by Simulation.build_observation."""
+    return (
+        OBS_CHANNELS_PRE
+        + tuple(f"fuel_temperature_{n}" for n in fuel_type_names)
+        + tuple(f"fuel_{n}" for n in fuel_type_names)
+        + OBS_CHANNELS_POST
+        + OBS_CHANNELS_BIOME
+        + (OBS_CHANNEL_IGNITED,)
+    )
 
 
 @dataclass
@@ -1086,40 +1105,57 @@ class Simulation:
 
     @staticmethod
     def build_observation(
+        air_temperatures: torch.Tensor,   # (..., H, W) near-surface air temperature [K]
         fuel_temperatures: torch.Tensor,  # (..., N_fuel, H, W)
         fuel: torch.Tensor,               # (..., N_fuel, H, W)
         terrain: torch.Tensor,            # (..., H, W)
         wind_x: torch.Tensor,             # (..., H, W) near-surface fire wind u [m/s]
         wind_y: torch.Tensor,             # (..., H, W) near-surface fire wind v [m/s]
+        biome_onehot: torch.Tensor,       # (..., N_biome, H, W) one-hot vegetation biome (0/1)
+        ignition_thresholds: torch.Tensor,  # (N_fuel, 1, 1) per-type ignition temperature [K]
     ) -> torch.Tensor:
         """Stack the observation channels into a normalized (..., C, H, W) observation.
 
-        The channels are (see obs_channel_names): the hottest fuel temperature (amax over
-        types), then one vegetation-mass channel per fuel type (in the fuel stack's order, no
-        longer summed together), then terrain (passed through) and the two near-surface wind
-        components -- the same velocity the fire reads for spread (prognostic wind x channeling
-        gain). N_fuel is read from the fuel stack, so C = 4 + N_fuel. With a leading batch axis
-        the result is the B x C x N x N tensor the world model trains on.
+        The channels are (see obs_channel_names): the near-surface air temperature, then one
+        fuel-temperature channel per fuel type (in the fuel stack's order, no longer reduced to the
+        hottest with amax), then one vegetation-mass channel per fuel type (same order), then
+        terrain (passed through), the two near-surface wind components -- the same velocity the fire
+        reads for spread (prognostic wind x channeling gain) -- the one-hot vegetation biome (one
+        channel per biome), and finally a binary "ignited" mask (1 where any fuel type at the cell
+        is at/above its own ignition threshold, i.e. the cell is burning). N_fuel is read from the
+        fuel stack and N_biome from the biome stack, so C = 5 + 2*N_fuel + N_biome. With a leading
+        batch axis the result is the B x C x N x N tensor the world model trains on.
 
         The raw SI fields span very different magnitudes (K vs kg/m^2 vs m vs m/s), so each
         channel is mapped to roughly [0, 1] by the documented affine window in
         physics_constants.OBS_NORM (value - offset) / scale; every per-type fuel channel shares
-        the "fuel" window. Wind is signed about 0; the high side is not clamped, so flames (and
-        strong gusts) ride a little above 1.
+        the "fuel" window and every biome channel the identity "biome" window. Wind is signed about
+        0; the high side is not clamped, so flames (and strong gusts) ride a little above 1.
         """
+        # Burning mask: any fuel type at/above its own ignition threshold (the canonical "burning"
+        # test, shared with rendering / the cells_burning stat). ignition_thresholds is (N_fuel,1,1)
+        # so it broadcasts against the (..., N_fuel, H, W) temperature stack; reduce over the types.
+        ignited = (fuel_temperatures >= ignition_thresholds).any(dim=-3).to(fuel_temperatures.dtype)
         channels = [
-            fuel_temperatures.amax(dim=-3),  # fuel_temperature: hottest fuel type
-            *fuel.unbind(dim=-3),            # fuel_<type>: per-type vegetation mass
-            terrain,                         # terrain: elevation
-            wind_x,                          # wind_x: near-surface fire wind u
-            wind_y,                          # wind_y: near-surface fire wind v
+            air_temperatures,                   # air_temperature: near-surface air temperature
+            *fuel_temperatures.unbind(dim=-3),  # fuel_temperature_<type>: per-type temperature
+            *fuel.unbind(dim=-3),               # fuel_<type>: per-type vegetation mass
+            terrain,                            # terrain: elevation
+            wind_x,                             # wind_x: near-surface fire wind u
+            wind_y,                             # wind_y: near-surface fire wind v
+            *biome_onehot.unbind(dim=-3),       # biome_<name>: one-hot vegetation biome
+            ignited,                            # ignited: any fuel type above its ignition threshold
         ]
         obs = torch.stack(channels, dim=-3)
         n_fuel = fuel.shape[-3]
+        n_biome = biome_onehot.shape[-3]
         windows = (
             [pc.OBS_NORM[c] for c in OBS_CHANNELS_PRE]
+            + [pc.OBS_NORM["fuel_temperature"]] * n_fuel
             + [pc.OBS_NORM["fuel"]] * n_fuel
             + [pc.OBS_NORM[c] for c in OBS_CHANNELS_POST]
+            + [pc.OBS_NORM["biome"]] * n_biome
+            + [pc.OBS_NORM[OBS_CHANNEL_IGNITED]]
         )
         offsets = torch.tensor([w[0] for w in windows], dtype=obs.dtype, device=obs.device)
         scales  = torch.tensor([w[1] for w in windows], dtype=obs.dtype, device=obs.device)

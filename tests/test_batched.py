@@ -17,7 +17,7 @@ import torch
 
 import physics_constants as pc
 from conftest import to_numpy
-from simulation import Simulation, SimState, obs_channel_names
+from simulation import Simulation, SimState, BIOME_NAMES, obs_channel_names
 from map_loader import save_map
 from config import boundary_pad
 from rollout import (
@@ -124,27 +124,39 @@ def test_build_observation_shape_and_channels():
     by the per-channel affine window in physics_constants.OBS_NORM (see tests/test_observation.py)."""
     B, N = 4, 8
     names = ("grass", "tree")
-    fuel_temps = torch.rand(B, len(names), N, N)
+    air_temps = torch.rand(B, N, N) * 1000.0 + pc.T_REF
+    fuel_temps = torch.rand(B, len(names), N, N) * 1000.0   # 0..1000 K, straddles the thresholds
     fuel = torch.rand(B, len(names), N, N)
     terrain = torch.rand(B, N, N)
     wind_x = torch.rand(B, N, N) * 2.0 - 1.0   # signed
     wind_y = torch.rand(B, N, N) * 2.0 - 1.0
+    # One-hot biome per cell (random of the three classes), stacked to (B, N_biome, N, N).
+    labels = torch.randint(0, len(BIOME_NAMES), (B, N, N))
+    biome_onehot = torch.nn.functional.one_hot(labels, len(BIOME_NAMES)).permute(0, 3, 1, 2).float()
+    ign = torch.tensor([500.0, 600.0]).view(len(names), 1, 1)   # per-type ignition thresholds [K]
 
-    obs = Simulation.build_observation(fuel_temps, fuel, terrain, wind_x, wind_y)
+    obs = Simulation.build_observation(
+        air_temps, fuel_temps, fuel, terrain, wind_x, wind_y, biome_onehot, ign
+    )
 
     def norm(channel, raw):
         offset, scale = pc.OBS_NORM[channel]
         return (to_numpy(raw) - offset) / scale
 
-    # C = 4 fixed channels (fuel_temperature + terrain + 2 wind) + one per fuel type;
-    # this synthetic case uses 2 fuel types -> 6.
+    # C = 5 fixed channels (air temperature + terrain + 2 wind + ignited) + two per fuel type
+    # (temperature + mass) + N_biome one-hot channels; 2 fuel types + 3 biomes -> 12.
     assert obs.shape == (B, len(obs_channel_names(names)), N, N)
-    np.testing.assert_allclose(to_numpy(obs[:, 0]), norm("fuel_temperature", fuel_temps.amax(dim=1)))  # hottest type
-    np.testing.assert_allclose(to_numpy(obs[:, 1]), norm("fuel", fuel[:, 0]))                          # fuel type 0
-    np.testing.assert_allclose(to_numpy(obs[:, 2]), norm("fuel", fuel[:, 1]))                          # fuel type 1
-    np.testing.assert_allclose(to_numpy(obs[:, 3]), norm("terrain", terrain))                          # terrain
-    np.testing.assert_allclose(to_numpy(obs[:, 4]), norm("wind_x", wind_x))                            # fire wind u
-    np.testing.assert_allclose(to_numpy(obs[:, 5]), norm("wind_y", wind_y))                            # fire wind v
+    np.testing.assert_allclose(to_numpy(obs[:, 0]), norm("air_temperature", air_temps))               # air temp
+    np.testing.assert_allclose(to_numpy(obs[:, 1]), norm("fuel_temperature", fuel_temps[:, 0]))       # temp type 0
+    np.testing.assert_allclose(to_numpy(obs[:, 2]), norm("fuel_temperature", fuel_temps[:, 1]))       # temp type 1
+    np.testing.assert_allclose(to_numpy(obs[:, 3]), norm("fuel", fuel[:, 0]))                          # mass type 0
+    np.testing.assert_allclose(to_numpy(obs[:, 4]), norm("fuel", fuel[:, 1]))                          # mass type 1
+    np.testing.assert_allclose(to_numpy(obs[:, 5]), norm("terrain", terrain))                          # terrain
+    np.testing.assert_allclose(to_numpy(obs[:, 6]), norm("wind_x", wind_x))                            # fire wind u
+    np.testing.assert_allclose(to_numpy(obs[:, 7]), norm("wind_y", wind_y))                            # fire wind v
+    np.testing.assert_allclose(to_numpy(obs[:, 8:-1]), to_numpy(biome_onehot))                         # one-hot biome
+    expected_ignited = (fuel_temps >= ign).any(dim=1).to(fuel_temps.dtype)                             # burning mask
+    np.testing.assert_allclose(to_numpy(obs[:, -1]), to_numpy(expected_ignited))
 
 
 def test_rollout_collects_and_samples(tmp_path):
@@ -264,11 +276,15 @@ def _build_small_dataset(tmp_path, *, nested=False):
     config = make_config(grid_size=grid)
     maps_dir = tmp_path / "maps"
     maps_dir.mkdir()
-    # Ramped terrain so the terrain channel isn't spatially constant -- every channel then has
-    # real variance, so standardisation drives each to a genuine unit std (not the constant-channel
-    # no-op guard).
+    # Ramped terrain (across columns) so the terrain channel isn't spatially constant, plus a
+    # temperature ramp across rows that crosses the woodland threshold (298 K) so the map spans all
+    # three biomes (cool -> woodland; warm+low -> grassland; warm+high -> shrubland). With the two
+    # ramps on independent axes every channel -- including each one-hot biome channel -- has real
+    # variance, so standardisation drives each to a genuine unit std (not the constant-channel
+    # no-op guard). temp_eq (which classify_biomes reads) defaults to the air field.
     terrain = (ramp_terrain(grid) * 300.0).astype(np.float32)
-    save_map(maps_dir / "m.npz", pad_map(build_map(grid_size=grid, terrain=terrain),
+    air = (290.0 + ramp_terrain(grid).T * 30.0).astype(np.float32)   # 290..320 K across rows
+    save_map(maps_dir / "m.npz", pad_map(build_map(grid_size=grid, terrain=terrain, air=air),
                                           boundary_pad(config)))
 
     def build(out, seed):
@@ -292,6 +308,12 @@ def test_bake_normalization_zero_mean_unit_std(tmp_path):
     n_ch = int(FireDataset(root).meta["num_channels"])
     assert not FireDataset(root).is_normalized                # raw dataset, not yet flagged
 
+    # A channel whose raw values never vary (e.g. a fully-saturated ignited mask on this tiny grid)
+    # can't be driven to unit std -- bake floors its scale to 1, so it stays at ~0. Note which
+    # channels vary now, before baking overwrites the shards, and expect unit std only for those.
+    raw = FireDataset(root).get_batch(np.arange(len(FireDataset(root)))).to(torch.float64)
+    varying = raw.permute(1, 0, 2, 3).reshape(n_ch, -1).std(dim=1, unbiased=False) >= 1e-8
+
     summary = bake_normalization(root, max_samples=None, workers=3, verbose=False)  # parallel pool
     assert summary["baked"] == 3 and (root / "stats.json").is_file()
 
@@ -302,7 +324,7 @@ def test_bake_normalization_zero_mean_unit_std(tmp_path):
     torch.testing.assert_close(per_ch.mean(dim=1), torch.zeros(n_ch, dtype=torch.float64),
                                atol=1e-4, rtol=0)
     torch.testing.assert_close(per_ch.std(dim=1, unbiased=False),
-                               torch.ones(n_ch, dtype=torch.float64), atol=1e-4, rtol=0)
+                               varying.to(torch.float64), atol=1e-4, rtol=0)
     # __getitem__ and get_batch read the same baked values.
     torch.testing.assert_close(ds[0], batch[0])
 
@@ -326,6 +348,8 @@ def test_channel_stats_match_manual_over_union(tmp_path):
     allx = ds.get_batch(np.arange(len(ds))).to(torch.float64)      # raw, un-normalized
     ref_mean = allx.mean(dim=(0, 2, 3))
     ref_std = allx.std(dim=(0, 2, 3), unbiased=False)
+    ref_std[ref_std < 1e-8] = 1.0   # mirror compute_channel_stats' constant-channel floor (e.g. a
+                                    # fully-saturated ignited mask on this tiny grid) so the no-op matches
     np.testing.assert_allclose(mean, ref_mean.numpy(), atol=1e-6)
     np.testing.assert_allclose(std, ref_std.numpy(), atol=1e-6)
 

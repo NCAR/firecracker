@@ -244,6 +244,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._terrain: np.ndarray | None = None
         self._sunlight: np.ndarray | None = None   # static average solar exposure [0,1] (SUNLIGHT view)
         self._biome_labels: np.ndarray | None = None   # static per-cell biome label 0/1/2 (BIOME view)
+        self._biome_onehot: torch.Tensor | None = None  # static padded one-hot biome (3, N, N) for the observation
         self._u_amb_x: torch.Tensor | None = None   # synoptic ambient wind [m/s]
         self._u_amb_y: torch.Tensor | None = None
         # Phase 6 (Option 2): static terrain-channeling gain and the near-surface wind the fire reads.
@@ -345,9 +346,10 @@ class FirecrackerEnv(gymnasium.Env):
         Identical to what BatchedRollout.observe collects, including the near-surface fire wind
         (prognostic wind x channeling gain) used by the spread physics."""
         obs = Simulation.build_observation(
-            self._fuel_temperatures, self._fuel, self._terrain,
+            self._air_temperatures, self._fuel_temperatures, self._fuel, self._terrain,
             self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel,
             self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel,
+            self._biome_onehot, self._sim.ignition_thresholds,
         )
         return _to_numpy(self._crop(obs)).astype(np.float32)
 
@@ -421,6 +423,17 @@ class FirecrackerEnv(gymnasium.Env):
             _to_numpy(terr_obs), _to_numpy(self._crop(self._temp_eq))
         )
         self._biome_labels = np.where(woodland, 0, np.where(grassland, 1, 2)).astype(np.int64)
+
+        # One-hot biome membership on the padded physics grid for the observation. classify_biomes
+        # is elementwise, so the padded masks crop (in build_observation) to exactly the interior
+        # classification above; classifying over the full grid keeps it aligned with terrain/wind
+        # before the crop. Channel order matches OBS_CHANNELS_BIOME (woodland, grassland, shrubland).
+        pad_wood, pad_grass, pad_shrub = self._biome_gen.classify_biomes(
+            _to_numpy(self._terrain), _to_numpy(self._temp_eq)
+        )
+        self._biome_onehot = self._to_tensor(
+            np.stack([pad_wood, pad_grass, pad_shrub]).astype(np.float32)
+        )
 
         # Optional ignition overlay (random spawn). Maps describe the world at rest; fire is a
         # runtime concern applied on top. The patch is placed in the observed interior (coords are

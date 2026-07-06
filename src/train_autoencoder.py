@@ -17,11 +17,11 @@ Dataset sizing (defaults)
 One "rollout" is a single env's 4096-step trajectory sampled every 64 steps, i.e. 64
 observations. Stepping num_envs=64 worlds in parallel for --rounds=16 yields
 16 * 64 * 64 = 65,536 observations (1024 rollouts) written as 16 shards. Each observation is a
-C x N x N tensor (C = 4 + one channel per fuel type, N = 256), already normalised by
-build_observation; the exact channel count travels in the dataset meta.
+C x N x N tensor (C = 5 + two channels per fuel type + three one-hot biome channels, N = 256),
+already normalised by build_observation; the exact channel count travels in the dataset meta.
 
-At N=256, C=5 the full set is ~86 GB in float32 / ~43 GB in float16 on disk, so --buffer-dtype
-defaults to float16 for the dataset.
+At N=256, C=10 (one fuel type) the full set is ~172 GB in float32 / ~86 GB in float16 on disk, so
+--buffer-dtype defaults to float16 for the dataset.
 
 Model precision
 ---------------
