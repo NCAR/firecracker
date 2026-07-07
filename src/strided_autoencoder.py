@@ -1,20 +1,18 @@
 """
 strided_autoencoder.py
 
-A convolutional autoencoder in PyTorch, a sibling to `autoencoder.ConvAutoencoder`.
+A convolutional autoencoder in PyTorch for the Firecracker world-model observation stack.
 
-This variant down/upsamples with strided convolutions rather than pixel-unshuffle/shuffle:
+It down/upsamples with parameter-free pooling:
 
-    DownBlock : 3x3 (same) conv -> 2x2 stride-2 conv             (H/W halve, channels set)
-    UpBlock   : 2x2 stride-2 transposed conv -> 3x3 (same) conv  (H/W double, channels set)
+    DownBlock : 3x3 (same) conv -> 2x2 average pool               (H/W halve, channels set by conv)
+    UpBlock   : 2x2 nearest-neighbor upsample -> 3x3 (same) conv  (H/W double, channels set by conv)
 
-Where `autoencoder.ConvAutoencoder` keeps resampling lossless (a space<->depth reshape) and
-lets a 1x1 conv pick the channels, here the 2x2 stride-2 conv *is* the resampler: it halves
-H/W and sets the output width in one learned, parametric step (and the transposed conv mirrors
-it on the way up). A 2x2 kernel at stride 2 tiles the input without overlap, so it is the
-strided analog of the shuffle reshape and avoids the checkerboard artifacts that overlapping
-transposed-conv kernels are prone to. The accompanying 3x3 (same) conv does the per-stage
-feature learning, exactly as in the shuffle variant.
+The resample and the channel change are decoupled: a 3x3 (same) conv sets the per-stage width
+and does the feature learning, while a parameter-free 2x2 average pool halves H/W (and
+nearest-neighbor upsampling mirrors it on the way up). This "resize-convolution" ordering keeps
+every learned kernel at unit stride, so it avoids the checkerboard artifacts that overlapping
+stride-2 transposed-conv kernels are prone to.
 
 The encoder is a stack of DownBlocks that halve H/W and grow channels at every stage,
 producing a spatial feature map that is then flattened and projected by a dense layer to a
@@ -23,9 +21,9 @@ map, reshapes it, and applies a stack of UpBlocks back to the original `C x N x 
 is a baseline for compressing the world-model observation stack (see
 `Simulation.build_observation` / `obs_channel_names`).
 
-With the default six stages on a 256x256 input the encoder produces a 512x4x4 feature map
-(channels x height x width), which flattens to 8192 features and projects down to a 256-d
-latent vector. The grid size `N` must be divisible by `2 ** len(channels)` so every strided
+With the default six stages on a 256x256 input the encoder produces a 256x4x4 feature map
+(channels x height x width), which flattens to 4096 features and projects down to a 512-d
+latent vector. The grid size `N` must be divisible by `2 ** len(channels)` so every pooling
 stage lands on an integer spatial size.
 
 Quick use:
@@ -34,9 +32,9 @@ Quick use:
     from strided_autoencoder import StridedConvAutoencoder
 
     model = StridedConvAutoencoder(in_channels=5, grid_size=256,
-                                   channels=(16, 32, 64, 128, 256, 512), latent_dim=256)
+                                   channels=(32, 64, 128, 256, 256, 256), latent_dim=512)
     x = torch.randn(8, 5, 256, 256)       # a B x C x N x N batch
-    x_hat, z = model(x)                   # reconstruction and B x 256 latent vector
+    x_hat, z = model(x)                   # reconstruction and B x 512 latent vector
     loss = torch.nn.functional.mse_loss(x_hat, x)
 """
 
@@ -48,9 +46,9 @@ from torch import nn
 
 
 class DownBlock(nn.Module):
-    """3x3 (same) conv for per-stage feature learning, then a 2x2 stride-2 conv that halves
-    H/W and sets the output width in one step. Each conv is followed by a BatchNorm2d
-    (conv -> norm -> activation)."""
+    """3x3 (same) conv that sets the output width and does the per-stage feature learning, then a
+    2x2 average pool that halves H/W. The conv is followed by a BatchNorm2d
+    (conv -> norm -> activation -> pool)."""
 
     def __init__(self, in_ch: int, out_ch: int, activation: type[nn.Module] = nn.ReLU) -> None:
         super().__init__()
@@ -58,9 +56,7 @@ class DownBlock(nn.Module):
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(out_ch),
             activation(),
-            nn.Conv2d(out_ch, out_ch, kernel_size=2, stride=2),  # H/W halved
-            nn.BatchNorm2d(out_ch),
-            activation(),
+            nn.AvgPool2d(kernel_size=2, stride=2),  # H/W halved
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,9 +64,10 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """2x2 stride-2 transposed conv that doubles H/W and sets the output width, then a 3x3
-    (same) conv. Each conv is followed by a BatchNorm2d (conv -> norm -> activation). The final
-    block omits its trailing norm and activation so it emits the raw reconstruction."""
+    """2x2 nearest-neighbor upsample that doubles H/W, then a 3x3 (same) conv that sets the
+    output width and does the per-stage feature learning. The conv is followed by a BatchNorm2d
+    (upsample -> conv -> norm -> activation). The final block omits its trailing norm and
+    activation so it emits the raw reconstruction."""
 
     def __init__(
         self,
@@ -81,10 +78,8 @@ class UpBlock(nn.Module):
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = [
-            nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2),  # H/W doubled
-            nn.BatchNorm2d(out_ch),
-            activation(),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
+            nn.Upsample(scale_factor=2, mode="nearest"),  # H/W doubled
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
         ]
         if not final:
             layers += [nn.BatchNorm2d(out_ch), activation()]
@@ -137,10 +132,9 @@ class Decoder(nn.Module):
 
 
 class StridedConvAutoencoder(nn.Module):
-    """A symmetric convolutional autoencoder using strided convs for resampling.
+    """A symmetric convolutional autoencoder using pool/upsample resampling.
 
-    A drop-in alternative to `autoencoder.ConvAutoencoder` with the same constructor signature
-    and (reconstruction, latent) forward contract.
+    Emits a (reconstruction, latent) pair from its forward pass.
 
     Args:
         in_channels: number of input channels (e.g. len(obs_channel_names(...))).
@@ -155,16 +149,16 @@ class StridedConvAutoencoder(nn.Module):
 
     The encoder produces a `(channels[-1], N // 2**len(channels), N // 2**len(channels))`
     feature map, which is flattened and projected by a linear layer to a `latent_dim` vector.
-    With the defaults (N=256, six stages, latent_dim=256) the feature map is `512 x 4 x 4`,
-    flattening to 8192 features before the projection to a 256-d latent.
+    With the defaults (N=256, six stages, latent_dim=512) the feature map is `256 x 4 x 4`,
+    flattening to 4096 features before the projection to a 512-d latent.
     """
 
     def __init__(
         self,
         in_channels: int = 5,
         grid_size: int = 256,
-        channels: Sequence[int] = (16, 32, 64, 128, 256, 512),
-        latent_dim: int = 256,
+        channels: Sequence[int] = (32, 64, 128, 256, 256, 256),
+        latent_dim: int = 512,
         activation: type[nn.Module] = nn.ReLU,
         normalize_latent: bool = True,
     ) -> None:

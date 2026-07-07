@@ -1,6 +1,6 @@
 # Trained autoencoder checkpoints
 
-Best replicate from each of the two 16-replicate grouped-parallel sweeps
+Best replicate from each 16-replicate grouped-parallel sweep
 (50 epochs, seeds 0–15). Each file is a `torch.save` dict with keys
 `epoch`, `val_loss`, `model_state`, and `model_config`. The Adam
 `optimizer_state` has been stripped (weights are bit-exact; only training
@@ -8,7 +8,6 @@ resumption is unavailable), which cuts each file from ~99 MiB to ~33 MiB.
 
 | File                             | Grouping / loss  | In ch | Dtype    | Source run                                         | Best epoch | Val loss |
 |----------------------------------|------------------|------:|----------|----------------------------------------------------|-----------:|---------:|
-| `shuffle_best.pt`                | shuffled / mse   |     8 | float32  | `sweep_shuffle_20260703_011310/run_02`             |         49 | 0.253177 |
 | `strided_best.pt`                | strided / mse    |     8 | float32  | `sweep_strided_20260703_011310/run_02`             |         49 | 0.249810 |
 | `strided_huber_best_bf16.pt`     | strided / huber  |     8 | bfloat16 | `sweep_strided_huber_20260705_*/`                  |         49 | 0.095380 |
 | `strided_huber_16ch_best_bf16.pt`| strided / huber  |    16 | bfloat16 | `sweep_strided_huber_lr1e3_16ch_20260706_112844/run_09` | 48 | 0.091211 |

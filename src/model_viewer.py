@@ -42,7 +42,6 @@ import pygame
 import torch
 
 import physics_constants as pc
-from autoencoder import ConvAutoencoder
 from strided_autoencoder import StridedConvAutoencoder
 from firecracker_env import FirecrackerEnv, ViewMode, TARGET_FPS
 from simulation import (
@@ -59,11 +58,9 @@ from rendering import (
     heat_colormap,
 )
 
-# The autoencoder and the strided variant share the (reconstruction, latent) forward contract and
-# the same constructor signature; the checkpoint's model_config["arch"] picks one. Kept in step with
+# The checkpoint's model_config["arch"] selects the architecture. Kept in step with
 # train_autoencoder.ARCHITECTURES (imported directly here to avoid pulling in the training deps).
 ARCHITECTURES = {
-    "shuffle": ConvAutoencoder,
     "strided": StridedConvAutoencoder,
 }
 
@@ -132,7 +129,7 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
         raise SystemExit(f"'{path}' is not a Firecracker autoencoder checkpoint "
                          f"(missing model_config/model_state).")
     cfg = ckpt["model_config"]
-    arch = cfg.get("arch", "shuffle")
+    arch = cfg.get("arch", "strided")
     if arch not in ARCHITECTURES:
         raise SystemExit(f"'{path}' names unknown arch '{arch}'; expected one of {list(ARCHITECTURES)}.")
 

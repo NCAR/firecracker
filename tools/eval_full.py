@@ -19,11 +19,10 @@ import torch
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from autoencoder import ConvAutoencoder
 from strided_autoencoder import StridedConvAutoencoder
 from rollout import FireDataset
 
-ARCHITECTURES = {"shuffle": ConvAutoencoder, "strided": StridedConvAutoencoder}
+ARCHITECTURES = {"strided": StridedConvAutoencoder}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
 

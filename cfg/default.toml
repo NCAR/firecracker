@@ -343,26 +343,21 @@ buffer_dtype   = "float32" # pool storage dtype ("float32" or "float16")
 
 [autoencoder]
 # Convolutional autoencoder pretraining (src/train_autoencoder.py). `arch` selects the
-# resampling style; each style ("shuffle" = pixel-unshuffle/shuffle, "strided" = 2x2 stride-2
-# conv) has its own subtable so the two can be sized independently. CLI flags on
+# resampling style; each style has its own subtable so it can be sized independently. The only
+# style is "strided" (avg-pool downsample / nearest-neighbor upsample). CLI flags on
 # train_autoencoder.py (--arch/--channels/--latent-dim) override these.
 #
 # `channels` is the encoder width per downsample stage; the last entry is the conv channel
 # count before flattening, and len(channels) sets how far H/W halve. On a 256x256 input the six
-# defaults below produce a 512x4x4 feature map (flatten = 8192), which a dense layer projects
-# to a `latent_dim` vector. grid_size must be divisible by 2**len(channels). Roughly 8.7M
+# defaults below produce a 256x4x4 feature map (flatten = 4096), which a dense layer projects
+# to a `latent_dim` vector. grid_size must be divisible by 2**len(channels). Roughly 7.3M
 # params at these settings.
-arch = "shuffle"
+arch = "strided"
 
 # `normalize_latent` L2-normalizes the latent to unit magnitude (projects it onto the unit
 # hypersphere); the decoder's dense layer learns to rescale it. On by default.
-[autoencoder.shuffle]
-channels         = [16, 32, 64, 128, 256, 512]  # pixel-unshuffle/shuffle encoder widths per stage
-latent_dim       = 256                          # dense latent vector width
-normalize_latent = true                         # unit-magnitude latent (unit hypersphere)
-
 [autoencoder.strided]
-channels         = [64, 64, 128, 128, 256, 256]  # 2x2 stride-2 conv encoder widths per stage
+channels         = [32, 64, 128, 256, 256, 256]  # encoder widths per downsample stage
 latent_dim       = 512                           # dense latent vector width
 normalize_latent = true                          # unit-magnitude latent (unit hypersphere)
 
