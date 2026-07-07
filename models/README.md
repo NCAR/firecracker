@@ -12,6 +12,13 @@ resumption is unavailable), which cuts each file from ~99 MiB to ~33 MiB.
 | `strided_best.pt`                | strided / mse    |     8 | float32  | `sweep_strided_20260703_011310/run_02`             |         49 | 0.249810 |
 | `strided_huber_best_bf16.pt`     | strided / huber  |     8 | bfloat16 | `sweep_strided_huber_20260705_*/`                  |         49 | 0.095380 |
 | `strided_huber_16ch_best_bf16.pt`| strided / huber  |    16 | bfloat16 | `sweep_strided_huber_lr1e3_16ch_20260706_112844/run_09` | 48 | 0.091211 |
+| `strided_huber_16ch_arch2_best_bf16.pt` | strided / huber (arch2) | 16 | bfloat16 | `sweep_strided_arch2_16ch_20260706_161842/run_03` | 50 | 0.084998 |
+
+The `arch2` model is the retuned strided stack — tapered widths
+`[64, 64, 128, 128, 256, 256]` with a 512-d latent — vs. the earlier 16ch
+model's `[16, 32, 64, 128, 256, 512]` / 256-d latent; both are recorded in each
+checkpoint's `model_config`. It is the best (lowest-val-loss) replicate of the
+`strided-16ch-arch2` (lr 1e-3, batch 64) sweep.
 
 Selected as the lowest-val-loss replicate in each sweep. Per-channel input
 normalization stats live with the dataset (`<data>/stats.json`) and the
