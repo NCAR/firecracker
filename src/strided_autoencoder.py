@@ -5,14 +5,17 @@ A convolutional autoencoder in PyTorch for the Firecracker world-model observati
 
 It down/upsamples with parameter-free pooling:
 
-    DownBlock : 3x3 (same) conv -> 2x2 average pool               (H/W halve, channels set by conv)
-    UpBlock   : 2x2 nearest-neighbor upsample -> 3x3 (same) conv  (H/W double, channels set by conv)
+    DownBlock : residual double-conv -> 2x2 average pool               (H/W halve, channels set by conv)
+    UpBlock   : 2x2 nearest-neighbor upsample -> residual double-conv  (H/W double, channels set by conv)
 
-The resample and the channel change are decoupled: a 3x3 (same) conv sets the per-stage width
-and does the feature learning, while a parameter-free 2x2 average pool halves H/W (and
-nearest-neighbor upsampling mirrors it on the way up). This "resize-convolution" ordering keeps
-every learned kernel at unit stride, so it avoids the checkerboard artifacts that overlapping
-stride-2 transposed-conv kernels are prone to.
+The resample and the channel change are decoupled: a residual pair of 3x3 (same) convs
+((conv -> BN -> act) x2 with a 1x1/identity skip around them) sets the per-stage width and does
+the feature learning, while a parameter-free 2x2 average pool halves H/W (and nearest-neighbor
+upsampling mirrors it on the way up). This "resize-convolution" ordering keeps every learned
+kernel at unit stride, so it avoids the checkerboard artifacts that overlapping stride-2
+transposed-conv kernels are prone to. The per-stage skip connection gives gradients an identity
+path around every stage so depth can be stacked without the gradient vanishing; the final
+UpBlock is a plain resize-conv reconstruction head (no BN/act/residual) that emits raw output.
 
 The encoder is a stack of DownBlocks that halve H/W and grow channels at every stage,
 producing a spatial feature map that is then flattened and projected by a dense layer to a
@@ -46,28 +49,50 @@ from torch import nn
 
 
 class DownBlock(nn.Module):
-    """3x3 (same) conv that sets the output width and does the per-stage feature learning, then a
-    2x2 average pool that halves H/W. The conv is followed by a BatchNorm2d
-    (conv -> norm -> activation -> pool)."""
+    """Residual double-conv stage, then a 2x2 average pool that halves H/W.
+
+    Two 3x3 (same) convs each followed by BatchNorm + activation do the per-stage feature
+    learning ((conv -> norm -> act) x2), wrapped in a skip connection: the block computes
+    act(F(x) + shortcut(x)) before pooling, where F is the two-conv residual branch. The skip
+    gives gradients a direct identity path around the stage, so gradient magnitude does not
+    decay with depth (the vanishing-gradient mitigation as more stages are stacked). The
+    shortcut is a 1x1 projection when the stage changes channel width (else a plain identity).
+    The second BN's weight (gamma) is zero-initialised so the block starts as the identity map
+    (shortcut only) and learns its residual from there -- a deep stack thus begins as its
+    shallow self and grows depth as training needs it."""
 
     def __init__(self, in_ch: int, out_ch: int, activation: type[nn.Module] = nn.ReLU) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_ch),
-            activation(),
-            nn.AvgPool2d(kernel_size=2, stride=2),  # H/W halved
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.act = activation()
+        # 1x1 projection so the skip matches the stage's output width (identity when unchanged).
+        self.shortcut: nn.Module = (
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1)
+            if in_ch != out_ch else nn.Identity()
         )
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)  # H/W halved
+        nn.init.zeros_(self.bn2.weight)  # block starts as identity (shortcut only)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        h = self.act(self.bn1(self.conv1(x)))
+        h = self.bn2(self.conv2(h))
+        h = self.act(h + self.shortcut(x))
+        return self.pool(h)
 
 
 class UpBlock(nn.Module):
-    """2x2 nearest-neighbor upsample that doubles H/W, then a 3x3 (same) conv that sets the
-    output width and does the per-stage feature learning. The conv is followed by a BatchNorm2d
-    (upsample -> conv -> norm -> activation). The final block omits its trailing norm and
-    activation so it emits the raw reconstruction."""
+    """2x2 nearest-neighbor upsample that doubles H/W, then a residual double-conv stage that
+    mirrors DownBlock (minus the pool): upsample -> act(F(x) + shortcut(x)), where F is two
+    3x3 (same) convs each with BatchNorm + activation and the shortcut is a 1x1 projection (or
+    identity) around them. The second BN's gamma is zero-initialised so the block starts as the
+    identity, matching DownBlock.
+
+    The final block is the raw reconstruction head: a single resize-conv with no norm,
+    activation, or residual, so it can emit unbounded (including negative) reconstruction values
+    -- a residual ReLU head would clamp them and a skip would not match the input-channel width."""
 
     def __init__(
         self,
@@ -77,16 +102,29 @@ class UpBlock(nn.Module):
         final: bool = False,
     ) -> None:
         super().__init__()
-        layers: list[nn.Module] = [
-            nn.Upsample(scale_factor=2, mode="nearest"),  # H/W doubled
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
-        ]
-        if not final:
-            layers += [nn.BatchNorm2d(out_ch), activation()]
-        self.net = nn.Sequential(*layers)
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")  # H/W doubled
+        self.final = final
+        if final:
+            self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
+            return
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.act = activation()
+        self.shortcut: nn.Module = (
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1)
+            if in_ch != out_ch else nn.Identity()
+        )
+        nn.init.zeros_(self.bn2.weight)  # block starts as identity (shortcut only)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        x = self.up(x)
+        if self.final:
+            return self.conv(x)
+        h = self.act(self.bn1(self.conv1(x)))
+        h = self.bn2(self.conv2(h))
+        return self.act(h + self.shortcut(x))
 
 
 class Encoder(nn.Module):

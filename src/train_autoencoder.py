@@ -168,6 +168,31 @@ def build_dataset_if_needed(args: argparse.Namespace, config: dict) -> None:
     print(f"  done: {info['total_samples']} samples across {info['rounds']} shard(s).")
 
 
+def _block_of(param_name: str) -> str:
+    """Group a parameter under the block it belongs to, for per-block grad-norm logging.
+
+    `encoder.blocks.3.conv1.weight` -> `encoder.blocks.3`; `to_latent.weight` -> `to_latent`.
+    The blocks come out in depth order (encoder stages, bottleneck, decoder stages), so the
+    reported norms read as a gradient-vs-depth profile."""
+    parts = param_name.split(".")
+    if len(parts) >= 3 and parts[1] == "blocks":
+        return ".".join(parts[:3])
+    return parts[0]
+
+
+def per_block_grad_norms(model: nn.Module) -> dict[str, float]:
+    """Total L2 grad norm of each block from the current (post-backward) `.grad` tensors.
+
+    Call after gradients are in real units (post-unscale under AMP). Returns block -> norm; a
+    block whose gradients are all None (unused) is omitted."""
+    sq: dict[str, float] = {}
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        sq[_block_of(name)] = sq.get(_block_of(name), 0.0) + float(p.grad.detach().pow(2).sum())
+    return {b: math.sqrt(v) for b, v in sq.items()}
+
+
 def run_epoch(
     model: StridedConvAutoencoder,
     loader: DataLoader,
@@ -180,7 +205,8 @@ def run_epoch(
     tag: str,
     max_grad_norm: float = 0.0,
     extra_loss_fn: nn.Module | None = None,
-) -> tuple[float, float, float, float]:
+    collect_layer_grads: bool = False,
+) -> tuple[float, float, float, float, dict[str, float]]:
     """Run one pass over `loader`. Trains when `optimizer` is given, else evaluates.
 
     When training with `max_grad_norm > 0`, gradients are clipped to that global L2 norm
@@ -190,9 +216,13 @@ def run_epoch(
     `extra_loss_fn`, if given, is evaluated (no grad) alongside the primary loss so a common
     yardstick (e.g. reconstruction MSE) can be reported regardless of the training `loss_fn`.
 
-    Returns `(mean_loss, grad_norm_mean, grad_norm_max, extra_mean)`; grad-norm stats
-    are the pre-clip totals over the epoch (0.0 for an eval pass), and `extra_mean` is NaN when
-    `extra_loss_fn` is None.
+    With `collect_layer_grads`, the per-block grad L2 norms (see `per_block_grad_norms`) are
+    accumulated over the epoch and returned averaged -- a gradient-vs-depth profile for spotting
+    vanishing gradients. Non-finite (AMP-overflow) steps are excluded, matching the global norm.
+
+    Returns `(mean_loss, grad_norm_mean, grad_norm_max, extra_mean, layer_grad_means)`; grad-norm
+    stats are the pre-clip totals over the epoch (0.0 for an eval pass), `extra_mean` is NaN when
+    `extra_loss_fn` is None, and `layer_grad_means` is empty unless `collect_layer_grads`.
     """
     training = optimizer is not None
     model.train(training)
@@ -207,6 +237,9 @@ def run_epoch(
     gnorm_sum = 0.0
     gnorm_max = 0.0
     gnorm_steps = 0
+    layer_gnorm_sum: dict[str, float] = {}
+    layer_gnorm_steps = 0
+    collect_layers = training and collect_layer_grads
     grad_ctx = torch.enable_grad() if training else torch.no_grad()
     with grad_ctx:
         for step, batch in enumerate(loader):
@@ -223,27 +256,44 @@ def run_epoch(
                     extra = extra_loss_fn(x_hat, x)
 
             if training:
+                step_block: dict[str, float] = {}
+                # Grads must be in real units before we read (per-block) or clip them, so unscale
+                # under AMP whenever either is wanted. Per-block norms are read pre-clip so they
+                # match the pre-clip global norm (clipping only rescales the whole vector uniformly).
+                need_real_grads = max_grad_norm > 0 or collect_layers
                 if use_amp:
                     scaler.scale(loss).backward()
-                    # Unscale before clipping so the norm/threshold are in real units.
-                    if max_grad_norm > 0:
+                    if need_real_grads:
                         scaler.unscale_(optimizer)
+                    if collect_layers:
+                        step_block = per_block_grad_norms(model)
+                    if max_grad_norm > 0:
                         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                         gnorm_val = float(gnorm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
+                    if collect_layers:
+                        step_block = per_block_grad_norms(model)
                     if max_grad_norm > 0:
                         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                         gnorm_val = float(gnorm)
                     optimizer.step()
                 # Skip non-finite norms: under AMP a scaled-gradient overflow yields an inf/nan
                 # norm and the scaler skips that step, so it isn't a real (taken) update.
-                if max_grad_norm > 0 and math.isfinite(gnorm_val):
+                grads_finite = (
+                    math.isfinite(gnorm_val) if max_grad_norm > 0
+                    else all(math.isfinite(v) for v in step_block.values())
+                )
+                if max_grad_norm > 0 and grads_finite:
                     gnorm_sum += gnorm_val
                     gnorm_max = max(gnorm_max, gnorm_val)
                     gnorm_steps += 1
+                if collect_layers and grads_finite:
+                    for b, v in step_block.items():
+                        layer_gnorm_sum[b] = layer_gnorm_sum.get(b, 0.0) + v
+                    layer_gnorm_steps += 1
 
             n = x.shape[0]
             total_loss += loss.item() * n
@@ -259,7 +309,9 @@ def run_epoch(
     mean_loss = total_loss / max(total_seen, 1)
     gnorm_mean = gnorm_sum / max(gnorm_steps, 1)
     extra_mean = extra_sum / max(total_seen, 1) if extra_loss_fn is not None else float("nan")
-    return mean_loss, gnorm_mean, gnorm_max, extra_mean
+    layer_grad_means = {b: s / layer_gnorm_steps for b, s in layer_gnorm_sum.items()} \
+        if layer_gnorm_steps else {}
+    return mean_loss, gnorm_mean, gnorm_max, extra_mean, layer_grad_means
 
 
 def main() -> None:
@@ -290,6 +342,10 @@ def main() -> None:
                              "(sparse/intermittent gradients)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                         help="clip gradients to this global L2 norm each step (0 disables)")
+    parser.add_argument("--log-layer-grads", action="store_true",
+                        help="log per-block (per-stage) grad L2 norms each epoch to "
+                             "layer_grad_norms.csv (and W&B as grad_norm/<block>) -- a "
+                             "gradient-vs-depth profile for spotting vanishing gradients")
     parser.add_argument("--loss", choices=("mse", "huber", "ms-ssim+l1"), default="mse",
                         help="reconstruction loss: 'mse' (default), 'huber' (robust, bounds the "
                              "gradient of large residuals), or 'ms-ssim+l1' (multi-scale structural "
@@ -554,15 +610,25 @@ def main() -> None:
          "grad_norm_mean", "grad_norm_max", "seconds"]
     )
 
+    # Optional per-block grad-norm log (long format: one row per block per epoch), written only
+    # when --log-layer-grads is set. Kept separate so the main metrics.csv schema is unchanged.
+    layer_grad_file = None
+    layer_grad_writer = None
+    if args.log_layer_grads:
+        layer_grad_file = (out_dir / "layer_grad_norms.csv").open("w", newline="")
+        layer_grad_writer = csv.writer(layer_grad_file)
+        layer_grad_writer.writerow(["epoch", "block", "grad_norm"])
+
     # 3. Train ----------------------------------------------------------------
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss, gnorm_mean, gnorm_max, _ = run_epoch(
+        train_loss, gnorm_mean, gnorm_max, _, layer_gnorms = run_epoch(
             model, train_loader, device, loss_fn, optimizer, scaler,
             args.log_interval, epoch, "train", max_grad_norm=args.max_grad_norm,
+            collect_layer_grads=args.log_layer_grads,
         )
-        val_loss, _, _, val_mse = run_epoch(
+        val_loss, _, _, val_mse, _ = run_epoch(
             model, val_loader, device, loss_fn, None, None, 0, epoch, "val",
             extra_loss_fn=val_mse_fn,
         )
@@ -576,6 +642,11 @@ def main() -> None:
                                  f"{gnorm_mean:.6f}", f"{gnorm_max:.6f}", f"{dt:.2f}"])
         metrics_file.flush()
 
+        if layer_grad_writer is not None:
+            for block, gn in layer_gnorms.items():
+                layer_grad_writer.writerow([epoch, block, f"{gn:.6e}"])
+            layer_grad_file.flush()
+
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(out_dir / "best.pt", epoch, val_loss)
@@ -584,7 +655,7 @@ def main() -> None:
             save_checkpoint(out_dir / f"epoch_{epoch:03d}.pt", epoch, val_loss)
 
         if run is not None:
-            run.log({
+            log_data = {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
@@ -594,9 +665,13 @@ def main() -> None:
                 "grad_norm_max": gnorm_max,
                 "lr": optimizer.param_groups[0]["lr"],
                 "epoch_seconds": dt,
-            }, step=epoch)
+            }
+            log_data.update({f"grad_norm/{block}": gn for block, gn in layer_gnorms.items()})
+            run.log(log_data, step=epoch)
 
     metrics_file.close()
+    if layer_grad_file is not None:
+        layer_grad_file.close()
     save_checkpoint(out_dir / "last.pt", args.epochs, best_val)
     print(f"done. best val loss {best_val:.6f}; checkpoints in '{out_dir}/'.")
     if run is not None:
