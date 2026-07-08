@@ -12,12 +12,21 @@ resumption is unavailable), which cuts each file from ~99 MiB to ~33 MiB.
 | `strided_huber_best_bf16.pt`     | strided / huber  |     8 | bfloat16 | `sweep_strided_huber_20260705_*/`                  |         49 | 0.095380 |
 | `strided_huber_16ch_best_bf16.pt`| strided / huber  |    16 | bfloat16 | `sweep_strided_huber_lr1e3_16ch_20260706_112844/run_09` | 48 | 0.091211 |
 | `strided_huber_16ch_arch2_best_bf16.pt` | strided / huber (arch2) | 16 | bfloat16 | `sweep_strided_arch2_16ch_20260706_161842/run_03` | 50 | 0.084998 |
+| `strided_huber_16ch_arch3_best_bf16.pt` | strided / huber (arch3) | 16 | bfloat16 | `lr1e3-arch3-16ch_20260707_163330/run_07` | 50 | 0.085238 |
 
 The `arch2` model is the retuned strided stack — tapered widths
 `[64, 64, 128, 128, 256, 256]` with a 512-d latent — vs. the earlier 16ch
 model's `[16, 32, 64, 128, 256, 512]` / 256-d latent; both are recorded in each
 checkpoint's `model_config`. It is the best (lowest-val-loss) replicate of the
 `strided-16ch-arch2` (lr 1e-3, batch 64) sweep.
+
+The `arch3` model is the reworked strided stack — widths `[32, 64, 128, 256,
+256, 256]` / 512-d latent using **parameter-free avg-pool downsample /
+nearest-neighbor upsample** resampling (vs. arch2's learned strided/transposed
+convs). It is the best (lowest-val-loss) replicate of the `lr1e3-arch3-16ch`
+(lr 1e-3, batch 64, huber) sweep. Despite a marginally higher best-val than
+arch2 (0.0852 vs 0.0850), the arch3 sweep trained ~2.2× faster and its 16
+replicates agreed ~10× more tightly (across-seed val CoV 0.40% vs 5.4%).
 
 Selected as the lowest-val-loss replicate in each sweep. Per-channel input
 normalization stats live with the dataset (`<data>/stats.json`) and the
