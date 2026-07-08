@@ -5,14 +5,16 @@ A convolutional autoencoder in PyTorch for the Firecracker world-model observati
 
 It down/upsamples with parameter-free pooling:
 
-    DownBlock : 3x3 (same) conv -> 2x2 average pool               (H/W halve, channels set by conv)
-    UpBlock   : 2x2 nearest-neighbor upsample -> 3x3 (same) conv  (H/W double, channels set by conv)
+    DownBlock : sep 3x3 (same) conv -> 2x2 average pool              (H/W halve, channels set by conv)
+    UpBlock   : 2x2 nearest-neighbor upsample -> sep 3x3 (same) conv (H/W double, channels set by conv)
 
-The resample and the channel change are decoupled: a 3x3 (same) conv sets the per-stage width
-and does the feature learning, while a parameter-free 2x2 average pool halves H/W (and
-nearest-neighbor upsampling mirrors it on the way up). This "resize-convolution" ordering keeps
-every learned kernel at unit stride, so it avoids the checkerboard artifacts that overlapping
-stride-2 transposed-conv kernels are prone to.
+The resample and the channel change are decoupled: a depthwise-separable 3x3 (same) conv sets the
+per-stage width and does the feature learning, while a parameter-free 2x2 average pool halves H/W
+(and nearest-neighbor upsampling mirrors it on the way up). Each conv is factored into a depthwise
+3x3 that filters channels independently followed by a pointwise 1x1 that mixes them (see
+`SeparableConv2d`), which cuts parameters and FLOPs relative to a full 3x3 conv. This
+"resize-convolution" ordering keeps every learned kernel at unit stride, so it avoids the
+checkerboard artifacts that overlapping stride-2 transposed-conv kernels are prone to.
 
 The encoder is a stack of DownBlocks that halve H/W and grow channels at every stage,
 producing a spatial feature map that is then flattened and projected by a dense layer to a
@@ -45,15 +47,33 @@ import torch.nn.functional as F
 from torch import nn
 
 
+class SeparableConv2d(nn.Module):
+    """A depthwise-separable 3x3 (same) convolution: a depthwise 3x3 conv that filters each input
+    channel independently (groups=in_ch, no channel mixing), followed by a pointwise 1x1 conv that
+    sets the output width by mixing across channels. This factorization of a full 3x3 conv cuts the
+    parameter and FLOP count of the spatial filtering from `in_ch * out_ch * 9` down to
+    `in_ch * 9 + in_ch * out_ch` while preserving the 3x3 receptive field."""
+
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_ch, in_ch, kernel_size=3, stride=1, padding=1, groups=in_ch
+        )
+        self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pointwise(self.depthwise(x))
+
+
 class DownBlock(nn.Module):
-    """3x3 (same) conv that sets the output width and does the per-stage feature learning, then a
-    2x2 average pool that halves H/W. The conv is followed by a BatchNorm2d
+    """Depthwise-separable 3x3 (same) conv that sets the output width and does the per-stage feature
+    learning, then a 2x2 average pool that halves H/W. The conv is followed by a BatchNorm2d
     (conv -> norm -> activation -> pool)."""
 
     def __init__(self, in_ch: int, out_ch: int, activation: type[nn.Module] = nn.ReLU) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+            SeparableConv2d(in_ch, out_ch),
             nn.BatchNorm2d(out_ch),
             activation(),
             nn.AvgPool2d(kernel_size=2, stride=2),  # H/W halved
@@ -64,10 +84,10 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """2x2 nearest-neighbor upsample that doubles H/W, then a 3x3 (same) conv that sets the
-    output width and does the per-stage feature learning. The conv is followed by a BatchNorm2d
-    (upsample -> conv -> norm -> activation). The final block omits its trailing norm and
-    activation so it emits the raw reconstruction."""
+    """2x2 nearest-neighbor upsample that doubles H/W, then a depthwise-separable 3x3 (same) conv
+    that sets the output width and does the per-stage feature learning. The conv is followed by a
+    BatchNorm2d (upsample -> conv -> norm -> activation). The final block omits its trailing norm
+    and activation so it emits the raw reconstruction."""
 
     def __init__(
         self,
@@ -79,7 +99,7 @@ class UpBlock(nn.Module):
         super().__init__()
         layers: list[nn.Module] = [
             nn.Upsample(scale_factor=2, mode="nearest"),  # H/W doubled
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1),
+            SeparableConv2d(in_ch, out_ch),
         ]
         if not final:
             layers += [nn.BatchNorm2d(out_ch), activation()]
