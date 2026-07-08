@@ -17,6 +17,11 @@ Press TAB to flip the model panels between their reconstruction and a per-cell |
 error heatmap for the shown field (the physics panel is unaffected). With more than one model the
 error panels share a color scale so their magnitudes are directly comparable.
 
+In the FIRE view, press M to overlay red, on each model panel, the cells the model predicts are
+burning via its reconstructed "ignited" channel (>50% certainty) but whose reconstructed fuel
+temperature is still below the ignition threshold (~300 C) — the cells the normal temperature-based
+fire overlay leaves unlit, flagging where the model disagrees with the temperature it reconstructed.
+
 The autoencoder only ever sees the world-model *observation* — the normalized stack of air
 temperature, one fuel_temperature_<type> channel and one fuel_<type> mass channel per fuel type,
 terrain, the two near-surface wind components, the one-hot vegetation biome, and a binary ignited
@@ -55,6 +60,7 @@ from rendering import (
     build_fire_surface,
     build_biome_surface,
     build_legend_panel,
+    build_biome_legend_panel,
     heat_colormap,
 )
 
@@ -197,6 +203,13 @@ class ComparisonViewer:
         self._show_error = False
         self._tab_prev = False
 
+        # M overlays red, on the FIRE model panels, the cells the model predicts are burning via the
+        # reconstructed ignited channel (>50% certainty) yet whose reconstructed fuel temperature
+        # stays below its ignition threshold, so the temperature-based fire overlay leaves them
+        # unlit. Edge-detected like TAB.
+        self._show_burning_pred = False
+        self._m_prev = False
+
         n_fuel = env._sim.num_fuel_types
         self.n_fuel = n_fuel
         # Observation channel layout (see obs_channel_names): air_temperature, then one
@@ -304,11 +317,26 @@ class ComparisonViewer:
         fuel = phys[self.i_fuel]
         fuel_temps = phys[self.i_fuel_temp]
         oxygen = np.ones(fuel.shape[1:], dtype=np.float32)
-        return build_fire_surface(
+        surface = build_fire_surface(
             fuel_temps, fuel, oxygen, scale,
             self.ignition_thresholds, self.fuel_burnt_threshold, self.fuel_type_names,
             env._show_fire_overlay and env._sim.fire_enabled,
         )
+        # With M held on, paint red the cells the model's reconstructed ignited channel calls
+        # burning with >50% certainty but whose reconstructed fuel temperature stays below the
+        # ignition threshold — exactly the cells build_fire_surface's temperature overlay leaves
+        # unlit, so the red flags where the model disagrees with the temperature it reconstructed.
+        # The ignited window is the identity, so recon_phys reads straight as certainty.
+        if self._show_burning_pred:
+            ign = self.ignition_thresholds[:, None, None]
+            below_ignition = (fuel_temps < ign).all(axis=0)        # (H, W) no fuel type alight
+            pred_burning = (panel.recon_phys[self.i_ignited] > 0.5) & below_ignition   # (H, W)
+            if pred_burning.any():
+                mask = np.repeat(np.repeat(pred_burning, scale, axis=0), scale, axis=1)  # (H*s, W*s)
+                pixels = pygame.surfarray.pixels3d(surface)         # (W*s, H*s, 3), x-major
+                pixels[mask.T] = (191, 0, 0)
+                del pixels   # release the surface lock before returning
+        return surface
 
     def _error_field(self, mode: ViewMode, panel: _ModelPanel) -> np.ndarray:
         """Per-cell reconstruction error (normalized-OBS units) for the shown field: the channel(s)
@@ -357,10 +385,15 @@ class ComparisonViewer:
         env._running, env._current_mode, fire_click = env._handle_events()
         # env._handle_events drains and pumps the event queue but doesn't touch TAB; read TAB from
         # the (now-current) held-key snapshot and edge-detect it into the reconstruction/error flip.
-        tab_down = pygame.key.get_pressed()[pygame.K_TAB]
+        pressed = pygame.key.get_pressed()
+        tab_down = pressed[pygame.K_TAB]
         if tab_down and not self._tab_prev:
             self._show_error = not self._show_error
         self._tab_prev = tab_down
+        m_down = pressed[pygame.K_m]
+        if m_down and not self._m_prev:
+            self._show_burning_pred = not self._show_burning_pred
+        self._m_prev = m_down
         if fire_click is not None:
             env._spawn_fire_patch(*fire_click)
             env._surfaces_dirty = True
@@ -390,9 +423,15 @@ class ComparisonViewer:
                 self._blit_panel(surface, xs[i + 1], self._model_title(i, mode))
 
         # Shared legend for the physics/reconstruction color scale (both use the same window).
-        panel = build_legend_panel(
-            env._legend_specs(), self.sim_px, self._legend_font, self._legend_title_font
-        )
+        # The biome view is categorical, so it gets labeled swatches instead of a gradient colorbar.
+        if mode == ViewMode.BIOME:
+            panel = build_biome_legend_panel(
+                self.sim_px, self._legend_font, self._legend_title_font
+            )
+        else:
+            panel = build_legend_panel(
+                env._legend_specs(), self.sim_px, self._legend_font, self._legend_title_font
+            )
         self._screen.blit(panel, (xs[-1] + self.sim_px + PAD, TITLE_H))
 
         pygame.display.flip()
