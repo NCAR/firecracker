@@ -407,6 +407,11 @@ def main() -> None:
     parser.add_argument("--out", default="checkpoints", help="dir to write checkpoints into")
     parser.add_argument("--save-interval", type=int, default=5,
                         help="write a checkpoint every N epochs (best is always saved)")
+    parser.add_argument("--resume", default=None,
+                        help="path to a checkpoint to resume from: restores model, optimizer, "
+                             "GradScaler, best-val, and continues at the next epoch. The "
+                             "architecture/channels/latent must match the checkpoint (they are "
+                             "validated). metrics.csv is appended to rather than truncated")
     parser.add_argument("--log-interval", type=int, default=100,
                         help="print the train loss every N steps (0 to silence)")
     parser.add_argument("--device", help="torch device override, e.g. cuda or cpu")
@@ -556,18 +561,56 @@ def main() -> None:
         model_config["channel_mean"] = channel_stats["channel_mean"]
         model_config["channel_std"] = channel_stats["channel_std"]
 
+    # Resume: reload model/optimizer/scaler state and continue at the next epoch. The architecture
+    # is rebuilt from CLI/config above (not the checkpoint), so guard against a silent mismatch that
+    # would make load_state_dict succeed on a differently-shaped model or corrupt the run.
+    start_epoch = 1
+    best_val = float("inf")
+    resume_wandb_id = None
+    if args.resume is not None:
+        ckpt = torch.load(args.resume, map_location=device)
+        ck_cfg = ckpt.get("model_config", {})
+        mismatch = {
+            k: (ck_cfg.get(k), model_config.get(k))
+            for k in ("arch", "in_channels", "grid_size", "channels", "latent_dim")
+            if ck_cfg.get(k) != model_config.get(k)
+        }
+        if mismatch:
+            raise SystemExit(
+                f"--resume checkpoint architecture does not match this run: {mismatch}. "
+                "Pass the same --arch/--channels/--latent-dim the checkpoint was trained with."
+            )
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        if scaler is not None and ckpt.get("scaler_state") is not None:
+            scaler.load_state_dict(ckpt["scaler_state"])
+        # Older checkpoints predate best_val; fall back to that epoch's val_loss so best.pt is not
+        # overwritten by a worse model on the first resumed epoch.
+        best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
+        start_epoch = int(ckpt["epoch"]) + 1
+        # Reattach to the original W&B run (if any) so the resumed epochs extend the same history
+        # rather than opening a duplicate run.
+        resume_wandb_id = ckpt.get("wandb_run_id")
+        print(f"resume: loaded '{args.resume}' (epoch {ckpt['epoch']}, best_val {best_val:.6f}); "
+              f"continuing at epoch {start_epoch}")
+
     # Optional Weights & Biases run. `run` is None when --wandb is not passed, which turns
     # every log call below into a no-op. Replicates share --wandb-group so W&B averages them.
     run = None
     if args.wandb:
         if wandb is None:
             raise SystemExit("--wandb was passed but wandb is not installed (pip install wandb)")
+        # On resume, reattach to the checkpoint's run id (resume="allow" continues it, or starts a
+        # fresh run under that id if the server has no history for it). A first run passes id=None,
+        # letting W&B mint one; that id is then saved into every checkpoint below.
         run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
             group=args.wandb_group,
             name=args.wandb_name or f"seed{args.seed}",
             mode=args.wandb_mode,
+            id=resume_wandb_id,
+            resume="allow" if resume_wandb_id is not None else None,
             config={
                 **model_config,
                 "seed": args.seed,
@@ -594,35 +637,46 @@ def main() -> None:
             {
                 "epoch": epoch,
                 "val_loss": val_loss,
+                "best_val": best_val,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                # Present only under AMP; restored on --resume so loss scaling continues seamlessly.
+                "scaler_state": scaler.state_dict() if scaler is not None else None,
+                # The W&B run id (if logging), so --resume reattaches to the same run.
+                "wandb_run_id": run.id if run is not None else None,
                 "model_config": model_config,
             },
             path,
         )
 
     # A machine-readable per-epoch log so replicate runs (e.g. tools/sweep.py) can be
-    # aggregated/averaged after the fact. Flushed each epoch to survive interruptions.
+    # aggregated/averaged after the fact. Flushed each epoch to survive interruptions. On resume,
+    # append to the existing log (and skip the header) so earlier epochs are preserved.
     metrics_path = out_dir / "metrics.csv"
-    metrics_file = metrics_path.open("w", newline="")
+    resuming_log = args.resume is not None and metrics_path.exists()
+    metrics_file = metrics_path.open("a" if resuming_log else "w", newline="")
     metrics_writer = csv.writer(metrics_file)
-    metrics_writer.writerow(
-        ["epoch", "train_loss", "val_loss", "val_mse",
-         "grad_norm_mean", "grad_norm_max", "seconds"]
-    )
+    if not resuming_log:
+        metrics_writer.writerow(
+            ["epoch", "train_loss", "val_loss", "val_mse",
+             "grad_norm_mean", "grad_norm_max", "seconds"]
+        )
 
     # Optional per-block grad-norm log (long format: one row per block per epoch), written only
     # when --log-layer-grads is set. Kept separate so the main metrics.csv schema is unchanged.
     layer_grad_file = None
     layer_grad_writer = None
     if args.log_layer_grads:
-        layer_grad_file = (out_dir / "layer_grad_norms.csv").open("w", newline="")
+        layer_grad_path = out_dir / "layer_grad_norms.csv"
+        resuming_lg = args.resume is not None and layer_grad_path.exists()
+        layer_grad_file = layer_grad_path.open("a" if resuming_lg else "w", newline="")
         layer_grad_writer = csv.writer(layer_grad_file)
-        layer_grad_writer.writerow(["epoch", "block", "grad_norm"])
+        if not resuming_lg:
+            layer_grad_writer.writerow(["epoch", "block", "grad_norm"])
 
     # 3. Train ----------------------------------------------------------------
-    best_val = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    # `best_val` and `start_epoch` were seeded above (inf / 1, or restored from --resume).
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         train_loss, gnorm_mean, gnorm_max, _, layer_gnorms = run_epoch(
             model, train_loader, device, loss_fn, optimizer, scaler,
