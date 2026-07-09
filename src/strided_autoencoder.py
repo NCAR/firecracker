@@ -58,24 +58,26 @@ from torch import nn
 class DownBlock(nn.Module):
     """Residual double-conv stage, then a resample that halves H/W.
 
-    Two 3x3 (same) convs each followed by BatchNorm + activation do the per-stage feature
-    learning ((conv -> norm -> act) x2), wrapped in a skip connection: the block computes
-    F(x) + shortcut(x) before downsampling, where F is the two-conv residual branch. The
-    activation lives inside the branch (F ends in act), so the addition is the last op and the
-    skip stays a clean, unrectified identity path -- gradients flow back through it undamped, and
-    the block can represent the exact identity (unlike gating the sum with a ReLU). The skip thus
-    gives gradients a direct identity path around the stage, so gradient magnitude does not decay
-    with depth (the vanishing-gradient mitigation as more stages are stacked). The shortcut is a
-    1x1 projection when the stage changes channel width (else a plain identity). The second BN's
-    weight (gamma) is zero-initialised so F(x) = 0 and the block starts as the exact identity map
-    (shortcut only), learning its residual from there -- a deep stack thus begins as its shallow
-    self and grows depth as training needs it.
+    The block computes act(F(x) + shortcut(x)) and then downsamples, where F is the two-conv
+    residual branch: conv -> BN -> act -> conv -> BN. The activation is applied AFTER the
+    addition (post-activation ResNet ordering), so F's last op is the (linear) second BN and the
+    activation sits on the residual sum. This ordering matters for the zero-init trick below: the
+    second BN's weight (gamma) is zero-initialised so F(x) = 0 and the block starts as the
+    shortcut alone (a deep stack thus begins as its shallow self and grows depth as training
+    needs it). Because F ends in a *linear* BN, zero-init zeroes F's output value but not the
+    gradient flowing into F -- the branch is dormant in value yet fully alive in gradient, so it
+    wakes up over the first few steps. (Do NOT move the activation to the end of F: act(BN) on a
+    zero-init BN is act(0), which parks the branch on the dead side of the ReLU kink -- zero
+    derivative -- and the whole conv branch never receives gradient. That variant was tried and
+    stalled the model.) The skip gives gradients a direct path around the stage, so gradient
+    magnitude does not decay with depth. The shortcut is a 1x1 projection when the stage changes
+    channel width (else a plain identity).
 
     The downsampler runs at unit-stride's output and halves H/W: `downsample="avgpool"` uses a
     parameter-free 2x2 average pool; `downsample="strided"` uses a learned 4x4 stride-2 conv
     (padding 1, so H/W halves exactly). The 4x4 kernel (divisible by the stride) gives even input
-    coverage, unlike a 2x2/3x3 stride-2 kernel. Either way the resample is applied to the residual
-    sum, so the identity/gradient path above is unaffected by the choice."""
+    coverage, unlike a 2x2/3x3 stride-2 kernel. Either way the resample is applied to the
+    activated residual sum, so the identity/gradient path above is unaffected by the choice."""
 
     def __init__(
         self,
@@ -107,17 +109,19 @@ class DownBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.act(self.bn1(self.conv1(x)))
-        h = self.act(self.bn2(self.conv2(h)))
-        return self.downsample(h + self.shortcut(x))
+        h = self.bn2(self.conv2(h))
+        h = self.act(h + self.shortcut(x))
+        return self.downsample(h)
 
 
 class UpBlock(nn.Module):
     """2x2 nearest-neighbor upsample that doubles H/W, then a residual double-conv stage that
-    mirrors DownBlock (minus the pool): upsample -> F(x) + shortcut(x), where F is two 3x3
-    (same) convs each with BatchNorm + activation and the shortcut is a 1x1 projection (or
-    identity) around them. The activation lives inside the branch so the addition is the last op
-    and the skip stays a clean identity path. The second BN's gamma is zero-initialised so the
-    block starts as the exact identity, matching DownBlock.
+    mirrors DownBlock (minus the pool): upsample -> act(F(x) + shortcut(x)), where F is two 3x3
+    (same) convs each with BatchNorm (conv -> BN -> act -> conv -> BN) and the shortcut is a 1x1
+    projection (or identity) around them. The activation is applied after the addition (post-
+    activation ordering), so F ends in a linear BN whose gamma is zero-initialised: F(x) = 0 at
+    init and gradient still flows into F, matching DownBlock (see its note on why the activation
+    must not end the branch).
 
     The final block is the raw reconstruction head: a single resize-conv with no norm,
     activation, or residual, so it can emit unbounded (including negative) reconstruction values
@@ -152,8 +156,8 @@ class UpBlock(nn.Module):
         if self.final:
             return self.conv(x)
         h = self.act(self.bn1(self.conv1(x)))
-        h = self.act(self.bn2(self.conv2(h)))
-        return h + self.shortcut(x)
+        h = self.bn2(self.conv2(h))
+        return self.act(h + self.shortcut(x))
 
 
 class Encoder(nn.Module):
