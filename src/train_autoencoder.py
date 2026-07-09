@@ -1,9 +1,8 @@
 """
 train_autoencoder.py
 
-Train a convolutional autoencoder (strided_autoencoder.ConvAutoencoder -- the "pooled" or
-"strided" arch, see ARCHITECTURES) to reconstruct Firecracker world-model observations collected
-from batched fire rollouts.
+Train a convolutional autoencoder (strided_autoencoder.ConvAutoencoder, the "pooled" arch) to
+reconstruct Firecracker world-model observations collected from batched fire rollouts.
 
 Pipeline
 --------
@@ -70,14 +69,13 @@ from config import load_config
 from losses import MSSSIML1Loss
 from ram_loader import RamBatchLoader, prewarm_shards
 from rollout import BatchedRollout, FireDataset
-from strided_autoencoder import ConvAutoencoder, PooledConvAutoencoder, StridedConvAutoencoder
+from strided_autoencoder import ConvAutoencoder
 
-# Selectable autoencoder architectures. All share the same constructor signature and the same
-# (reconstruction, latent) forward contract; they differ only in the encoder's downsampling op
-# (both use the same resize-conv decoder). --arch picks one by key.
+# Selectable autoencoder architectures, keyed by --arch. Only the parameter-free 2x2 average-pool
+# encoder ("pooled") remains; the learned strided-conv downsampler was evaluated and dropped (no
+# quality gain over avg-pool, higher inter-seed variance, +3.5M params).
 ARCHITECTURES = {
-    "pooled": PooledConvAutoencoder,    # 2x2 average-pool downsample (parameter-free)
-    "strided": StridedConvAutoencoder,  # 4x4 stride-2 conv downsample (learned)
+    "pooled": ConvAutoencoder,  # 2x2 average-pool downsample (parameter-free)
 }
 
 # Names accepted by --weight-dtype, mapped to the torch dtype the model's params/compute run in.
@@ -392,9 +390,8 @@ def main() -> None:
                              "CPU. Recorded in the checkpoint for eval/inference")
     # Model
     parser.add_argument("--arch", choices=tuple(ARCHITECTURES), default=None,
-                        help="autoencoder architecture (encoder downsampling style; both use the "
-                             "same resize-conv decoder): 'pooled' (2x2 average pool) or 'strided' "
-                             "(4x4 stride-2 conv); default from [autoencoder].arch")
+                        help="autoencoder architecture: 'pooled' (2x2 average-pool encoder, "
+                             "resize-conv decoder); default from [autoencoder].arch")
     parser.add_argument("--channels", type=_parse_channels, default=None,
                         help="encoder channel widths per downsample stage; the last is the conv "
                              "channel count before flattening, e.g. 16,32,64,128,256,512; default "

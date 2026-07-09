@@ -47,7 +47,7 @@ import pygame
 import torch
 
 import physics_constants as pc
-from strided_autoencoder import PooledConvAutoencoder, StridedConvAutoencoder
+from strided_autoencoder import ConvAutoencoder
 from firecracker_env import FirecrackerEnv, ViewMode, TARGET_FPS
 from simulation import (
     OBS_CHANNELS_PRE, OBS_CHANNELS_POST, OBS_CHANNELS_BIOME, OBS_CHANNEL_IGNITED, obs_channel_names,
@@ -67,8 +67,7 @@ from rendering import (
 # The checkpoint's model_config["arch"] selects the architecture. Kept in step with
 # train_autoencoder.ARCHITECTURES (imported directly here to avoid pulling in the training deps).
 ARCHITECTURES = {
-    "pooled": PooledConvAutoencoder,
-    "strided": StridedConvAutoencoder,
+    "pooled": ConvAutoencoder,
 }
 
 
