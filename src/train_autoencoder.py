@@ -1,8 +1,9 @@
 """
 train_autoencoder.py
 
-Train the convolutional autoencoder (strided_autoencoder.StridedConvAutoencoder) to reconstruct
-Firecracker world-model observations collected from batched fire rollouts.
+Train a convolutional autoencoder (strided_autoencoder.ConvAutoencoder -- the "pooled" or
+"strided" arch, see ARCHITECTURES) to reconstruct Firecracker world-model observations collected
+from batched fire rollouts.
 
 Pipeline
 --------
@@ -69,12 +70,14 @@ from config import load_config
 from losses import MSSSIML1Loss
 from ram_loader import RamBatchLoader, prewarm_shards
 from rollout import BatchedRollout, FireDataset
-from strided_autoencoder import StridedConvAutoencoder
+from strided_autoencoder import ConvAutoencoder, PooledConvAutoencoder, StridedConvAutoencoder
 
 # Selectable autoencoder architectures. All share the same constructor signature and the same
-# (reconstruction, latent) forward contract. --arch picks one by key.
+# (reconstruction, latent) forward contract; they differ only in the encoder's downsampling op
+# (both use the same resize-conv decoder). --arch picks one by key.
 ARCHITECTURES = {
-    "strided": StridedConvAutoencoder,  # avg-pool / nearest-upsample resampling
+    "pooled": PooledConvAutoencoder,    # 2x2 average-pool downsample (parameter-free)
+    "strided": StridedConvAutoencoder,  # 4x4 stride-2 conv downsample (learned)
 }
 
 # Names accepted by --weight-dtype, mapped to the torch dtype the model's params/compute run in.
@@ -194,7 +197,7 @@ def per_block_grad_norms(model: nn.Module) -> dict[str, float]:
 
 
 def run_epoch(
-    model: StridedConvAutoencoder,
+    model: ConvAutoencoder,
     loader: DataLoader,
     device: torch.device,
     loss_fn: nn.Module,
@@ -316,7 +319,7 @@ def run_epoch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train the StridedConvAutoencoder on Firecracker rollout observations."
+        description="Train a convolutional autoencoder on Firecracker rollout observations."
     )
     # Data / dataset construction
     parser.add_argument("--data", default="data/fire", help="dataset dir (shards + meta.json)")
@@ -389,8 +392,9 @@ def main() -> None:
                              "CPU. Recorded in the checkpoint for eval/inference")
     # Model
     parser.add_argument("--arch", choices=tuple(ARCHITECTURES), default=None,
-                        help="autoencoder architecture: 'strided' (avg-pool / nearest-upsample "
-                             "resampling); default from [autoencoder].arch")
+                        help="autoencoder architecture (encoder downsampling style; both use the "
+                             "same resize-conv decoder): 'pooled' (2x2 average pool) or 'strided' "
+                             "(4x4 stride-2 conv); default from [autoencoder].arch")
     parser.add_argument("--channels", type=_parse_channels, default=None,
                         help="encoder channel widths per downsample stage; the last is the conv "
                              "channel count before flattening, e.g. 16,32,64,128,256,512; default "
@@ -440,7 +444,7 @@ def main() -> None:
     # Model architecture: CLI flags override the [autoencoder] config, which in turn overrides
     # the model constructor defaults. `channels`/`latent_dim` are read from the per-arch subtable.
     ae_cfg = config.get("autoencoder", {})
-    arch = args.arch or ae_cfg.get("arch", "strided")
+    arch = args.arch or ae_cfg.get("arch", "pooled")
     arch_cfg = ae_cfg.get(arch, {})
     channels = args.channels if args.channels is not None else arch_cfg.get("channels")
     channels = tuple(channels) if channels is not None else None

@@ -47,7 +47,7 @@ import pygame
 import torch
 
 import physics_constants as pc
-from strided_autoencoder import StridedConvAutoencoder
+from strided_autoencoder import PooledConvAutoencoder, StridedConvAutoencoder
 from firecracker_env import FirecrackerEnv, ViewMode, TARGET_FPS
 from simulation import (
     OBS_CHANNELS_PRE, OBS_CHANNELS_POST, OBS_CHANNELS_BIOME, OBS_CHANNEL_IGNITED, obs_channel_names,
@@ -67,8 +67,24 @@ from rendering import (
 # The checkpoint's model_config["arch"] selects the architecture. Kept in step with
 # train_autoencoder.ARCHITECTURES (imported directly here to avoid pulling in the training deps).
 ARCHITECTURES = {
+    "pooled": PooledConvAutoencoder,
     "strided": StridedConvAutoencoder,
 }
+
+
+def resolve_arch(cfg: dict, model_state: dict) -> str:
+    """Resolve the architecture key for a checkpoint, accounting for legacy labels.
+
+    Checkpoints written before the pooled/strided split all recorded arch='strided' but were in
+    fact average-pool models (the class named "strided" used a 2x2 avg pool then; the name is
+    historical). A real strided-conv model has per-stage 4x4 downsample convs at
+    `encoder.blocks.<i>.downsample.weight`; an avg-pool model has none. So a checkpoint labelled
+    'strided' with no such weights is a legacy pooled model and loads as 'pooled'.
+    """
+    arch = cfg.get("arch", "pooled")
+    if arch == "strided" and not any(".downsample." in k for k in model_state):
+        return "pooled"
+    return arch
 
 # Weight dtypes a checkpoint may be saved in (see train_autoencoder.WEIGHT_DTYPES). Checkpoints
 # from before --weight-dtype existed have no such key and load as float32.
@@ -135,7 +151,7 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
         raise SystemExit(f"'{path}' is not a Firecracker autoencoder checkpoint "
                          f"(missing model_config/model_state).")
     cfg = ckpt["model_config"]
-    arch = cfg.get("arch", "strided")
+    arch = resolve_arch(cfg, ckpt["model_state"])
     if arch not in ARCHITECTURES:
         raise SystemExit(f"'{path}' names unknown arch '{arch}'; expected one of {list(ARCHITECTURES)}.")
 

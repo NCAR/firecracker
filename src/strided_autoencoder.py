@@ -3,19 +3,26 @@ strided_autoencoder.py
 
 A convolutional autoencoder in PyTorch for the Firecracker world-model observation stack.
 
-It down/upsamples with parameter-free pooling:
+The stage does its feature learning with a residual pair of 3x3 (same) convs and then resamples;
+the resample and the channel change are decoupled. Two downsampling styles are offered, selected
+per-model (see PooledConvAutoencoder / StridedConvAutoencoder):
 
-    DownBlock : residual double-conv -> 2x2 average pool               (H/W halve, channels set by conv)
-    UpBlock   : 2x2 nearest-neighbor upsample -> residual double-conv  (H/W double, channels set by conv)
+    DownBlock (downsample="avgpool") : residual double-conv -> 2x2 average pool  (parameter-free)
+    DownBlock (downsample="strided") : residual double-conv -> 4x4 stride-2 conv (learned)
+    UpBlock                          : 2x2 nearest-neighbor upsample -> residual double-conv
 
-The resample and the channel change are decoupled: a residual pair of 3x3 (same) convs
-((conv -> BN -> act) x2 with a 1x1/identity skip around them) sets the per-stage width and does
-the feature learning, while a parameter-free 2x2 average pool halves H/W (and nearest-neighbor
-upsampling mirrors it on the way up). This "resize-convolution" ordering keeps every learned
-kernel at unit stride, so it avoids the checkerboard artifacts that overlapping stride-2
-transposed-conv kernels are prone to. The per-stage skip connection gives gradients an identity
-path around every stage so depth can be stacked without the gradient vanishing; the final
-UpBlock is a plain resize-conv reconstruction head (no BN/act/residual) that emits raw output.
+The two downsamplers differ only in the final H/W halving. "avgpool" is a parameter-free fixed
+low-pass; "strided" learns the downsampling filter with a 4x4 stride-2 conv. The 4x4 kernel is
+deliberate: kernel size divisible by the stride gives even input coverage, avoiding the uneven
+overlap (the downsampling analog of checkerboard gridding) that a 2x2 or 3x3 stride-2 kernel
+produces -- an earlier 2x2 stride-2 version resampled poorly for exactly that reason, which is
+the "checkerboard" the history below refers to. Both styles share the same upsampling path: a
+"resize-convolution" (nearest-neighbor upsample then a unit-stride conv), which keeps every
+decoder kernel at unit stride and so cannot produce the checkerboard artifacts that overlapping
+stride-2 transposed-conv kernels are prone to. The per-stage skip connection gives gradients an
+identity path around every stage so depth can be stacked without the gradient vanishing; the
+final UpBlock is a plain resize-conv reconstruction head (no BN/act/residual) that emits raw
+output.
 
 The encoder is a stack of DownBlocks that halve H/W and grow channels at every stage,
 producing a spatial feature map that is then flattened and projected by a dense layer to a
@@ -32,7 +39,7 @@ stage lands on an integer spatial size.
 Quick use:
 
     import torch
-    from strided_autoencoder import StridedConvAutoencoder
+    from strided_autoencoder import StridedConvAutoencoder  # or PooledConvAutoencoder
 
     model = StridedConvAutoencoder(in_channels=5, grid_size=256,
                                    channels=(32, 64, 128, 256, 256, 256), latent_dim=512)
@@ -49,19 +56,34 @@ from torch import nn
 
 
 class DownBlock(nn.Module):
-    """Residual double-conv stage, then a 2x2 average pool that halves H/W.
+    """Residual double-conv stage, then a resample that halves H/W.
 
     Two 3x3 (same) convs each followed by BatchNorm + activation do the per-stage feature
     learning ((conv -> norm -> act) x2), wrapped in a skip connection: the block computes
-    act(F(x) + shortcut(x)) before pooling, where F is the two-conv residual branch. The skip
-    gives gradients a direct identity path around the stage, so gradient magnitude does not
-    decay with depth (the vanishing-gradient mitigation as more stages are stacked). The
-    shortcut is a 1x1 projection when the stage changes channel width (else a plain identity).
-    The second BN's weight (gamma) is zero-initialised so the block starts as the identity map
-    (shortcut only) and learns its residual from there -- a deep stack thus begins as its
-    shallow self and grows depth as training needs it."""
+    F(x) + shortcut(x) before downsampling, where F is the two-conv residual branch. The
+    activation lives inside the branch (F ends in act), so the addition is the last op and the
+    skip stays a clean, unrectified identity path -- gradients flow back through it undamped, and
+    the block can represent the exact identity (unlike gating the sum with a ReLU). The skip thus
+    gives gradients a direct identity path around the stage, so gradient magnitude does not decay
+    with depth (the vanishing-gradient mitigation as more stages are stacked). The shortcut is a
+    1x1 projection when the stage changes channel width (else a plain identity). The second BN's
+    weight (gamma) is zero-initialised so F(x) = 0 and the block starts as the exact identity map
+    (shortcut only), learning its residual from there -- a deep stack thus begins as its shallow
+    self and grows depth as training needs it.
 
-    def __init__(self, in_ch: int, out_ch: int, activation: type[nn.Module] = nn.ReLU) -> None:
+    The downsampler runs at unit-stride's output and halves H/W: `downsample="avgpool"` uses a
+    parameter-free 2x2 average pool; `downsample="strided"` uses a learned 4x4 stride-2 conv
+    (padding 1, so H/W halves exactly). The 4x4 kernel (divisible by the stride) gives even input
+    coverage, unlike a 2x2/3x3 stride-2 kernel. Either way the resample is applied to the residual
+    sum, so the identity/gradient path above is unaffected by the choice."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        activation: type[nn.Module] = nn.ReLU,
+        downsample: str = "avgpool",
+    ) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(out_ch)
@@ -73,22 +95,29 @@ class DownBlock(nn.Module):
             nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1)
             if in_ch != out_ch else nn.Identity()
         )
-        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)  # H/W halved
+        if downsample == "avgpool":
+            self.downsample: nn.Module = nn.AvgPool2d(kernel_size=2, stride=2)  # parameter-free
+        elif downsample == "strided":
+            # 4x4 stride-2 (padding 1) learned downsampler: kernel divisible by stride -> even
+            # input coverage, avoiding the gridding a 2x2/3x3 stride-2 kernel produces.
+            self.downsample = nn.Conv2d(out_ch, out_ch, kernel_size=4, stride=2, padding=1)
+        else:
+            raise ValueError(f"downsample must be 'avgpool' or 'strided', got {downsample!r}")
         nn.init.zeros_(self.bn2.weight)  # block starts as identity (shortcut only)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.act(self.bn1(self.conv1(x)))
-        h = self.bn2(self.conv2(h))
-        h = self.act(h + self.shortcut(x))
-        return self.pool(h)
+        h = self.act(self.bn2(self.conv2(h)))
+        return self.downsample(h + self.shortcut(x))
 
 
 class UpBlock(nn.Module):
     """2x2 nearest-neighbor upsample that doubles H/W, then a residual double-conv stage that
-    mirrors DownBlock (minus the pool): upsample -> act(F(x) + shortcut(x)), where F is two
-    3x3 (same) convs each with BatchNorm + activation and the shortcut is a 1x1 projection (or
-    identity) around them. The second BN's gamma is zero-initialised so the block starts as the
-    identity, matching DownBlock.
+    mirrors DownBlock (minus the pool): upsample -> F(x) + shortcut(x), where F is two 3x3
+    (same) convs each with BatchNorm + activation and the shortcut is a 1x1 projection (or
+    identity) around them. The activation lives inside the branch so the addition is the last op
+    and the skip stays a clean identity path. The second BN's gamma is zero-initialised so the
+    block starts as the exact identity, matching DownBlock.
 
     The final block is the raw reconstruction head: a single resize-conv with no norm,
     activation, or residual, so it can emit unbounded (including negative) reconstruction values
@@ -123,8 +152,8 @@ class UpBlock(nn.Module):
         if self.final:
             return self.conv(x)
         h = self.act(self.bn1(self.conv1(x)))
-        h = self.bn2(self.conv2(h))
-        return self.act(h + self.shortcut(x))
+        h = self.act(self.bn2(self.conv2(h)))
+        return h + self.shortcut(x)
 
 
 class Encoder(nn.Module):
@@ -135,11 +164,15 @@ class Encoder(nn.Module):
         in_channels: int,
         channels: Sequence[int],
         activation: type[nn.Module] = nn.ReLU,
+        downsample: str = "avgpool",
     ) -> None:
         super().__init__()
         widths = [in_channels, *channels]
         self.blocks = nn.Sequential(
-            *(DownBlock(widths[i], widths[i + 1], activation) for i in range(len(channels)))
+            *(
+                DownBlock(widths[i], widths[i + 1], activation, downsample)
+                for i in range(len(channels))
+            )
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -169,10 +202,14 @@ class Decoder(nn.Module):
         return self.blocks(z)
 
 
-class StridedConvAutoencoder(nn.Module):
-    """A symmetric convolutional autoencoder using pool/upsample resampling.
+class ConvAutoencoder(nn.Module):
+    """A symmetric convolutional autoencoder; the encoder downsampling style is subclass-set.
 
-    Emits a (reconstruction, latent) pair from its forward pass.
+    Emits a (reconstruction, latent) pair from its forward pass. The two concrete models --
+    `PooledConvAutoencoder` (2x2 average pool) and `StridedConvAutoencoder` (4x4 stride-2 conv)
+    -- differ only in the encoder's `downsample` op; both share the resize-conv decoder and the
+    rest of this class. Use one of the subclasses rather than instantiating this base directly
+    (its `downsample` default matches PooledConvAutoencoder).
 
     Args:
         in_channels: number of input channels (e.g. len(obs_channel_names(...))).
@@ -184,6 +221,7 @@ class StridedConvAutoencoder(nn.Module):
         normalize_latent: L2-normalize the latent so every vector has unit magnitude (lies on the
                      unit hypersphere). On by default; makes cosine similarity the natural latent
                      metric for the downstream world-model objectives.
+        downsample:  encoder H/W-halving op, "avgpool" or "strided" (see DownBlock).
 
     The encoder produces a `(channels[-1], N // 2**len(channels), N // 2**len(channels))`
     feature map, which is flattened and projected by a linear layer to a `latent_dim` vector.
@@ -199,6 +237,7 @@ class StridedConvAutoencoder(nn.Module):
         latent_dim: int = 512,
         activation: type[nn.Module] = nn.ReLU,
         normalize_latent: bool = True,
+        downsample: str = "avgpool",
     ) -> None:
         super().__init__()
         n_stages = len(channels)
@@ -215,8 +254,9 @@ class StridedConvAutoencoder(nn.Module):
         self.flat_dim = self.conv_channels * self.conv_spatial * self.conv_spatial
         self.latent_dim = latent_dim
         self.normalize_latent = normalize_latent
+        self.downsample = downsample
 
-        self.encoder = Encoder(in_channels, channels, activation)
+        self.encoder = Encoder(in_channels, channels, activation, downsample)
         self.to_latent = nn.Linear(self.flat_dim, latent_dim)
         self.from_latent = nn.Linear(latent_dim, self.flat_dim)
         self.decoder = Decoder(in_channels, channels, activation)
@@ -244,3 +284,30 @@ class StridedConvAutoencoder(nn.Module):
         z = self.encode(x)
         x_hat = self.decode(z)
         return x_hat, z
+
+
+class PooledConvAutoencoder(ConvAutoencoder):
+    """ConvAutoencoder whose encoder downsamples with a parameter-free 2x2 average pool.
+
+    The pool is a fixed low-pass, so it anti-aliases before subsampling -- a good fit for a
+    reconstruction target with sharp categorical boundaries -- and adds no parameters. Pairs with
+    the shared resize-conv (nearest-upsample + conv) decoder. Accepts the same constructor
+    arguments as ConvAutoencoder except `downsample`, which is fixed to "avgpool"."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.pop("downsample", None)
+        super().__init__(*args, downsample="avgpool", **kwargs)
+
+
+class StridedConvAutoencoder(ConvAutoencoder):
+    """ConvAutoencoder whose encoder downsamples with a learned 4x4 stride-2 conv.
+
+    The 4x4 kernel (divisible by the stride) gives even input coverage, so the downsampling is
+    learnable without the gridding a 2x2/3x3 stride-2 kernel produces. Pairs with the shared
+    resize-conv decoder (the up path stays resize-conv, not a transposed conv, so the decoder is
+    identical to PooledConvAutoencoder's and only the downsampler differs). Accepts the same
+    constructor arguments as ConvAutoencoder except `downsample`, which is fixed to "strided"."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.pop("downsample", None)
+        super().__init__(*args, downsample="strided", **kwargs)

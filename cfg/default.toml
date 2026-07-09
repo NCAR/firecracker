@@ -342,20 +342,28 @@ buffer_device  = "cpu"     # where the sample pool lives ("cpu" or "cuda")
 buffer_dtype   = "float32" # pool storage dtype ("float32" or "float16")
 
 [autoencoder]
-# Convolutional autoencoder pretraining (src/train_autoencoder.py). `arch` selects the
-# resampling style; each style has its own subtable so it can be sized independently. The only
-# style is "strided" (avg-pool downsample / nearest-neighbor upsample). CLI flags on
+# Convolutional autoencoder pretraining (src/train_autoencoder.py). `arch` selects the encoder
+# downsampling style; each style has its own subtable so it can be sized independently. Both
+# styles share the same resize-conv (nearest-upsample + conv) decoder and differ only in the
+# H/W-halving op: "pooled" uses a parameter-free 2x2 average pool, "strided" uses a learned 4x4
+# stride-2 conv (kernel divisible by stride -> even coverage, no gridding). CLI flags on
 # train_autoencoder.py (--arch/--channels/--latent-dim) override these.
 #
 # `channels` is the encoder width per downsample stage; the last entry is the conv channel
 # count before flattening, and len(channels) sets how far H/W halve. On a 256x256 input the six
 # defaults below produce a 256x4x4 feature map (flatten = 4096), which a dense layer projects
-# to a `latent_dim` vector. grid_size must be divisible by 2**len(channels). Roughly 7.3M
-# params at these settings.
-arch = "strided"
+# to a `latent_dim` vector. grid_size must be divisible by 2**len(channels). At these settings
+# "pooled" is ~10.8M params; "strided" adds ~3.5M (+32%) for the per-stage full 4x4 downsample
+# convs, which mix across channels as well as downsample (see below).
+arch = "pooled"
 
 # `normalize_latent` L2-normalizes the latent to unit magnitude (projects it onto the unit
 # hypersphere); the decoder's dense layer learns to rescale it. On by default.
+[autoencoder.pooled]
+channels         = [32, 64, 128, 256, 256, 256]  # encoder widths per downsample stage
+latent_dim       = 512                           # dense latent vector width
+normalize_latent = true                          # unit-magnitude latent (unit hypersphere)
+
 [autoencoder.strided]
 channels         = [32, 64, 128, 256, 256, 256]  # encoder widths per downsample stage
 latent_dim       = 512                           # dense latent vector width

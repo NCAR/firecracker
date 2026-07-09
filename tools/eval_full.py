@@ -19,15 +19,24 @@ import torch
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from strided_autoencoder import StridedConvAutoencoder
+from strided_autoencoder import PooledConvAutoencoder, StridedConvAutoencoder
 from rollout import FireDataset
 
-ARCHITECTURES = {"strided": StridedConvAutoencoder}
+ARCHITECTURES = {"pooled": PooledConvAutoencoder, "strided": StridedConvAutoencoder}
 DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
-def build_model(mc: dict, device: torch.device, dtype: torch.dtype) -> nn.Module:
-    m = ARCHITECTURES[mc["arch"]](
+def resolve_arch(mc: dict, model_state: dict) -> str:
+    """Resolve the architecture key, treating a legacy 'strided'-labelled avg-pool checkpoint
+    (no per-stage 4x4 downsample convs) as 'pooled'. See model_viewer.resolve_arch."""
+    arch = mc.get("arch", "pooled")
+    if arch == "strided" and not any(".downsample." in k for k in model_state):
+        return "pooled"
+    return arch
+
+
+def build_model(mc: dict, model_state: dict, device: torch.device, dtype: torch.dtype) -> nn.Module:
+    m = ARCHITECTURES[resolve_arch(mc, model_state)](
         in_channels=mc["in_channels"], grid_size=mc["grid_size"],
         channels=tuple(mc["channels"]), latent_dim=mc["latent_dim"],
         # Absent in pre-normalization checkpoints; they were trained without it.
@@ -52,7 +61,7 @@ def main() -> None:
     # half precision is unsupported on CPU, so up-cast to float32 there (lossless from bf16).
     want = DTYPES[mc.get("weight_dtype", "float32")]
     dtype = torch.float32 if (want is not torch.float32 and device.type == "cpu") else want
-    model = build_model(mc, device, dtype)
+    model = build_model(mc, ckpt["model_state"], device, dtype)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
