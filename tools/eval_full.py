@@ -41,6 +41,8 @@ def build_model(mc: dict, model_state: dict, device: torch.device, dtype: torch.
         channels=tuple(mc["channels"]), latent_dim=mc["latent_dim"],
         # Absent in pre-normalization checkpoints; they were trained without it.
         normalize_latent=mc.get("normalize_latent", False),
+        # Absent in pre-bottleneck checkpoints; None reproduces the un-bottlenecked model.
+        bottleneck_channels=mc.get("bottleneck_channels"),
     )
     return m.to(device=device, dtype=dtype)
 

@@ -168,6 +168,8 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
         latent_dim=cfg["latent_dim"],
         # Absent in pre-normalization checkpoints; they were trained without it.
         normalize_latent=cfg.get("normalize_latent", False),
+        # Absent in pre-bottleneck checkpoints; None reproduces the un-bottlenecked model.
+        bottleneck_channels=cfg.get("bottleneck_channels"),
     ).to(device=device, dtype=load_dtype)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
