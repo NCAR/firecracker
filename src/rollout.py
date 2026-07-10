@@ -422,6 +422,12 @@ class BatchedRollout:
                 )
             self._schedule_pos = 0
 
+        # Effective per-round schedule (collect() lets these override the attributes); record
+        # what was actually used so a trajectory-aware reader can reshape each shard's flat
+        # samples into (frames, envs) and know the sim-tick spacing between stored frames.
+        eff_steps  = self.steps  if steps  is None else int(steps)
+        eff_stride = self.stride if stride is None else int(stride)
+
         samples_per_shard = None
         for r in range(rounds):
             self.reset()                                   # fresh worlds each round
@@ -438,6 +444,12 @@ class BatchedRollout:
             "channels":          list(self.obs_channels),
             "num_channels":      self.num_channels,
             "grid_size":         self.grid_size,
+            # Trajectory structure: a shard is (F, B) samples in frame-major, env-minor order
+            # (see collect). F = samples_per_shard // num_envs frames per world, each world an
+            # independent episode; consecutive stored frames are `stride` sim-ticks apart.
+            "num_envs":          self.num_envs,
+            "stride":            eff_stride,
+            "steps":             eff_steps,
             "dtype":             str(np.dtype(self._buffer_dtype_np)),
             "shard_glob":        _SHARD_GLOB,
         }
