@@ -214,6 +214,7 @@ class ConvAutoencoder(nn.Module):
         latent_dim: int = 512,
         activation: type[nn.Module] = nn.ReLU,
         normalize_latent: bool = True,
+        bottleneck_channels: int | None = None,
     ) -> None:
         super().__init__()
         n_stages = len(channels)
@@ -227,11 +228,32 @@ class ConvAutoencoder(nn.Module):
         self.channels = tuple(channels)
         self.conv_channels = channels[-1]
         self.conv_spatial = grid_size // (2 ** n_stages)
-        self.flat_dim = self.conv_channels * self.conv_spatial * self.conv_spatial
         self.latent_dim = latent_dim
         self.normalize_latent = normalize_latent
+        # Optional 1x1-conv channel bottleneck around the latent: compress the encoder's
+        # conv_channels x S x S map to bottleneck_channels x S x S with a 1x1 conv (a per-pixel
+        # channel projection, shared across all S*S positions) BEFORE flattening, and expand back
+        # with a mirrored 1x1 conv AFTER the latent. This preserves the S x S spatial layout while
+        # shrinking the flattened width (and hence the two dense latent projections) by
+        # conv_channels/bottleneck_channels. flat_channels is what gets flattened/reshaped. Each 1x1
+        # conv is followed by BatchNorm (no activation), so the projections stay linear in
+        # representation: the encoder-side BN normalizes the channel stats feeding the dense latent
+        # layer, and the decoder-side BN mirrors it by normalizing the input to the decoder's first
+        # conv (a different tensor than that conv's own BN, so not redundant with it).
+        self.bottleneck_channels = bottleneck_channels
+        self.flat_channels = bottleneck_channels if bottleneck_channels is not None else self.conv_channels
+        self.flat_dim = self.flat_channels * self.conv_spatial * self.conv_spatial
 
         self.encoder = Encoder(in_channels, channels, activation)
+        if bottleneck_channels is not None:
+            self.enc_project = nn.Sequential(
+                nn.Conv2d(self.conv_channels, bottleneck_channels, kernel_size=1),
+                nn.BatchNorm2d(bottleneck_channels),
+            )
+            self.dec_project = nn.Sequential(
+                nn.Conv2d(bottleneck_channels, self.conv_channels, kernel_size=1),
+                nn.BatchNorm2d(self.conv_channels),
+            )
         self.to_latent = nn.Linear(self.flat_dim, latent_dim)
         self.from_latent = nn.Linear(latent_dim, self.flat_dim)
         self.decoder = Decoder(in_channels, channels, activation)
@@ -243,6 +265,8 @@ class ConvAutoencoder(nn.Module):
         unit hypersphere); the decoder's `from_latent` layer learns to rescale it.
         """
         h = self.encoder(x)
+        if self.bottleneck_channels is not None:
+            h = self.enc_project(h)  # conv_channels -> bottleneck_channels (1x1), spatial preserved
         z = self.to_latent(h.flatten(1))
         if self.normalize_latent:
             z = F.normalize(z, dim=-1)
@@ -251,7 +275,9 @@ class ConvAutoencoder(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Map a B x latent_dim latent vector back to a B x C x N x N reconstruction."""
         h = self.from_latent(z)
-        h = h.view(-1, self.conv_channels, self.conv_spatial, self.conv_spatial)
+        h = h.view(-1, self.flat_channels, self.conv_spatial, self.conv_spatial)
+        if self.bottleneck_channels is not None:
+            h = self.dec_project(h)  # bottleneck_channels -> conv_channels (1x1) before the decoder
         return self.decoder(h)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

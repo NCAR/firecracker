@@ -455,6 +455,9 @@ def main() -> None:
         args.normalize_latent if args.normalize_latent is not None
         else arch_cfg.get("normalize_latent")
     )
+    # Optional 1x1-conv channel bottleneck around the latent (config only): compress the encoder
+    # output to this many channels before flattening, expand back after. None = no bottleneck.
+    bottleneck_channels = arch_cfg.get("bottleneck_channels")
 
     # 1. Dataset --------------------------------------------------------------
     build_dataset_if_needed(args, config)
@@ -520,10 +523,13 @@ def main() -> None:
         model_kwargs["latent_dim"] = latent_dim
     if normalize_latent is not None:
         model_kwargs["normalize_latent"] = normalize_latent
+    if bottleneck_channels is not None:
+        model_kwargs["bottleneck_channels"] = bottleneck_channels
     model = ARCHITECTURES[arch](**model_kwargs).to(device=device, dtype=weight_dtype)
     n_params = sum(p.numel() for p in model.parameters())
     conv_shape = f"{model.conv_channels}x{model.conv_spatial}x{model.conv_spatial}"
     print(f"model: arch={arch} channels={tuple(model.channels)} conv_latent={conv_shape} "
+          f"bottleneck_channels={model.bottleneck_channels} flat_dim={model.flat_dim} "
           f"latent_dim={model.latent_dim} normalize_latent={model.normalize_latent} "
           f"params={n_params:,}")
 
@@ -551,6 +557,7 @@ def main() -> None:
         "channels": list(model.channels),
         "latent_dim": model.latent_dim,
         "normalize_latent": model.normalize_latent,
+        "bottleneck_channels": model.bottleneck_channels,
         # The dtype the weights are saved in; eval rebuilds the model in it (or up-casts to float32
         # on CPU, which is lossless from bfloat16). AMP trains float32 weights, so record float32.
         "weight_dtype": str(weight_dtype).removeprefix("torch."),
