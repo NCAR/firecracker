@@ -99,7 +99,13 @@ def build_autoencoder(args, config, device, weight_dtype):
             kwargs["bottleneck_channels"] = mc["bottleneck_channels"]
         model = ARCHITECTURES[arch](**kwargs).to(device=device, dtype=weight_dtype)
         model.load_state_dict(ckpt["model_state"])
-        print(f"init: loaded autoencoder from '{args.init_from}' (arch={arch})")
+        # The checkpoint may be bf16 (that's what ships in models/); building at weight_dtype before
+        # load_state_dict upcasts the weights to that dtype (bf16->f32 is lossless). Record the dtype
+        # the model actually runs in, not the source checkpoint's, so a later rebuild matches.
+        mc["weight_dtype"] = str(weight_dtype).removeprefix("torch.")
+        print(f"init: loaded autoencoder from '{args.init_from}' (arch={arch}, "
+              f"src dtype {ckpt['model_config'].get('weight_dtype', '?')} -> "
+              f"{mc['weight_dtype']})")
         # Prefer the stats the AE was trained under (carried in its config); fall back to the data.
         stats = None
         if "channel_mean" in mc and "channel_std" in mc:
