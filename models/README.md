@@ -65,3 +65,45 @@ ckpt = torch.load("models/strided_best.pt", map_location="cpu")
 model = build_model(ckpt["model_config"])   # see src/train_autoencoder.py
 model.load_state_dict(ckpt["model_state"])
 ```
+
+## World model checkpoints
+
+`world_model_convbn256_16ch_best_bf16.pt` is a latent **world model**
+(`src/train_world_model.py`), not an autoencoder: a dynamics head that predicts the next latent,
+trained on top of a **frozen** autoencoder. It is the lowest-val-loss replicate (`run_14`) of the
+`wm-frozen-convbn256-lr1e3` 16-replicate sweep (50 epochs, frozen `conv_bottleneck_256` encoder /
+decoder).
+
+| File                                       | Base AE                      | In ch | Dtype    | Source run                                          | Best epoch | Val loss (1−cos) |
+|--------------------------------------------|------------------------------|------:|----------|-----------------------------------------------------|-----------:|-----------------:|
+| `world_model_convbn256_16ch_best_bf16.pt`  | conv-bottleneck-256 (frozen) |    16 | bfloat16 | `wm-frozen-convbn256-lr1e3_20260711_000856/run_14`  |         50 | 0.017485 |
+
+The val loss is the cosine next-latent prediction loss `1 − cos(ẑ_{t+1}, sg(z_{t+1}))`, so it is
+**not** comparable to the autoencoders' reconstruction (huber/mse) losses above. Because the AE was
+frozen, `model_state` here is the `conv_bottleneck_256` autoencoder unchanged (its bf16 weights were
+upcast to f32 for training and stored back as bf16); only `dynamics_state` was trained.
+
+Beyond the autoencoder keys, the file carries `dynamics_state`, `dynamics_config`
+(`{latent_dim, hidden_dim, depth}`, with `hidden_dim` resolved to its actual width), and
+`freeze_ae`. Rebuild both nets with:
+
+```python
+import torch
+from strided_autoencoder import ConvAutoencoder
+from dynamics import LatentTransition
+
+ckpt = torch.load("models/world_model_convbn256_16ch_best_bf16.pt", map_location="cpu")
+mc, dc = ckpt["model_config"], ckpt["dynamics_config"]
+ae = ConvAutoencoder(
+    in_channels=mc["in_channels"], grid_size=mc["grid_size"], channels=tuple(mc["channels"]),
+    latent_dim=mc["latent_dim"], normalize_latent=mc["normalize_latent"],
+    bottleneck_channels=mc.get("bottleneck_channels"),
+)
+ae.load_state_dict(ckpt["model_state"]); ae.eval()
+dyn = LatentTransition(dc["latent_dim"], hidden_dim=dc["hidden_dim"], depth=dc["depth"])
+dyn.load_state_dict(ckpt["dynamics_state"]); dyn.eval()
+# z_t = ae.encode(x);  z_hat = dyn(z_t);  x_hat = ae.decode(z_hat)
+```
+
+Or view it rolling forward against the live physics:
+`python tools/rollout_viewer.py --model models/world_model_convbn256_16ch_best_bf16.pt`.
