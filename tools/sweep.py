@@ -220,16 +220,19 @@ def compute_bindings(
 
 
 def build_command(
-    passthrough: list[str], out_dir: Path, seed: int, extra: list[str] | None = None
+    trainer: Path, passthrough: list[str], out_dir: Path, seed: int,
+    extra: list[str] | None = None,
 ) -> list[str]:
-    """Assemble a train_autoencoder.py invocation: shared args plus this run's out/seed.
+    """Assemble a `trainer` invocation: shared args plus this run's out/seed.
 
-    The launcher owns `--out`, `--seed`, `--device` (always cuda) and, for a W&B run, the
-    per-run `--wandb-group`/`--wandb-name`; strip any user-supplied copies so the launcher's
-    values (passed via `extra`) don't collide on the command line.
+    `trainer` is the training script to run (train_autoencoder.py or train_world_model.py); both
+    share the --out/--seed/--device/--wandb-group/--wandb-name CLI the launcher drives. The launcher
+    owns `--out`, `--seed`, `--device` (always cuda) and, for a W&B run, the per-run
+    `--wandb-group`/`--wandb-name`; strip any user-supplied copies so the launcher's values (passed
+    via `extra`) don't collide on the command line.
     """
     drop = {"--out", "--seed", "--device", "--wandb-group", "--wandb-name"}
-    cmd = [sys.executable, str(_SRC / "train_autoencoder.py")]
+    cmd = [sys.executable, str(trainer)]
     skip_next = False
     for tok in passthrough:
         if skip_next:
@@ -332,7 +335,8 @@ def aggregate(out_root: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train replicate world models in parallel and average their curves.",
-        epilog="All args after `--` are forwarded to src/train_autoencoder.py.",
+        epilog="All args after `--` are forwarded to the --trainer script (default "
+               "src/train_autoencoder.py).",
     )
     parser.add_argument("--gpus", type=int, default=1,
                         help="GPUs to spread runs across; run i is pinned to gpu i%%gpus "
@@ -343,6 +347,10 @@ def main() -> None:
                         help="replicate runs sharing EACH gpu at once (default: 4)")
     parser.add_argument("--out", default="runs/sweep",
                         help="root dir; runs land in <out>/run_NN (default: runs/sweep)")
+    parser.add_argument("--trainer", default="train_autoencoder.py",
+                        help="training script each replicate runs: a name under src/ or a path "
+                             "(default: train_autoencoder.py; use train_world_model.py to sweep "
+                             "the latent world model)")
     parser.add_argument("--seed-base", type=int, default=0,
                         help="seed of the first replicate; run i uses seed-base+i (default: 0)")
     parser.add_argument("--wandb-group", default=None,
@@ -371,6 +379,13 @@ def main() -> None:
 
     if args.gpus < 1:
         parser.error("--gpus must be >= 1")
+    # Resolve the trainer script: a bare name (or relative path) is taken under src/; an absolute
+    # path is used as-is. Fail early with a clear message rather than deep in a subprocess.
+    trainer = Path(args.trainer)
+    if not trainer.is_absolute():
+        trainer = _SRC / trainer
+    if not trainer.is_file():
+        parser.error(f"--trainer script not found: {trainer}")
     replicas = args.replicas if args.replicas is not None else args.gpus * args.per_gpu
 
     # argparse.REMAINDER keeps the leading "--"; drop it.
@@ -392,7 +407,7 @@ def main() -> None:
         run_dir = out_root / f"run_{i:02d}"
         extra = (["--wandb-group", wandb_group, "--wandb-name", f"run_{i:02d}_seed{seed}"]
                  if wandb_on else None)
-        cmd = build_command(passthrough, run_dir, seed, extra)
+        cmd = build_command(trainer, passthrough, run_dir, seed, extra)
         queue.append((i, seed, gpu, run_dir, cmd))
 
     # Pin each lane to disjoint, NUMA-local cores so lanes sharing a socket don't starve one

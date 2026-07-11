@@ -48,6 +48,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import wandb
+except ImportError:                          # --wandb then errors out with an install hint
+    wandb = None
+
 from config import load_config
 from rollout import FireDataset
 from ram_loader import prewarm_shards
@@ -259,6 +264,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=0)
     parser.add_argument("--out", default="runs/world_model", help="output dir for checkpoints + metrics")
+    # Weights & Biases (matches the autoencoder trainer's flags so tools/sweep.py drives both the
+    # same way: it injects --wandb-group / --wandb-name per replicate when --wandb is forwarded).
+    parser.add_argument("--wandb", action="store_true", help="log the run to Weights & Biases")
+    parser.add_argument("--wandb-project", default="firecracker-world-model", help="W&B project")
+    parser.add_argument("--wandb-entity", default=None, help="W&B entity (team/user)")
+    parser.add_argument("--wandb-group", default=None, help="W&B group shared by replicates")
+    parser.add_argument("--wandb-name", default=None, help="W&B run name (default: seed<seed>)")
+    parser.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -313,6 +326,29 @@ def main() -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Optional Weights & Biases run. `run` is None when --wandb is off, turning every log call
+    # below into a no-op. Replicates share --wandb-group (injected per-run by tools/sweep.py) so
+    # W&B averages them, exactly as for the autoencoder sweeps.
+    run = None
+    if args.wandb:
+        if wandb is None:
+            raise SystemExit("--wandb was passed but wandb is not installed (pip install wandb)")
+        run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group,
+            name=args.wandb_name or f"seed{args.seed}", mode=args.wandb_mode,
+            config={
+                **model_config, **dyn_config,
+                "seed": args.seed, "epochs": args.epochs, "batch_size": args.batch_size,
+                "lr": args.lr, "weight_decay": args.weight_decay, "adam_eps": args.adam_eps,
+                "max_grad_norm": args.max_grad_norm, "amp": scaler is not None,
+                "window": args.window, "step": args.step, "val_frac": args.val_frac,
+                "pred_weight": args.pred_weight, "rec_weight": args.rec_weight,
+                "rec_loss": args.rec_loss, "freeze_ae": args.freeze_ae,
+                "init_from": args.init_from, "dyn_params": n_dyn, "ae_params": n_ae,
+                "n_train_windows": len(train_w), "n_val_windows": len(val_w),
+            },
+        )
+
     def save_checkpoint(path, epoch, val_loss, best_val):
         ckpt = {
             "epoch": epoch,
@@ -323,6 +359,7 @@ def main() -> None:
             "model_config": model_config,
             "dynamics_config": dyn_config,
             "freeze_ae": args.freeze_ae,
+            "wandb_run_id": run.id if run is not None else None,
         }
         if channel_stats is not None:
             ckpt["model_config"] = {**model_config, **channel_stats}
@@ -363,9 +400,22 @@ def main() -> None:
             save_checkpoint(out_dir / "best.pt", epoch, va_loss, best_val)
             print(f"  new best val {va_loss:.6f} -> {out_dir / 'best.pt'}")
 
+        if run is not None:
+            run.log({
+                "epoch": epoch,
+                "train_loss": tr_loss, "train_pred": tr_pred, "train_rec": tr_rec,
+                "val_loss": va_loss, "val_pred": va_pred, "val_rec": va_rec,
+                "best_val": best_val,
+                "grad_norm_mean": gmean, "grad_norm_max": gmax,
+                "lr": optimizer.param_groups[0]["lr"], "epoch_seconds": dt,
+            }, step=epoch)
+
     metrics_file.close()
     save_checkpoint(out_dir / "last.pt", args.epochs, best_val, best_val)
     print(f"done. best val loss {best_val:.6f}; checkpoints in '{out_dir}/'.")
+    if run is not None:
+        run.summary["best_val"] = best_val
+        run.finish()
 
 
 if __name__ == "__main__":
