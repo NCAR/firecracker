@@ -318,7 +318,10 @@ def main() -> None:
     transition = LatentTransition(
         model.latent_dim, hidden_dim=args.dyn_hidden, depth=args.dyn_depth,
     ).to(device=device, dtype=weight_dtype)
-    dyn_config = {"latent_dim": model.latent_dim, "hidden_dim": args.dyn_hidden, "depth": args.dyn_depth}
+    # Record the RESOLVED hidden width (transition.hidden_dim), not the raw --dyn-hidden which is
+    # None when defaulted, so a rebuild reproduces the exact head even if the default later changes.
+    dyn_config = {"latent_dim": model.latent_dim, "hidden_dim": transition.hidden_dim,
+                  "depth": args.dyn_depth}
     n_ae = sum(p.numel() for p in model.parameters())
     n_dyn = sum(p.numel() for p in transition.parameters())
     print(f"model: autoencoder params={n_ae:,} ({'frozen' if args.freeze_ae else 'trainable'}) + "

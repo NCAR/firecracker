@@ -49,6 +49,7 @@ class LatentTransition(nn.Module):
             raise ValueError(f"depth must be >= 1, got {depth}")
         hidden_dim = hidden_dim if hidden_dim is not None else 1024
         self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim          # resolved width (record this, not the raw None default)
         self.residual = bool(residual)
         self.normalize_output = bool(normalize_output)
 
