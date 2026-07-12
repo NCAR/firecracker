@@ -73,13 +73,55 @@ def test_head_overfits_fixed_targets(tmp_path):
     opt = torch.optim.Adam(head.parameters(), lr=1e-2)
     device = torch.device("cpu")
 
-    first = twm.run_epoch(model, head, loader, device, opt, None, torch.nn.MSELoss(),
-                          1.0, 1.0, True, 1.0, 1, "train", 0)[1]     # pred component
+    first = twm.run_epoch(model, head, None, loader, device, opt, None, torch.nn.MSELoss(),
+                          1.0, 1.0, True, 0.996, 1.0, 1, "train", 0)[1]     # pred component
     for epoch in range(2, 61):
-        last = twm.run_epoch(model, head, loader, device, opt, None, torch.nn.MSELoss(),
-                             1.0, 1.0, True, 1.0, epoch, "train", 0)[1]
+        last = twm.run_epoch(model, head, None, loader, device, opt, None, torch.nn.MSELoss(),
+                             1.0, 1.0, True, 0.996, 1.0, epoch, "train", 0)[1]
     assert last < first * 0.5, f"pred loss did not fall: {first:.4f} -> {last:.4f}"
     assert last < 0.3
+
+
+def test_update_ema_blends_toward_online():
+    """update_ema momentum-blends params toward the online model and copies buffers straight over."""
+    online = _ae(6)
+    ema = _ae(6)                                            # different random init
+    # Give the online model distinct BN running stats so the buffer copy is observable.
+    online.train()
+    online(torch.randn(4, 6, GRID, GRID))                   # updates BN running_mean/var
+    p_online = next(online.parameters()).detach().clone()
+    p_ema_before = next(ema.parameters()).detach().clone()
+    twm.update_ema(ema, online, decay=0.9)
+    p_ema_after = next(ema.parameters()).detach()
+    expected = 0.9 * p_ema_before + 0.1 * p_online
+    assert torch.allclose(p_ema_after, expected, atol=1e-6)
+    # Buffers are copied (momentum 0), so the EMA encoder's BN stats now match the online model's.
+    for be, bo in zip(ema.buffers(), online.buffers()):
+        assert torch.equal(be, bo)
+
+
+def test_end_to_end_ema_target_and_single_decode(tmp_path):
+    """A non-frozen step reconstructs only x_t (rec > 0), trains via the EMA target, and the EMA
+    encoder is pulled toward the online encoder after the optimizer step."""
+    _, ds = _build_dataset(tmp_path)
+    model = _ae(ds.meta["num_channels"])
+    head = LatentTransition(LATENT, depth=2)
+    ema = twm.copy.deepcopy(model)
+    for p in ema.parameters():
+        p.requires_grad_(False)
+    ema.eval()
+    ema_before = [p.detach().clone() for p in ema.parameters()]
+
+    traj = TrajectoryDataset(ds, window=2)
+    train_w, _ = split_episodes(traj, val_frac=0.25, seed=0)
+    loader = TrajectoryBatchLoader(traj, train_w, batch_size=4, shuffle=True, seed=0, drop_last=True)
+    opt = torch.optim.Adam(twm._trained_params(model, head, freeze_ae=False), lr=1e-2)
+
+    _, pred, rec, mae, _, _ = twm.run_epoch(model, head, ema, loader, torch.device("cpu"), opt, None,
+                                            torch.nn.MSELoss(), 1.0, 1.0, False, 0.9, 1.0, 1, "train", 0)
+    assert rec > 0.0 and mae > 0.0                          # x_t IS reconstructed end-to-end
+    # The EMA encoder moved toward the (now-updated) online weights.
+    assert any(not torch.equal(a, b) for a, b in zip(ema.parameters(), ema_before))
 
 
 def test_freeze_ae_updates_only_head(tmp_path):
@@ -96,8 +138,8 @@ def test_freeze_ae_updates_only_head(tmp_path):
     train_w, _ = split_episodes(traj, val_frac=0.25, seed=0)
     loader = TrajectoryBatchLoader(traj, train_w, batch_size=4, shuffle=True, seed=0, drop_last=True)
     opt = torch.optim.Adam(twm._trained_params(model, head, freeze_ae=True), lr=1e-2)
-    _, pred, rec, _, _ = twm.run_epoch(model, head, loader, torch.device("cpu"), opt, None,
-                                       torch.nn.MSELoss(), 1.0, 1.0, True, 1.0, 1, "train", 0)
+    _, pred, rec, _, _, _ = twm.run_epoch(model, head, None, loader, torch.device("cpu"), opt, None,
+                                          torch.nn.MSELoss(), 1.0, 1.0, True, 0.996, 1.0, 1, "train", 0)
 
     assert rec == 0.0                                   # reconstruction dropped when the AE is frozen
     for a, b in zip(model.parameters(), ae_before):

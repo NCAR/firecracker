@@ -6,18 +6,23 @@ Train a latent world model on Firecracker rollout trajectories: an autoencoder
 that predicts the next latent from the current one.
 
 Data are drawn as short frame windows over episodes (traj_loader.TrajectoryDataset), each window
-a run of consecutive stored frames from one world. For a window (x_t, x_{t+1}):
+a run of consecutive stored frames from one world. For a window (x_t, x_{t+1}) the loss splits into
+two DISJOINT gradient paths through a single shared online latent z_t (BYOL/SPR-style asymmetry):
 
-  z_t      = encode(x_t)                      # unit-norm latent (normalize_latent=True)
-  z_{t+1}  = encode(x_{t+1})                  # unit-norm latent
-  z_hat    = transition(z_t)                  # predicted next latent, re-normalized to the sphere
+  z_t          = encode(x_t)                       # ONLINE encoder, unit-norm (normalize_latent=True)
+  z_hat        = transition(z_t)                   # predicted next latent, re-normalized to the sphere
+  z_{t+1}^ema  = ema_encode(x_{t+1})               # EMA (momentum) encoder, stop-grad, unit-norm
 
-  prediction loss  = 1 - cos(z_hat, stopgrad(z_{t+1}))     # SimSiam/BYOL-style, cosine on the sphere
-  reconstruction   = loss_fn(decode(z_t), x_t) + loss_fn(decode(z_{t+1}), x_{t+1})
+  reconstruction (anchor)  = loss_fn(decode(z_t), x_t)              # decoder -> encoder; NOT the head
+  prediction (self-pred)   = 1 - cos(z_hat, stopgrad(z_{t+1}^ema)) # head -> encoder; NOT the decoder
 
-The L2 normalization on both encode() and transition() outputs, together with the decoder anchor,
-prevents representational collapse -- so no variance/covariance (VICReg) term is needed. The
-stop-gradient on the target latent is what makes the predictive objective non-trivial.
+The second frame x_{t+1} is NEVER decoded: its only role is as the prediction target, encoded by an
+exponential-moving-average copy of the encoder (updated after each step, no gradient). Gradients
+therefore flow along exactly two paths that meet only at the encoder: the reconstruction path
+(decoder->encoder) and the self-predictive path (dynamics head->encoder). The EMA target -- rather
+than the online encoder's own stop-grad output -- decouples the target from the fast-moving online
+weights and stabilizes training, guarding against representational collapse (together with the L2
+normalization and the decoder anchor; no variance/covariance VICReg term is needed).
 
 Two modes, selected by --init-from:
   * from scratch     -- build a fresh autoencoder from config/CLI and train encoder+decoder+head
@@ -39,6 +44,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import time
 from pathlib import Path
@@ -76,6 +82,20 @@ def cosine_prediction_loss(z_hat: torch.Tensor, z_target: torch.Tensor) -> torch
     Both are expected to be unit-norm; the stop-gradient on the target is applied by the caller.
     """
     return (1.0 - F.cosine_similarity(z_hat, z_target, dim=-1)).mean()
+
+
+@torch.no_grad()
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    """In-place EMA update of the target encoder: theta_ema <- decay*theta_ema + (1-decay)*theta_online.
+
+    Parameters are momentum-blended; buffers (BatchNorm running stats, num_batches_tracked) are copied
+    straight across, keeping the target's normalization synced to the online encoder without a lerp on
+    the integer counter. Runs under no_grad -- the EMA weights never receive gradients.
+    """
+    for pe, pm in zip(ema_model.parameters(), model.parameters()):
+        pe.mul_(decay).add_(pm.detach(), alpha=1.0 - decay)
+    for be, bm in zip(ema_model.buffers(), model.buffers()):
+        be.copy_(bm)
 
 
 def build_autoencoder(args, config, device, weight_dtype):
@@ -147,15 +167,20 @@ def build_autoencoder(args, config, device, weight_dtype):
 
 
 def run_epoch(
-    model, transition, loader, device, optimizer, scaler,
-    rec_loss_fn, pred_weight, rec_weight, freeze_ae, max_grad_norm, epoch, tag, log_interval,
+    model, transition, ema_model, loader, device, optimizer, scaler,
+    rec_loss_fn, pred_weight, rec_weight, freeze_ae, ema_decay, max_grad_norm, epoch, tag, log_interval,
     out_activation="none",
 ):
     """One pass over `loader`. Trains when `optimizer` is given, else evaluates (no grad).
 
+    The next-frame target latent comes from `ema_model` (the momentum encoder, stop-grad); when
+    training and not frozen, `ema_model` is EMA-updated toward `model` after each optimizer step.
+    For a frozen AE `ema_model` is None and the (fixed) online encoder supplies the target directly.
+
     Returns (mean_total, mean_pred, mean_rec, mean_mae, grad_norm_mean, grad_norm_max). `mean_mae`
-    is a loss-independent reconstruction MAE yardstick (sigmoid applied when out_activation=='sigmoid'
-    so the bce/sigmoid and linear arms are directly comparable); it is 0 for a frozen AE.
+    is a loss-independent reconstruction MAE yardstick over x_t (sigmoid applied when
+    out_activation=='sigmoid' so the bce/sigmoid and linear arms are directly comparable); it is 0
+    for a frozen AE.
     """
     training = optimizer is not None
     transition.train(training)
@@ -178,25 +203,29 @@ def run_epoch(
                 optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                # A frozen AE needs no encoder graph; encode under no_grad to save memory.
+                # Online latent z_t: shared by both paths (reconstruction + prediction), so both
+                # backprop into the encoder. A frozen AE needs no encoder graph -> encode under no_grad.
                 enc_ctx = torch.no_grad() if freeze_ae else torch.enable_grad()
                 with enc_ctx:
                     z_t = model.encode(x_t)
-                    z_next = model.encode(x_next)
+                # Next-frame TARGET latent: the EMA encoder (stop-grad). x_next is never decoded. For a
+                # frozen AE the encoder is fixed, so its own output is already a stable target.
+                target_encoder = model if ema_model is None else ema_model
+                with torch.no_grad():
+                    z_next_tgt = target_encoder.encode(x_next)
                 z_hat = transition(z_t)
-                pred = cosine_prediction_loss(z_hat, z_next.detach())
+                pred = cosine_prediction_loss(z_hat, z_next_tgt)
                 if freeze_ae:
                     rec = torch.zeros((), device=device)
                     mae = torch.zeros((), device=device)
                 else:
-                    dec_t, dec_next = model.decode(z_t), model.decode(z_next)
-                    rec = 0.5 * (rec_loss_fn(dec_t, x_t) + rec_loss_fn(dec_next, x_next))
+                    dec_t = model.decode(z_t)                       # reconstruct x_t only
+                    rec = rec_loss_fn(dec_t, x_t)
                     # Loss-independent reconstruction MAE (sigmoid for the logits/bce head), so the
                     # arms are comparable regardless of which rec loss trained them.
                     with torch.no_grad():
                         rt = dec_t.sigmoid() if out_activation == "sigmoid" else dec_t
-                        rn = dec_next.sigmoid() if out_activation == "sigmoid" else dec_next
-                        mae = 0.5 * (F.l1_loss(rt, x_t) + F.l1_loss(rn, x_next))
+                        mae = F.l1_loss(rt, x_t)
                 loss = pred_weight * pred + rec_weight * rec
 
             if training:
@@ -213,6 +242,9 @@ def run_epoch(
                     if max_grad_norm > 0:
                         gnorm_val = float(torch.nn.utils.clip_grad_norm_(_trained_params(model, transition, freeze_ae), max_grad_norm))
                     optimizer.step()
+                # After the online weights move, pull the EMA target encoder toward them.
+                if ema_model is not None:
+                    update_ema(ema_model, model, ema_decay)
                 if max_grad_norm > 0 and np.isfinite(gnorm_val):
                     gnorm_sum += gnorm_val
                     gnorm_max = max(gnorm_max, gnorm_val)
@@ -266,6 +298,10 @@ def main() -> None:
     parser.add_argument("--dyn-depth", type=int, default=2, help="dynamics head hidden layers")
     parser.add_argument("--dyn-hidden", type=int, default=None,
                         help="dynamics head hidden width (default 1024)")
+    parser.add_argument("--ema-decay", type=float, default=0.996,
+                        help="momentum for the EMA target encoder that supplies the prediction target "
+                             "(theta_ema <- decay*theta_ema + (1-decay)*theta_online each step). "
+                             "Ignored with --freeze-ae (the fixed encoder is its own target).")
     # Loss weights
     parser.add_argument("--pred-weight", type=float, default=1.0, help="weight on the prediction loss")
     parser.add_argument("--rec-weight", type=float, default=1.0, help="weight on the reconstruction loss")
@@ -338,6 +374,15 @@ def main() -> None:
             raise SystemExit("--freeze-ae requires --init-from (nothing to freeze when training from scratch).")
         for p in model.parameters():
             p.requires_grad_(False)
+    # EMA target encoder: a momentum copy of the whole autoencoder (only its encode() is used; the
+    # decoder half rides along, EMA-updated but unused). None for a frozen AE -- a fixed encoder is
+    # already a stable target, so it serves as its own target with no EMA bookkeeping.
+    ema_model = None
+    if not args.freeze_ae:
+        ema_model = copy.deepcopy(model)
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+        ema_model.eval()
     transition = LatentTransition(
         model.latent_dim, hidden_dim=args.dyn_hidden, depth=args.dyn_depth,
     ).to(device=device, dtype=weight_dtype)
@@ -386,6 +431,7 @@ def main() -> None:
                 "pred_weight": args.pred_weight, "rec_weight": args.rec_weight,
                 "rec_loss": args.rec_loss, "out_activation": args.out_activation,
                 "huber_delta": args.huber_delta, "freeze_ae": args.freeze_ae,
+                "ema_decay": None if args.freeze_ae else args.ema_decay,
                 "init_from": args.init_from, "dyn_params": n_dyn, "ae_params": n_ae,
                 "n_train_windows": len(train_w), "n_val_windows": len(val_w),
             },
@@ -422,13 +468,13 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         tr_loss, tr_pred, tr_rec, tr_mae, gmean, gmax = run_epoch(
-            model, transition, train_loader, device, optimizer, scaler,
-            rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae,
+            model, transition, ema_model, train_loader, device, optimizer, scaler,
+            rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae, args.ema_decay,
             args.max_grad_norm, epoch, "train", args.log_interval, args.out_activation,
         )
         va_loss, va_pred, va_rec, va_mae, _, _ = run_epoch(
-            model, transition, val_loader, device, None, None,
-            rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae,
+            model, transition, ema_model, val_loader, device, None, None,
+            rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae, args.ema_decay,
             0.0, epoch, "val", 0, args.out_activation,
         )
         dt = time.time() - t0
