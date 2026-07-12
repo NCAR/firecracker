@@ -149,10 +149,13 @@ def build_autoencoder(args, config, device, weight_dtype):
 def run_epoch(
     model, transition, loader, device, optimizer, scaler,
     rec_loss_fn, pred_weight, rec_weight, freeze_ae, max_grad_norm, epoch, tag, log_interval,
+    out_activation="none",
 ):
     """One pass over `loader`. Trains when `optimizer` is given, else evaluates (no grad).
 
-    Returns (mean_total, mean_pred, mean_rec, grad_norm_mean, grad_norm_max).
+    Returns (mean_total, mean_pred, mean_rec, mean_mae, grad_norm_mean, grad_norm_max). `mean_mae`
+    is a loss-independent reconstruction MAE yardstick (sigmoid applied when out_activation=='sigmoid'
+    so the bce/sigmoid and linear arms are directly comparable); it is 0 for a frozen AE.
     """
     training = optimizer is not None
     transition.train(training)
@@ -160,7 +163,7 @@ def run_epoch(
     use_amp = scaler is not None and device.type == "cuda"
     param_dtype = next(model.parameters()).dtype
 
-    tot = tot_pred = tot_rec = 0.0
+    tot = tot_pred = tot_rec = tot_mae = 0.0
     seen = 0
     gnorm_sum = 0.0
     gnorm_max = 0.0
@@ -184,9 +187,16 @@ def run_epoch(
                 pred = cosine_prediction_loss(z_hat, z_next.detach())
                 if freeze_ae:
                     rec = torch.zeros((), device=device)
+                    mae = torch.zeros((), device=device)
                 else:
-                    rec = 0.5 * (rec_loss_fn(model.decode(z_t), x_t)
-                                 + rec_loss_fn(model.decode(z_next), x_next))
+                    dec_t, dec_next = model.decode(z_t), model.decode(z_next)
+                    rec = 0.5 * (rec_loss_fn(dec_t, x_t) + rec_loss_fn(dec_next, x_next))
+                    # Loss-independent reconstruction MAE (sigmoid for the logits/bce head), so the
+                    # arms are comparable regardless of which rec loss trained them.
+                    with torch.no_grad():
+                        rt = dec_t.sigmoid() if out_activation == "sigmoid" else dec_t
+                        rn = dec_next.sigmoid() if out_activation == "sigmoid" else dec_next
+                        mae = 0.5 * (F.l1_loss(rt, x_t) + F.l1_loss(rn, x_next))
                 loss = pred_weight * pred + rec_weight * rec
 
             if training:
@@ -212,13 +222,14 @@ def run_epoch(
             tot += loss.item() * n
             tot_pred += pred.item() * n
             tot_rec += float(rec) * n
+            tot_mae += float(mae) * n
             seen += n
             if training and log_interval and step % log_interval == 0:
                 print(f"  epoch {epoch:3d} [{tag}] step {step:5d}/{len(loader)}  "
                       f"loss {loss.item():.6f}  pred {pred.item():.6f}  rec {float(rec):.6f}")
 
     denom = max(seen, 1)
-    return (tot / denom, tot_pred / denom, tot_rec / denom,
+    return (tot / denom, tot_pred / denom, tot_rec / denom, tot_mae / denom,
             gnorm_sum / max(gnorm_steps, 1), gnorm_max)
 
 
@@ -258,8 +269,17 @@ def main() -> None:
     # Loss weights
     parser.add_argument("--pred-weight", type=float, default=1.0, help="weight on the prediction loss")
     parser.add_argument("--rec-weight", type=float, default=1.0, help="weight on the reconstruction loss")
-    parser.add_argument("--rec-loss", choices=("mse", "huber"), default="mse", help="reconstruction loss")
-    parser.add_argument("--huber-delta", type=float, default=1.0, help="Huber delta when --rec-loss huber")
+    parser.add_argument("--rec-loss", choices=("mse", "huber", "bce"), default="mse",
+                        help="reconstruction loss: mse | huber | bce. 'bce' uses BCEWithLogitsLoss "
+                             "(decoder emits logits; sigmoid is applied only for reconstructions), so "
+                             "pair it with --out-activation sigmoid on the min-max [0,1] data.")
+    parser.add_argument("--huber-delta", type=float, default=0.1,
+                        help="Huber delta when --rec-loss huber. Inputs are min-max scaled to [0,1], "
+                             "so a small delta (~0.1) is where robustness engages (default: 0.1).")
+    parser.add_argument("--out-activation", choices=("none", "sigmoid"), default="none",
+                        help="decoder output activation used when forming reconstructions: 'none' "
+                             "(raw linear head) or 'sigmoid' (pair with --rec-loss bce). Recorded in "
+                             "the checkpoint so eval/viewers reconstruct the right values.")
     # Optimization
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -330,7 +350,16 @@ def main() -> None:
     print(f"model: autoencoder params={n_ae:,} ({'frozen' if args.freeze_ae else 'trainable'}) + "
           f"dynamics params={n_dyn:,}  latent_dim={model.latent_dim}")
 
-    rec_loss_fn = nn.HuberLoss(delta=args.huber_delta) if args.rec_loss == "huber" else nn.MSELoss()
+    if args.rec_loss == "huber":
+        rec_loss_fn = nn.HuberLoss(delta=args.huber_delta)
+    elif args.rec_loss == "bce":
+        # Decoder emits logits; BCEWithLogits fuses the sigmoid in (stable). Reconstructions/val_mae
+        # apply sigmoid explicitly (see run_epoch / out_activation).
+        rec_loss_fn = nn.BCEWithLogitsLoss()
+    else:
+        rec_loss_fn = nn.MSELoss()
+    # Recorded so eval/viewers know whether decode() outputs logits (apply sigmoid) or raw values.
+    model_config["out_activation"] = args.out_activation
     optimizer = torch.optim.AdamW(_trained_params(model, transition, args.freeze_ae),
                                   lr=args.lr, weight_decay=args.weight_decay, eps=args.adam_eps)
     scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
@@ -355,17 +384,18 @@ def main() -> None:
                 "max_grad_norm": args.max_grad_norm, "amp": scaler is not None,
                 "window": args.window, "step": args.step, "val_frac": args.val_frac,
                 "pred_weight": args.pred_weight, "rec_weight": args.rec_weight,
-                "rec_loss": args.rec_loss, "freeze_ae": args.freeze_ae,
+                "rec_loss": args.rec_loss, "out_activation": args.out_activation,
+                "huber_delta": args.huber_delta, "freeze_ae": args.freeze_ae,
                 "init_from": args.init_from, "dyn_params": n_dyn, "ae_params": n_ae,
                 "n_train_windows": len(train_w), "n_val_windows": len(val_w),
             },
         )
 
-    def save_checkpoint(path, epoch, val_loss, best_val):
+    def save_checkpoint(path, epoch, val_loss, best_pred):
         ckpt = {
             "epoch": epoch,
-            "val_loss": val_loss,
-            "best_val": best_val,
+            "val_loss": val_loss,          # total loss at the saved epoch (reference)
+            "best_pred": best_pred,        # the val_pred that selected this checkpoint
             "model_state": model.state_dict(),
             "dynamics_state": transition.state_dict(),
             "model_config": model_config,
@@ -380,53 +410,56 @@ def main() -> None:
     metrics_path = out_dir / "metrics.csv"
     metrics_file = metrics_path.open("w", newline="")
     metrics_writer = csv.writer(metrics_file)
-    metrics_writer.writerow(["epoch", "train_loss", "train_pred", "train_rec",
-                             "val_loss", "val_pred", "val_rec",
+    metrics_writer.writerow(["epoch", "train_loss", "train_pred", "train_rec", "train_mae",
+                             "val_loss", "val_pred", "val_rec", "val_mae",
                              "grad_norm_mean", "grad_norm_max", "seconds"])
 
     # 3. Train ---------------------------------------------------------------
-    best_val = float("inf")
+    # best.pt is selected on val_pred (the cosine next-latent loss): it's the world model's actual
+    # objective and, unlike val_loss (pred + a Huber/BCE rec of different scales), is comparable
+    # across the linear-Huber and sigmoid-BCE arms of the A/B.
+    best_pred = float("inf")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_pred, tr_rec, gmean, gmax = run_epoch(
+        tr_loss, tr_pred, tr_rec, tr_mae, gmean, gmax = run_epoch(
             model, transition, train_loader, device, optimizer, scaler,
             rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae,
-            args.max_grad_norm, epoch, "train", args.log_interval,
+            args.max_grad_norm, epoch, "train", args.log_interval, args.out_activation,
         )
-        va_loss, va_pred, va_rec, _, _ = run_epoch(
+        va_loss, va_pred, va_rec, va_mae, _, _ = run_epoch(
             model, transition, val_loader, device, None, None,
             rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae,
-            0.0, epoch, "val", 0,
+            0.0, epoch, "val", 0, args.out_activation,
         )
         dt = time.time() - t0
-        print(f"epoch {epoch:3d}/{args.epochs}  train {tr_loss:.6f} (pred {tr_pred:.6f} rec {tr_rec:.6f})  "
-              f"val {va_loss:.6f} (pred {va_pred:.6f} rec {va_rec:.6f})  "
+        print(f"epoch {epoch:3d}/{args.epochs}  train {tr_loss:.6f} (pred {tr_pred:.6f} rec {tr_rec:.6f} mae {tr_mae:.6f})  "
+              f"val {va_loss:.6f} (pred {va_pred:.6f} rec {va_rec:.6f} mae {va_mae:.6f})  "
               f"grad(mean {gmean:.3f} max {gmax:.3f})  ({dt:.1f}s)")
-        metrics_writer.writerow([epoch, f"{tr_loss:.6f}", f"{tr_pred:.6f}", f"{tr_rec:.6f}",
-                                 f"{va_loss:.6f}", f"{va_pred:.6f}", f"{va_rec:.6f}",
+        metrics_writer.writerow([epoch, f"{tr_loss:.6f}", f"{tr_pred:.6f}", f"{tr_rec:.6f}", f"{tr_mae:.6f}",
+                                 f"{va_loss:.6f}", f"{va_pred:.6f}", f"{va_rec:.6f}", f"{va_mae:.6f}",
                                  f"{gmean:.6f}", f"{gmax:.6f}", f"{dt:.2f}"])
         metrics_file.flush()
 
-        if va_loss < best_val:
-            best_val = va_loss
-            save_checkpoint(out_dir / "best.pt", epoch, va_loss, best_val)
-            print(f"  new best val {va_loss:.6f} -> {out_dir / 'best.pt'}")
+        if va_pred < best_pred:
+            best_pred = va_pred
+            save_checkpoint(out_dir / "best.pt", epoch, va_loss, best_pred)
+            print(f"  new best val_pred {va_pred:.6f} -> {out_dir / 'best.pt'}")
 
         if run is not None:
             run.log({
                 "epoch": epoch,
-                "train_loss": tr_loss, "train_pred": tr_pred, "train_rec": tr_rec,
-                "val_loss": va_loss, "val_pred": va_pred, "val_rec": va_rec,
-                "best_val": best_val,
+                "train_loss": tr_loss, "train_pred": tr_pred, "train_rec": tr_rec, "train_mae": tr_mae,
+                "val_loss": va_loss, "val_pred": va_pred, "val_rec": va_rec, "val_mae": va_mae,
+                "best_pred": best_pred,
                 "grad_norm_mean": gmean, "grad_norm_max": gmax,
                 "lr": optimizer.param_groups[0]["lr"], "epoch_seconds": dt,
             }, step=epoch)
 
     metrics_file.close()
-    save_checkpoint(out_dir / "last.pt", args.epochs, best_val, best_val)
-    print(f"done. best val loss {best_val:.6f}; checkpoints in '{out_dir}/'.")
+    save_checkpoint(out_dir / "last.pt", args.epochs, best_pred, best_pred)
+    print(f"done. best val_pred {best_pred:.6f}; checkpoints in '{out_dir}/'.")
     if run is not None:
-        run.summary["best_val"] = best_val
+        run.summary["best_pred"] = best_pred
         run.finish()
 
 

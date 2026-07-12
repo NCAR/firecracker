@@ -148,6 +148,8 @@ class RolloutViewer(ComparisonViewer):
         md = next(p.model.parameters()).dtype
         with torch.no_grad():
             x_hat = p.model.decode(self._z.to(md))[0].float()
+        if p.out_sigmoid:                                        # logits -> [0,1] reconstruction
+            x_hat = torch.sigmoid(x_hat)
         recon = x_hat * p.scale + p.offset if p.offset is not None else x_hat
         recon = recon.detach().cpu().numpy().astype(np.float32)
         p.recon_obs = recon
@@ -258,6 +260,10 @@ class OfflineRolloutViewer(ComparisonViewer):
         def unnorm(t):   # model output (normalized) -> affine-OBS
             return t * scale + offset if offset is not None else t
 
+        def dec(zk):     # decode -> [0,1] recon (sigmoid on a logits/bce-trained head), then affine-OBS
+            o = p.model.decode(zk.to(md))[0].float()
+            return unnorm(o.sigmoid() if p.out_sigmoid else o)
+
         with torch.no_grad():
             gt_obs = affine                                              # (F, C, H, W) affine-OBS
             z = p.model.encode(model_in[0:1].to(md))                     # anchor on frame 0
@@ -265,7 +271,7 @@ class OfflineRolloutViewer(ComparisonViewer):
             for _ in range(self.F - 1):
                 z = self.dynamics(z.to(next(self.dynamics.parameters()).dtype))
                 zs.append(z)
-            preds = [unnorm(p.model.decode(zk.to(md))[0].float()) for zk in zs]
+            preds = [dec(zk) for zk in zs]
             pred_obs = torch.stack(preds)                                # (F, C, H, W) affine-OBS
 
         self._gt_obs_seq = gt_obs.cpu().numpy().astype(np.float32)

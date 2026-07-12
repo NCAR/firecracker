@@ -79,6 +79,10 @@ def main() -> None:
           f"  device={device}", flush=True)
     print(f"  dataset={args.data}  samples={n}  batch_size={args.batch_size}", flush=True)
 
+    # A bce/sigmoid-trained model has a linear decoder that emits logits; its reconstruction is
+    # sigmoid(logits). Absent/"none" -> the decoder output is already the reconstruction.
+    out_sigmoid = mc.get("out_activation") == "sigmoid"
+
     huber_fn = nn.HuberLoss(delta=args.huber_delta)
     mse_fn = nn.MSELoss()
 
@@ -91,6 +95,8 @@ def main() -> None:
             idx = np.arange(start, min(start + args.batch_size, n))
             x = ds.get_batch(idx).to(device=device, dtype=dtype, non_blocking=True)
             x_hat = model(x)[0]
+            if out_sigmoid:                            # logits -> [0,1] reconstruction
+                x_hat = torch.sigmoid(x_hat)
             b = x.shape[0]
             # Compute the reported metrics in float32 so the accumulation is faithful even when
             # the forward ran in bf16 (the reconstruction is still a bf16-precision estimate).

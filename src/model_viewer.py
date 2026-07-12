@@ -196,6 +196,9 @@ class _ModelPanel:
             self.scale = torch.tensor(scale, dtype=torch.float32, device=device)[:, None, None]
         else:
             self.offset = self.scale = None
+        # A model trained with --rec-loss bce / --out-activation sigmoid has a linear decoder that
+        # emits logits; its reconstruction is sigmoid(logits). Absent/"none" -> raw linear output.
+        self.out_sigmoid = config.get("out_activation") == "sigmoid"
         self.recon_obs: np.ndarray | None = None   # (C, H, W) normalized-OBS reconstruction
         self.recon_phys: np.ndarray | None = None  # (C, H, W) reconstruction in physical units
 
@@ -295,6 +298,8 @@ class ComparisonViewer:
                 # The autoencoder forward returns (x_hat, z); take the reconstruction.
                 x_hat = p.model(x_in.unsqueeze(0).to(model_dtype))[0]
             x_hat = x_hat.squeeze(0).float()
+            if p.out_sigmoid:                                        # logits -> [0,1] reconstruction
+                x_hat = torch.sigmoid(x_hat)
             recon = x_hat * p.scale + p.offset if p.offset is not None else x_hat
             recon = recon.detach().cpu().numpy().astype(np.float32)  # (C, H, W) normalized-OBS
             p.recon_obs = recon
