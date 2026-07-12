@@ -162,12 +162,22 @@ class BatchedRollout:
         # disjoint contiguous shard of it via (shard_index, num_shards); together the shards
         # cover every map exactly `map_repeats` times. Fire ignition still uses `seed`, so each
         # worker lights its worlds differently. `_schedule` is None in replacement mode.
+        # Schedule provenance for the dataset meta. In replacement mode (map_repeats None) all four
+        # are None; in exhaustive mode they record the coverage (every map used map_repeats times)
+        # and this worker's disjoint slice of the shared global schedule (shard_index of num_shards,
+        # permuted by schedule_seed), enough to reproduce which maps this worker drew.
         self._schedule: list[Path] | None = None
         self._schedule_pos = 0
         if map_repeats is not None:
+            self._map_repeats = int(map_repeats)
+            self._num_shards = int(num_shards)
+            self._shard_index = int(shard_index)
+            self._schedule_seed = int(schedule_seed)
             self._schedule = self._build_map_schedule(
-                int(map_repeats), int(num_shards), int(shard_index), int(schedule_seed)
+                self._map_repeats, self._num_shards, self._shard_index, self._schedule_seed
             )
+        else:
+            self._map_repeats = self._num_shards = self._shard_index = self._schedule_seed = None
 
         self._state: SimState | None = None
         self._pool: torch.Tensor | None = None   # (capacity, C, N, N) on buffer_device
@@ -455,6 +465,14 @@ class BatchedRollout:
             "num_envs":          self.num_envs,
             "stride":            eff_stride,
             "steps":             eff_steps,
+            # Map coverage / schedule provenance: map_repeats an int means exhaustive (every map
+            # used exactly this many times, no replacement), with this worker taking shard_index of
+            # num_shards from the schedule_seed-permuted global schedule; all null means random-with-
+            # replacement draws (no schedule). See _build_map_schedule.
+            "map_repeats":       self._map_repeats,
+            "num_shards":        self._num_shards,
+            "shard_index":       self._shard_index,
+            "schedule_seed":     self._schedule_seed,
             "dtype":             str(np.dtype(self._buffer_dtype_np)),
             "shard_glob":        _SHARD_GLOB,
         }
