@@ -302,8 +302,10 @@ rejects mismatched/legacy maps with a clear "regenerate" message.
   Kelvin/SI ranges — `_AIR_TEMP_DISPLAY_THRESHOLD`, the ignition-relative fire colors in
   `build_fire_surface`, pressure/column-height normalisation, etc.
 - **Observations:** `OBS_CHANNELS` now span physical ranges; document a per-channel
-  normalisation (mean/scale) for the world model and apply it in `build_observation` or
-  at the trainer boundary.
+  normalisation for the world model and apply it in `build_observation` or at the trainer
+  boundary. *Done:* `build_observation` maps each channel to ~`[0, 1]` via the `OBS_NORM`
+  affine windows; the dataset is then min-max scaled to `[0, 1]` offline
+  (`tools/normalize_dataset.py`, stats in `stats.json`) before training.
 - **Config:** rewrite `cfg/default.toml` with physical values and a unit annotation on
   every key; add a `[units]` section (`cell_size_m`, reference state, etc.).
 - **`main.py`:** annotate the info printouts with units.

@@ -110,15 +110,18 @@ def _resolve_device(name: str | None) -> torch.device:
 
 
 def _load_channel_stats(data_dir: str) -> dict | None:
-    """The per-channel mean/std baked into this dataset (its `stats.json`), or None if absent.
+    """The per-channel min/max baked into this dataset (its `stats.json`), or None if absent.
 
-    Recorded in the checkpoint so an inference/eval script can standardise raw inputs the same way
-    the training shards were standardised (and de-normalize reconstructions)."""
+    Recorded in the checkpoint so an inference/eval script can min-max scale raw inputs the same way
+    the training shards were scaled (and de-normalize reconstructions). Legacy z-scored datasets
+    (channel_mean/channel_std) are still accepted for backward compatibility."""
     path = Path(data_dir) / "stats.json"
     if not path.is_file():
         return None
     stats = json.loads(path.read_text())
-    if "channel_mean" not in stats or "channel_std" not in stats:
+    has_minmax = "channel_min" in stats and "channel_max" in stats
+    has_meanstd = "channel_mean" in stats and "channel_std" in stats
+    if not (has_minmax or has_meanstd):
         return None
     return stats
 
@@ -353,18 +356,19 @@ def main() -> None:
                              "similarity + L1; rewards preserving local contrast/structure, so it "
                              "penalises blur that mse tolerates). val_mse is always logged so the "
                              "three are comparable")
-    parser.add_argument("--huber-delta", type=float, default=1.0,
+    parser.add_argument("--huber-delta", type=float, default=0.1,
                         help="Huber transition point (only for --loss huber); residuals below it "
-                             "are quadratic, above it linear. With per-channel standardisation the "
-                             "inputs are ~unit-variance (roughly [-3,3]), so 0.5-1.0 is where "
-                             "robustness starts to engage (default: 1.0)")
+                             "are quadratic, above it linear. Inputs are min-max scaled to [0, 1] "
+                             "(outliers can ride above 1), so residuals are small -- the default 0.1 "
+                             "keeps the bulk of pixels quadratic and only clamps the gradient of "
+                             "genuine outliers (default: 0.1)")
     parser.add_argument("--ms-ssim-alpha", type=float, default=0.84,
                         help="(only for --loss ms-ssim+l1) weight on the MS-SSIM term vs L1: "
                              "alpha*(1-MS-SSIM) + (1-alpha)*L1 (default: 0.84, per Zhao et al.)")
-    parser.add_argument("--ms-ssim-data-range", type=float, default=6.0,
+    parser.add_argument("--ms-ssim-data-range", type=float, default=1.0,
                         help="(only for --loss ms-ssim+l1) SSIM dynamic range L for its C1/C2 "
-                             "constants; the inputs are per-channel standardised, so ~6.0 (a +/-3 "
-                             "sigma span) suits them (default: 6.0)")
+                             "constants; the inputs are min-max scaled to [0, 1], so ~1.0 suits "
+                             "them (default: 1.0)")
     parser.add_argument("--val-frac", type=float, default=0.05,
                         help="fraction of samples held out for validation")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -469,13 +473,13 @@ def main() -> None:
         print(f"prewarm: streaming {len(dataset.shard_paths)} shards into page cache (background)")
         prewarm_shards(dataset)
     # Normalization is baked into the shards offline (tools/normalize_dataset.py) so the training
-    # hot path stays a plain memmap copy. Warn if the data hasn't been standardized; the applied
-    # per-channel mean/std travel in <data>/stats.json (recorded in the checkpoint for inference).
+    # hot path stays a plain memmap copy. Warn if the data hasn't been normalized; the applied
+    # per-channel min/max travel in <data>/stats.json (recorded in the checkpoint for inference).
     channel_stats = _load_channel_stats(args.data)
     if dataset.is_normalized:
-        print(f"input: per-channel zero-mean/unit-std baked into shards ('{args.data}')")
+        print(f"input: per-channel min-max scaled to [0, 1] baked into shards ('{args.data}')")
     else:
-        print(f"WARNING: dataset at '{args.data}' is not marked normalized; train on standardized "
+        print(f"WARNING: dataset at '{args.data}' is not marked normalized; train on normalized "
               f"data by baking it first: python tools/normalize_dataset.py --data {args.data}")
     grid_size = int(dataset.meta["grid_size"])
     in_channels = int(dataset.meta["num_channels"])
@@ -562,11 +566,13 @@ def main() -> None:
         # on CPU, which is lossless from bfloat16). AMP trains float32 weights, so record float32.
         "weight_dtype": str(weight_dtype).removeprefix("torch."),
     }
-    # Carry the input standardisation so inference/eval can reproduce the exact channel scaling
-    # the model was trained under (the transform baked into the shards; absent if none was found).
+    # Carry the input normalization so inference/eval can reproduce the exact channel scaling the
+    # model was trained under (the transform baked into the shards; absent if none was found). Copy
+    # the min/max pair for a min-max dataset, or the legacy mean/std pair for an older z-scored one.
     if channel_stats is not None:
-        model_config["channel_mean"] = channel_stats["channel_mean"]
-        model_config["channel_std"] = channel_stats["channel_std"]
+        for k in ("channel_min", "channel_max", "channel_mean", "channel_std"):
+            if k in channel_stats:
+                model_config[k] = channel_stats[k]
 
     # Resume: reload model/optimizer/scaler state and continue at the next epoch. The architecture
     # is rebuilt from CLI/config above (not the checkpoint), so guard against a silent mismatch that

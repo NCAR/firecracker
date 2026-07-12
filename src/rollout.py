@@ -77,8 +77,8 @@ DEFAULT_GRID_SIZE = 256
 # Filenames used by build_dataset / FireDataset for an on-disk sharded dataset.
 _META_NAME = "meta.json"
 _SHARD_GLOB = "shard_*.npy"
-# Per-channel standardisation stats (mean/std) sit at the dataset root, next to meta.json for a
-# flat dataset or above the per-worker subdirs for a nested one — see compute_channel_stats.
+# Per-channel normalization stats (min/max) sit at the dataset root, next to meta.json for a
+# flat dataset or above the per-worker subdirs for a nested one — see compute_channel_minmax.
 _STATS_NAME = "stats.json"
 
 
@@ -479,11 +479,11 @@ class FireDataset(Dataset):
     RAM. Each item is one C x N x N observation. Samples are stored grouped by world within a
     shard (and by source across subdirs), so shuffle in the DataLoader for I.I.D. minibatches.
 
-    Standardisation is *baked into the shards* offline (tools/normalize_dataset.py rewrites each
-    sample to the per-channel z-score `(x - mean) / std`), not applied on read: every shard is read
-    hundreds of times over a training run, so paying the scale once at prep time keeps the hot path
-    a plain memmap copy. A normalised dataset carries `"normalized": true` in its meta and the
-    applied mean/std in a root `stats.json`; `FireDataset.is_normalized` reports the flag.
+    Normalization is *baked into the shards* offline (tools/normalize_dataset.py rewrites each
+    sample to the per-channel min-max scale `(x - min) / (max - min)`), not applied on read: every
+    shard is read hundreds of times over a training run, so paying the scale once at prep time keeps
+    the hot path a plain memmap copy. A normalised dataset carries `"normalized": true` in its meta
+    and the applied min/max in a root `stats.json`; `FireDataset.is_normalized` reports the flag.
     """
 
     def __init__(self, root: str | Path):
@@ -525,7 +525,7 @@ class FireDataset(Dataset):
 
     @property
     def is_normalized(self) -> bool:
-        """Whether the on-disk shards have been standardised (every source meta flags it)."""
+        """Whether the on-disk shards have been normalized (every source meta flags it)."""
         return self._all_normalized
 
     def __len__(self) -> int:
@@ -558,7 +558,7 @@ class FireDataset(Dataset):
         """Grouped-by-shard fancy read of the requested samples as a (B, C, N, N) numpy array.
 
         Groups the global indices by shard so each shard is read in a single memmap fancy-index
-        into a preallocated buffer. Shared by get_batch and compute_channel_stats.
+        into a preallocated buffer. Shared by get_batch and compute_channel_minmax.
         """
         indices = np.asarray(indices, dtype=np.int64)
         shard_ids, offsets = np.divmod(indices, self.per_shard)
@@ -571,7 +571,7 @@ class FireDataset(Dataset):
 
 
 def plan_stat_shards(dataset: FireDataset, max_samples: int | None, seed: int) -> np.ndarray:
-    """Which shard indices compute_channel_stats will read for a given `max_samples` budget.
+    """Which shard indices compute_channel_minmax will read for a given `max_samples` budget.
 
     Sampling is done at *shard* granularity: reading a few whole shards sequentially is far cheaper
     on a capacity-tuned parallel filesystem than scattering `max_samples` single-sample reads
@@ -586,60 +586,77 @@ def plan_stat_shards(dataset: FireDataset, max_samples: int | None, seed: int) -
     return np.sort(np.random.default_rng(seed).choice(n_shards, size=k, replace=False))
 
 
-def compute_channel_stats(
-    dataset: FireDataset, *, max_samples: int | None = 10_000, seed: int = 0, chunk: int = 256
+def compute_channel_minmax(
+    dataset: FireDataset, *, max_samples: int | None = None, seed: int = 0, chunk: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate per-channel mean and std for zero-mean/unit-std scaling of `dataset`.
+    """Find per-channel min and max for min-max scaling of `dataset` to [0, 1].
 
-    The full set is far too large to read in its entirety (hundreds of GB), so — unless it fits the
-    `max_samples` budget — stats are estimated from a random subset of whole shards (see
-    plan_stat_shards) read sequentially. Each channel is reduced over the read observations and both
-    spatial axes, so with a 256x256 grid even ~10k samples give each channel ~6.5e8 values: the
-    mean/std estimates are tight to several significant figures, which is all standardisation needs.
-    Pass `max_samples=None` to read every shard.
+    Most channels aren't normally distributed (bounded masses, one-hot biomes, a binary ignited
+    mask, heavy-tailed temperatures), so the dataset is min-max scaled — (x - min) / (max - min) —
+    rather than z-scored. This maps the bulk of each channel into [0, 1] while letting genuine
+    outliers (e.g. flame-front temperatures) ride above 1, which is often exactly the signal we
+    care about, instead of being flattened by a std.
 
-    Raw (pre-standardisation) values are accumulated in float64 in `chunk`-sample slices so no large
-    float64 buffer is materialised. std uses the population (biased) estimator; a channel whose read
-    values never vary gets std=1 so standardising it is a safe no-op rather than a divide-by-zero.
+    Unlike a mean/std, min and max are extreme order statistics: reading only a subset of shards
+    systematically *under*-estimates the true range (the global extreme may live in an unread
+    shard), which would push unread outliers past [0, 1] after scaling. So the default
+    (`max_samples=None`) reads *every* shard; passing a `max_samples` budget samples whole shards
+    (see plan_stat_shards) and trades that exactness for speed. Values are read in float64
+    `chunk`-sample slices, so no large buffer is materialised.
 
-    Returns `(mean, std)`, each a float64 array of length num_channels.
+    A channel whose read values never vary (max == min) has zero span; the caller floors the span
+    to 1 so scaling it is a safe no-op (the constant maps to 0) rather than a divide-by-zero.
+
+    Returns `(cmin, cmax)`, each a float64 array of length num_channels.
     """
     n_ch = int(dataset.meta["num_channels"])
     if len(dataset) == 0:
         raise ValueError(f"Dataset at {dataset.root} is empty; cannot compute channel stats.")
     shard_sel = plan_stat_shards(dataset, max_samples, seed)
 
-    count = 0                                    # total scalars seen per channel (samples * H * W)
-    s1 = np.zeros(n_ch, dtype=np.float64)         # sum per channel
-    s2 = np.zeros(n_ch, dtype=np.float64)         # sum of squares per channel
+    cmin = np.full(n_ch, np.inf, dtype=np.float64)    # running per-channel min
+    cmax = np.full(n_ch, -np.inf, dtype=np.float64)   # running per-channel max
     for si in shard_sel:
-        shard = dataset._shard(int(si))           # (per_shard, C, H, W) memmap
-        m, _, h, w = shard.shape
-        for start in range(0, m, chunk):          # sequential slices of one shard
+        shard = dataset._shard(int(si))               # (per_shard, C, H, W) memmap
+        m = shard.shape[0]
+        for start in range(0, m, chunk):              # sequential slices of one shard
             arr = np.asarray(shard[start:start + chunk], dtype=np.float64)
-            s1 += arr.sum(axis=(0, 2, 3))
-            s2 += (arr * arr).sum(axis=(0, 2, 3))
-            count += arr.shape[0] * h * w
-
-    mean = s1 / count
-    var = np.maximum(s2 / count - mean * mean, 0.0)   # clamp tiny negatives from rounding
-    std = np.sqrt(var)
-    std[std < 1e-8] = 1.0                              # constant channel -> unit scale (no-op)
-    return mean, std
+            cmin = np.minimum(cmin, arr.min(axis=(0, 2, 3)))
+            cmax = np.maximum(cmax, arr.max(axis=(0, 2, 3)))
+    return cmin, cmax
 
 
-def write_channel_stats(
-    root: str | Path, mean: np.ndarray, std: np.ndarray, *, channels: list[str] | None = None,
+def stats_affine(stats: dict) -> tuple[np.ndarray, np.ndarray]:
+    """The baked normalization as an affine pair `(offset, scale)`: forward is (x - offset) / scale,
+    inverse is y * scale + offset.
+
+    Min-max datasets/checkpoints carry `channel_min`/`channel_max` (offset = min, scale = max - min);
+    legacy z-scored ones carry `channel_mean`/`channel_std` (offset = mean, scale = std), so old
+    checkpoints still de-normalize correctly. A zero/tiny span is floored to 1 so a constant channel
+    is a safe no-op (the constant maps to 0). Returns two float64 arrays of length num_channels.
+    """
+    if "channel_min" in stats and "channel_max" in stats:
+        offset = np.asarray(stats["channel_min"], dtype=np.float64)
+        scale = np.asarray(stats["channel_max"], dtype=np.float64) - offset
+    else:
+        offset = np.asarray(stats["channel_mean"], dtype=np.float64)
+        scale = np.asarray(stats["channel_std"], dtype=np.float64).copy()
+    scale[scale < 1e-8] = 1.0                             # constant channel -> unit scale (no-op)
+    return offset, scale
+
+
+def write_channel_minmax(
+    root: str | Path, cmin: np.ndarray, cmax: np.ndarray, *, channels: list[str] | None = None,
     n_samples: int | None = None, total_samples: int | None = None,
 ) -> dict:
-    """Write per-channel mean/std to `root`/stats.json (the transform baked in by normalize_dataset).
+    """Write per-channel min/max to `root`/stats.json (the transform baked in by normalize_dataset).
 
     `n_samples`/`total_samples` (when given) record how many observations the estimate drew and
     how many the dataset holds, for provenance. Returns the stats dict that was written.
     """
     stats = {
-        "channel_mean": [float(x) for x in mean],
-        "channel_std":  [float(x) for x in std],
+        "channel_min": [float(x) for x in cmin],
+        "channel_max": [float(x) for x in cmax],
     }
     if channels is not None:
         stats["channels"] = list(channels)
@@ -657,14 +674,14 @@ def write_channel_stats(
 
 
 def ensure_channel_stats(
-    root: str | Path, *, recompute: bool = False, max_samples: int | None = 10_000,
+    root: str | Path, *, recompute: bool = False, max_samples: int | None = None,
     seed: int = 0, chunk: int = 256, verbose: bool = True,
 ) -> dict:
     """Compute + write `root`/stats.json if missing (or `recompute`), else load the existing one.
 
-    Idempotent: the first call over a freshly built dataset estimates the stats from up to
-    `max_samples` random observations (see compute_channel_stats) and caches them; later calls just
-    read the file back. Returns the stats dict.
+    Idempotent: the first call over a freshly built dataset finds the per-channel min/max (see
+    compute_channel_minmax; the default reads every shard so the range is exact) and caches them;
+    later calls just read the file back. Returns the stats dict.
     """
     stats_path = Path(root) / _STATS_NAME
     if stats_path.is_file() and not recompute:
@@ -676,16 +693,16 @@ def ensure_channel_stats(
     if verbose:
         scope = (f"all {n}" if n_used == n
                  else f"{n_used} ({len(shard_sel)} random shards) of {n}")
-        print(f"estimating channel stats from {scope} samples in '{root}' ...")
-    mean, std = compute_channel_stats(ds, max_samples=max_samples, seed=seed, chunk=chunk)
-    stats = write_channel_stats(
-        root, mean, std, channels=list(ds.meta.get("channels", [])),
+        print(f"measuring channel min/max over {scope} samples in '{root}' ...")
+    cmin, cmax = compute_channel_minmax(ds, max_samples=max_samples, seed=seed, chunk=chunk)
+    stats = write_channel_minmax(
+        root, cmin, cmax, channels=list(ds.meta.get("channels", [])),
         n_samples=n_used, total_samples=n,
     )
     if verbose:
-        names = stats.get("channels") or [f"ch{i}" for i in range(len(mean))]
-        for name, mu, sd in zip(names, mean, std):
-            print(f"  {name:<18} mean {mu:+.4g}  std {sd:.4g}")
+        names = stats.get("channels") or [f"ch{i}" for i in range(len(cmin))]
+        for name, lo, hi in zip(names, cmin, cmax):
+            print(f"  {name:<18} min {lo:+.4g}  max {hi:+.4g}")
     return stats
 
 
@@ -717,21 +734,22 @@ def _drop_page_cache(path: str) -> None:
 
 
 def _bake_shard(job: tuple) -> int:
-    """Rewrite one shard to standardised values into its temp path; returns the sample count.
+    """Rewrite one shard to min-max scaled values into its temp path; returns the sample count.
 
-    `mean`/`std` are (1, C, 1, 1) float32. The float32 working buffer is bounded to `chunk` samples;
-    the output keeps the shard's stored dtype. Reads the pristine original (never mutated here) and
-    writes a sibling temp file, so the source dir is only swapped in once all its shards are baked.
-    Each shard's read and written pages are dropped from cache afterwards to bound memory use.
+    `offset`/`scale` are (1, C, 1, 1) float32 (min and max-min per channel); the sample maps to
+    (x - offset) / scale. The float32 working buffer is bounded to `chunk` samples; the output keeps
+    the shard's stored dtype. Reads the pristine original (never mutated here) and writes a sibling
+    temp file, so the source dir is only swapped in once all its shards are baked. Each shard's read
+    and written pages are dropped from cache afterwards to bound memory use.
     """
-    src_path, tmp_path, mean, std, chunk, dtype_str = job
+    src_path, tmp_path, offset, scale, chunk, dtype_str = job
     dtype = np.dtype(dtype_str)
     raw = np.load(src_path, mmap_mode="r")                   # (m, C, H, W), read-only
     n = int(raw.shape[0])
     out = np.empty(raw.shape, dtype=dtype)
     for start in range(0, n, chunk):
         block = np.asarray(raw[start:start + chunk], dtype=np.float32)
-        out[start:start + chunk] = ((block - mean) / std).astype(dtype)
+        out[start:start + chunk] = ((block - offset) / scale).astype(dtype)
     np.save(tmp_path, out)
     del raw, out                                             # release the mmap + output buffer
     _drop_page_cache(tmp_path)                               # evict the just-written pages
@@ -740,13 +758,13 @@ def _bake_shard(job: tuple) -> int:
 
 
 def bake_normalization(
-    root: str | Path, *, max_samples: int | None = 10_000, seed: int = 0, chunk: int = 256,
+    root: str | Path, *, max_samples: int | None = None, seed: int = 0, chunk: int = 256,
     workers: int = 1, keep_backup: bool = False, verbose: bool = True,
 ) -> dict:
-    """Standardise a dataset on disk: rewrite every shard to the per-channel z-score (x-mean)/std.
+    """Normalize a dataset on disk: rewrite every shard to the per-channel min-max scale (x-min)/(max-min).
 
-    Estimates (or reuses) the per-channel stats -> `root`/stats.json, then rewrites every shard to
-    standardised values in the stored dtype and flags each source meta `"normalized": true`, so
+    Measures (or reuses) the per-channel min/max -> `root`/stats.json, then rewrites every shard to
+    scaled values in the stored dtype and flags each source meta `"normalized": true`, so
     FireDataset serves already-scaled data with no per-read cost. Individual shards are baked in
     parallel across `workers` processes (I/O-bound; scale it to the node's cpus). Idempotent:
     already-flagged sources are skipped, so a re-run (or requeued job) is a safe no-op.
@@ -779,8 +797,9 @@ def bake_normalization(
     # Stats are measured from the (still-raw) data; reuses stats.json when already present.
     stats = ensure_channel_stats(root, max_samples=max_samples, seed=seed, chunk=chunk,
                                  verbose=verbose)
-    mean = np.asarray(stats["channel_mean"], dtype=np.float32).reshape(1, -1, 1, 1)
-    std = np.asarray(stats["channel_std"], dtype=np.float32).reshape(1, -1, 1, 1)
+    off64, scale64 = stats_affine(stats)                 # min and (max-min), constant-channel floored
+    offset = off64.astype(np.float32).reshape(1, -1, 1, 1)
+    scale = scale64.astype(np.float32).reshape(1, -1, 1, 1)
 
     # Fan out one task per shard (across all pending sources) into fresh per-source temp dirs.
     plans = []          # (source_dir, tmp_dir, meta)
@@ -794,7 +813,7 @@ def bake_normalization(
         tmp.mkdir()
         plans.append((d, tmp, meta))
         for sp in shards:
-            tasks.append((str(sp), str(tmp / sp.name), mean, std, chunk, meta["dtype"]))
+            tasks.append((str(sp), str(tmp / sp.name), offset, scale, chunk, meta["dtype"]))
 
     if verbose:
         print(f"baking {len(tasks)} shard(s) across {len(pending)} source(s) "

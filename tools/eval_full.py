@@ -71,8 +71,8 @@ def main() -> None:
     if not ds.is_normalized:
         raise SystemExit(
             f"dataset at {args.data} is NOT baked-normalized; the model was trained on per-channel "
-            f"z-scored inputs, so evaluating raw shards is invalid. Point --data at the normalized "
-            f"(staged) copy.")
+            f"min-max scaled inputs, so evaluating raw shards is invalid. Point --data at the "
+            f"normalized (staged) copy.")
     n = len(ds)
     print(f"ckpt={args.ckpt}", flush=True)
     print(f"  weight_dtype(saved)={mc.get('weight_dtype')}  eval_dtype={str(dtype).removeprefix('torch.')}"

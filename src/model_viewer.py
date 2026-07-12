@@ -31,9 +31,10 @@ pressure, radiant heat, ...) draw from state that is not in the observation, so 
 shows a "not in observation" placeholder for them while the physics panel still renders.
 
 The observation is doubly normalized on the way into the model: build_observation applies the affine
-OBS_NORM windows (roughly [0, 1] per channel), then training z-scores each channel to zero mean /
-unit variance using stats carried in the checkpoint (channel_mean / channel_std). Both transforms
-are inverted here so the reconstruction lands back in physical units for rendering.
+OBS_NORM windows (roughly [0, 1] per channel), then training min-max scales each channel to [0, 1]
+using stats carried in the checkpoint (channel_min / channel_max; legacy checkpoints carry
+channel_mean / channel_std). Both transforms are inverted here so the reconstruction lands back in
+physical units for rendering.
 
 Invoked via `python src/main.py --model models/best.pt [more.pt ...]`; see main.run_comparison.
 """
@@ -63,6 +64,7 @@ from rendering import (
     build_biome_legend_panel,
     heat_colormap,
 )
+from rollout import stats_affine
 
 # The checkpoint's model_config["arch"] selects the architecture. Kept in step with
 # train_autoencoder.ARCHITECTURES (imported directly here to avoid pulling in the training deps).
@@ -137,8 +139,9 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
     """Load a checkpoint and rebuild the trained autoencoder on `device`, in eval mode.
 
     Returns (model, model_config). The model_config carries the architecture (arch / channels /
-    latent_dim / grid_size / in_channels) and, when the training dataset was standardized, the
-    per-channel mean/std the input was z-scored by (channel_mean / channel_std).
+    latent_dim / grid_size / in_channels) and, when the training dataset was normalized, the
+    per-channel min/max the input was scaled by (channel_min / channel_max; legacy checkpoints carry
+    channel_mean / channel_std).
     """
     try:
         ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -177,22 +180,22 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
 
 
 class _ModelPanel:
-    """One loaded autoencoder plus the per-model state the viewer keeps for it: its de-standardising
-    z-score stats and the cached reconstruction (in both normalized-OBS and physical units)."""
+    """One loaded autoencoder plus the per-model state the viewer keeps for it: its de-normalizing
+    affine stats and the cached reconstruction (in both normalized-OBS and physical units)."""
 
     def __init__(self, model: torch.nn.Module, config: dict, name: str, device: torch.device) -> None:
         self.model = model
         self.config = config
         self.name = name
-        # Per-channel z-score the model was trained under (if the dataset was standardized). Kept on
-        # the device so the (de)standardisation is a cheap broadcast around the forward pass.
-        mean = config.get("channel_mean")
-        std = config.get("channel_std")
-        if mean is not None and std is not None:
-            self.mean = torch.tensor(mean, dtype=torch.float32, device=device)[:, None, None]
-            self.std = torch.tensor(std, dtype=torch.float32, device=device)[:, None, None]
+        # Per-channel affine normalization the model was trained under (offset = min, scale = max-min
+        # for a min-max dataset; mean/std for a legacy z-scored one), if the dataset was normalized.
+        # Kept on the device so (de)normalization is a cheap broadcast around the forward pass.
+        if "channel_min" in config or "channel_mean" in config:
+            offset, scale = stats_affine(config)
+            self.offset = torch.tensor(offset, dtype=torch.float32, device=device)[:, None, None]
+            self.scale = torch.tensor(scale, dtype=torch.float32, device=device)[:, None, None]
         else:
-            self.mean = self.std = None
+            self.offset = self.scale = None
         self.recon_obs: np.ndarray | None = None   # (C, H, W) normalized-OBS reconstruction
         self.recon_phys: np.ndarray | None = None  # (C, H, W) reconstruction in physical units
 
@@ -284,15 +287,15 @@ class ComparisonViewer:
         x = torch.from_numpy(gt).to(self.device)
         self._gt_obs = gt
         for p in self.panels:
-            x_in = (x - p.mean) / p.std if p.mean is not None else x
+            x_in = (x - p.offset) / p.scale if p.offset is not None else x
             # Feed the model in its own weight dtype (bf16/f16 on GPU; f32 on CPU) then widen the
-            # reconstruction back to float32 for the de-standardisation math and rendering.
+            # reconstruction back to float32 for the de-normalization math and rendering.
             model_dtype = next(p.model.parameters()).dtype
             with torch.no_grad():
                 # The autoencoder forward returns (x_hat, z); take the reconstruction.
                 x_hat = p.model(x_in.unsqueeze(0).to(model_dtype))[0]
             x_hat = x_hat.squeeze(0).float()
-            recon = x_hat * p.std + p.mean if p.mean is not None else x_hat
+            recon = x_hat * p.scale + p.offset if p.offset is not None else x_hat
             recon = recon.detach().cpu().numpy().astype(np.float32)  # (C, H, W) normalized-OBS
             p.recon_obs = recon
             p.recon_phys = recon * self.scales[:, None, None] + self.offsets[:, None, None]

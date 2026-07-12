@@ -107,8 +107,11 @@ def build_autoencoder(args, config, device, weight_dtype):
               f"src dtype {ckpt['model_config'].get('weight_dtype', '?')} -> "
               f"{mc['weight_dtype']})")
         # Prefer the stats the AE was trained under (carried in its config); fall back to the data.
+        # Min-max datasets carry channel_min/channel_max; legacy z-scored ones channel_mean/std.
         stats = None
-        if "channel_mean" in mc and "channel_std" in mc:
+        if "channel_min" in mc and "channel_max" in mc:
+            stats = {"channel_min": mc["channel_min"], "channel_max": mc["channel_max"]}
+        elif "channel_mean" in mc and "channel_std" in mc:
             stats = {"channel_mean": mc["channel_mean"], "channel_std": mc["channel_std"]}
         return model, mc, stats
 

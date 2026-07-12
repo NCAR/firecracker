@@ -1,15 +1,16 @@
 """
 normalize_dataset.py
 
-Standardise a built Firecracker dataset *on disk*: rewrite every shard to the per-channel z-score
-(x - mean) / std so each channel has zero mean and unit variance. Because each shard is read
-hundreds of times over a training run, baking the scale in once here keeps the training hot path a
-plain memmap copy (FireDataset applies no per-read normalization).
+Normalize a built Firecracker dataset *on disk*: rewrite every shard to the per-channel min-max
+scale (x - min) / (max - min) so each channel lands in [0, 1]. Most channels aren't normally
+distributed, so min-max is preferred over z-scoring. Because each shard is read hundreds of times
+over a training run, baking the scale in once here keeps the training hot path a plain memmap copy
+(FireDataset applies no per-read normalization).
 
-The per-channel stats are estimated from a random subset of shards (10k observations by default;
-see tools/compute_stats.py) and cached to <data>/stats.json — that file records the exact transform
-that was baked in, for inference/de-normalization. Each source's meta.json is flagged
-"normalized": true on success.
+The per-channel min/max are measured over the whole dataset by default (see tools/compute_stats.py;
+min/max from a subset would under-estimate the true range) and cached to <data>/stats.json — that
+file records the exact transform that was baked in, for inference/de-normalization. Each source's
+meta.json is flagged "normalized": true on success.
 
 Idempotent and resumable: already-flagged sources are skipped, and each source is baked into a
 sibling temp dir built from the pristine originals then swapped in, so an interrupted run never
@@ -33,13 +34,14 @@ from rollout import bake_normalization  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Bake per-channel zero-mean/unit-std normalization into a dataset's shards."
+        description="Bake per-channel min-max normalization to [0, 1] into a dataset's shards."
     )
     parser.add_argument("--data", required=True, help="dataset dir (flat or nested per-worker)")
     parser.add_argument("--workers", type=int, default=1,
                         help="shards to bake in parallel across processes; scale to the node's cpus")
-    parser.add_argument("--max-samples", type=int, default=10_000,
-                        help="random observations to estimate stats from (0 = whole dataset)")
+    parser.add_argument("--max-samples", type=int, default=0,
+                        help="random observations to measure min/max from (0 = whole dataset, the "
+                             "default; a subset under-estimates the true range)")
     parser.add_argument("--seed", type=int, default=0, help="seed for the stats sample")
     parser.add_argument("--chunk", type=int, default=256,
                         help="samples per accumulation/rewrite slice (memory/speed knob)")

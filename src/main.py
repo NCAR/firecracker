@@ -188,9 +188,10 @@ def run_comparison(
                 f"but this config's fuel types give {len(env.obs_channels)}; the fuel_types must "
                 f"match the trained model."
             )
+        normalized = "channel_min" in model_config or "channel_mean" in model_config
         print(f"Loaded model: {model_path}  (arch={model_config.get('arch', 'pooled')}, "
               f"channels={tuple(model_config['channels'])}, latent_dim={model_config['latent_dim']}, "
-              f"standardized={'channel_mean' in model_config})")
+              f"normalized={normalized})")
         models.append((model, model_config, model_path.stem))
 
     viewer = ComparisonViewer(env, models)

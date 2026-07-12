@@ -115,7 +115,7 @@ class RolloutViewer(ComparisonViewer):
         p = self.panels[0]
         gt = self.env._observation()
         x = torch.from_numpy(gt).to(self.device)
-        x_in = (x - p.mean) / p.std if p.mean is not None else x
+        x_in = (x - p.offset) / p.scale if p.offset is not None else x
         md = next(p.model.parameters()).dtype
         with torch.no_grad():
             self._z = p.model.encode(x_in.unsqueeze(0).to(md))
@@ -148,7 +148,7 @@ class RolloutViewer(ComparisonViewer):
         md = next(p.model.parameters()).dtype
         with torch.no_grad():
             x_hat = p.model.decode(self._z.to(md))[0].float()
-        recon = x_hat * p.std + p.mean if p.mean is not None else x_hat
+        recon = x_hat * p.scale + p.offset if p.offset is not None else x_hat
         recon = recon.detach().cpu().numpy().astype(np.float32)
         p.recon_obs = recon
         p.recon_phys = recon * self.scales[:, None, None] + self.offsets[:, None, None]
@@ -246,17 +246,17 @@ class OfflineRolloutViewer(ComparisonViewer):
         frames = self.ds.get_batch(idx).to(self.device).float()          # (F, C, H, W)
         p = self.panels[0]
         md = next(p.model.parameters()).dtype
-        mean, std = p.mean, p.std
+        offset, scale = p.offset, p.scale
 
-        # Work in affine-OBS space (build_observation's ~[0,1] windows) throughout, standardizing with
-        # the CHECKPOINT's stats -- exactly like the online path z-scores env._observation(). Shards are
-        # already affine-OBS unless the dataset was baked-normalized (then un-z-score, assuming its
+        # Work in affine-OBS space (build_observation's ~[0,1] windows) throughout, normalizing with
+        # the CHECKPOINT's stats -- exactly like the online path scales env._observation(). Shards are
+        # already affine-OBS unless the dataset was baked-normalized (then un-scale, assuming its
         # stats match the checkpoint). This lets a raw, un-normalized tiny dataset work directly.
-        affine = frames * std + mean if (self.ds.is_normalized and mean is not None) else frames
-        model_in = (affine - mean) / std if mean is not None else affine   # z-score with checkpoint stats
+        affine = frames * scale + offset if (self.ds.is_normalized and offset is not None) else frames
+        model_in = (affine - offset) / scale if offset is not None else affine   # normalize w/ ckpt stats
 
-        def unzscore(t):   # model output (z-scored) -> affine-OBS
-            return t * std + mean if mean is not None else t
+        def unnorm(t):   # model output (normalized) -> affine-OBS
+            return t * scale + offset if offset is not None else t
 
         with torch.no_grad():
             gt_obs = affine                                              # (F, C, H, W) affine-OBS
@@ -265,7 +265,7 @@ class OfflineRolloutViewer(ComparisonViewer):
             for _ in range(self.F - 1):
                 z = self.dynamics(z.to(next(self.dynamics.parameters()).dtype))
                 zs.append(z)
-            preds = [unzscore(p.model.decode(zk.to(md))[0].float()) for zk in zs]
+            preds = [unnorm(p.model.decode(zk.to(md))[0].float()) for zk in zs]
             pred_obs = torch.stack(preds)                                # (F, C, H, W) affine-OBS
 
         self._gt_obs_seq = gt_obs.cpu().numpy().astype(np.float32)
@@ -346,13 +346,13 @@ def run_offline(args, config, env, ae_model, ae_cfg, dynamics) -> None:
         raise SystemExit("dataset shape does not match the model "
                          f"({dataset.meta.get('num_channels')}x{dataset.meta.get('grid_size')} vs "
                          f"{ae_cfg['in_channels']}x{ae_cfg['grid_size']}).")
-    # The viewer standardizes frames with the CHECKPOINT's stats, so a raw dataset is preferred. A
+    # The viewer normalizes frames with the CHECKPOINT's stats, so a raw dataset is preferred. A
     # baked-normalized dataset is only correct if it was normalized with those same (training) stats.
     if dataset.is_normalized:
         print(f"note: dataset '{args.data}' is normalized; assuming its stats match the checkpoint. "
               f"A dataset baked with its OWN stats will render wrong -- prefer a raw dataset.")
     else:
-        print(f"dataset '{args.data}' is raw; standardizing with the checkpoint's channel stats.")
+        print(f"dataset '{args.data}' is raw; normalizing with the checkpoint's channel stats.")
     viewer = OfflineRolloutViewer(env, ae_model, ae_cfg, dynamics, dataset, num_envs, args.interval)
     print("offline: LEFT/RIGHT scrub frames, N new episode, SPACE autoplay, TAB error, ESC quit")
 

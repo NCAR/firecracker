@@ -1,15 +1,17 @@
 """
 compute_stats.py
 
-Estimate per-channel standardisation statistics (mean/std) for a built Firecracker dataset and
-write them to <data>/stats.json. FireDataset(<data>) then z-scores every sample it serves so each
-channel leaves the dataset with a mean of zero and a standard deviation of one — the scale the
-autoencoder trains best on. The on-disk shards are untouched; the scaling is applied on read.
+Find per-channel min-max normalization statistics (min/max) for a built Firecracker dataset and
+write them to <data>/stats.json. normalize_dataset.py then bakes the min-max scale (x-min)/(max-min)
+into the shards so each channel leaves the dataset in [0, 1] — most channels aren't normally
+distributed, so min-max is preferred over z-scoring (and genuine outliers ride above 1 rather than
+being flattened by a std). This step only writes stats.json; the shards are scaled by the bake.
 
-The full set is hundreds of GB, so the stats are estimated from a random subset (10k observations
-by default — even that gives each channel ~6.5e8 values on a 256x256 grid, plenty for tight
-estimates). This is the same computation train_autoencoder triggers automatically when stats.json
-is missing — run it here to prepare a dataset up front, inspect the numbers, or refresh them.
+Unlike a mean/std, min and max are extreme order statistics: a subset of shards *under*-estimates
+the true range, so the default reads the whole dataset (--max-samples 0). Pass a positive
+--max-samples to sample whole shards instead, trading exactness for speed. This is the same
+computation normalize_dataset triggers when stats.json is missing — run it here to prepare a dataset
+up front, inspect the numbers, or refresh them.
 
 Usage:
     python tools/compute_stats.py --data /path/to/data/fire
@@ -28,13 +30,14 @@ from rollout import ensure_channel_stats  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compute per-channel mean/std for a Firecracker dataset (writes stats.json)."
+        description="Find per-channel min/max for a Firecracker dataset (writes stats.json)."
     )
     parser.add_argument("--data", required=True, help="dataset dir (flat or nested per-worker)")
     parser.add_argument("--recompute", action="store_true",
                         help="overwrite an existing stats.json instead of reusing it")
-    parser.add_argument("--max-samples", type=int, default=10_000,
-                        help="random observations to estimate from (0 = use the whole dataset)")
+    parser.add_argument("--max-samples", type=int, default=0,
+                        help="random observations to measure from (0 = whole dataset; the default, "
+                             "since min/max from a subset under-estimate the true range)")
     parser.add_argument("--seed", type=int, default=0,
                         help="seed for the random sample of observations")
     parser.add_argument("--chunk", type=int, default=256,

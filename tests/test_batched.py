@@ -24,7 +24,7 @@ from rollout import (
     BatchedRollout,
     FireDataset,
     bake_normalization,
-    compute_channel_stats,
+    compute_channel_minmax,
     ensure_channel_stats,
 )
 from scenarios import (
@@ -302,29 +302,31 @@ def _build_small_dataset(tmp_path, *, nested=False):
     return root
 
 
-def test_bake_normalization_zero_mean_unit_std(tmp_path):
-    """bake_normalization rewrites the shards so FireDataset (raw read) yields ~N(0,1) per channel."""
+def test_bake_normalization_min_max_to_unit_range(tmp_path):
+    """bake_normalization rewrites the shards so FireDataset (raw read) yields [0, 1] per channel."""
     root = _build_small_dataset(tmp_path, nested=True)
     n_ch = int(FireDataset(root).meta["num_channels"])
     assert not FireDataset(root).is_normalized                # raw dataset, not yet flagged
 
     # A channel whose raw values never vary (e.g. a fully-saturated ignited mask on this tiny grid)
-    # can't be driven to unit std -- bake floors its scale to 1, so it stays at ~0. Note which
-    # channels vary now, before baking overwrites the shards, and expect unit std only for those.
+    # has a zero span -- bake floors its scale to 1, so it maps to a constant ~0 (min 0, max 0)
+    # rather than spanning [0, 1]. Note which channels vary now, before baking overwrites the shards,
+    # and expect a full unit range only for those.
     raw = FireDataset(root).get_batch(np.arange(len(FireDataset(root)))).to(torch.float64)
-    varying = raw.permute(1, 0, 2, 3).reshape(n_ch, -1).std(dim=1, unbiased=False) >= 1e-8
+    per_ch_raw = raw.permute(1, 0, 2, 3).reshape(n_ch, -1)
+    varying = (per_ch_raw.amax(dim=1) - per_ch_raw.amin(dim=1)) >= 1e-8
 
     summary = bake_normalization(root, max_samples=None, workers=3, verbose=False)  # parallel pool
     assert summary["baked"] == 3 and (root / "stats.json").is_file()
 
-    ds = FireDataset(root)                                    # served values are already standardized
+    ds = FireDataset(root)                                    # served values are already normalized
     assert ds.is_normalized
     batch = ds.get_batch(np.arange(len(ds)))                 # (N, C, H, W), no read-time transform
     per_ch = batch.to(torch.float64).permute(1, 0, 2, 3).reshape(n_ch, -1)
-    torch.testing.assert_close(per_ch.mean(dim=1), torch.zeros(n_ch, dtype=torch.float64),
+    # Every channel's min is ~0; a varying channel reaches ~1, a constant one stays at 0.
+    torch.testing.assert_close(per_ch.amin(dim=1), torch.zeros(n_ch, dtype=torch.float64),
                                atol=1e-4, rtol=0)
-    torch.testing.assert_close(per_ch.std(dim=1, unbiased=False),
-                               varying.to(torch.float64), atol=1e-4, rtol=0)
+    torch.testing.assert_close(per_ch.amax(dim=1), varying.to(torch.float64), atol=1e-4, rtol=0)
     # __getitem__ and get_batch read the same baked values.
     torch.testing.assert_close(ds[0], batch[0])
 
@@ -339,32 +341,31 @@ def test_bake_normalization_idempotent(tmp_path):
     torch.testing.assert_close(FireDataset(root).get_batch(np.arange(8)), before)
 
 
-def test_channel_stats_match_manual_over_union(tmp_path):
-    """Stats over a nested (multi-worker) dataset match a direct mean/std of the raw union."""
+def test_channel_minmax_match_manual_over_union(tmp_path):
+    """Min/max over a nested (multi-worker) dataset match a direct min/max of the raw union."""
     root = _build_small_dataset(tmp_path, nested=True)
     ds = FireDataset(root)
-    mean, std = compute_channel_stats(ds, max_samples=None)
+    cmin, cmax = compute_channel_minmax(ds, max_samples=None)
 
     allx = ds.get_batch(np.arange(len(ds))).to(torch.float64)      # raw, un-normalized
-    ref_mean = allx.mean(dim=(0, 2, 3))
-    ref_std = allx.std(dim=(0, 2, 3), unbiased=False)
-    ref_std[ref_std < 1e-8] = 1.0   # mirror compute_channel_stats' constant-channel floor (e.g. a
-                                    # fully-saturated ignited mask on this tiny grid) so the no-op matches
-    np.testing.assert_allclose(mean, ref_mean.numpy(), atol=1e-6)
-    np.testing.assert_allclose(std, ref_std.numpy(), atol=1e-6)
+    ref_min = allx.amin(dim=(0, 2, 3))
+    ref_max = allx.amax(dim=(0, 2, 3))
+    np.testing.assert_allclose(cmin, ref_min.numpy(), atol=1e-6)
+    np.testing.assert_allclose(cmax, ref_max.numpy(), atol=1e-6)
 
 
-def test_channel_stats_sampling_approximates_full(tmp_path):
-    """A capped random-sample estimate is close to the full-set stats and records its provenance."""
+def test_channel_minmax_sampling_within_full(tmp_path):
+    """A capped random-sample range sits inside the full-set range and records its provenance."""
     root = _build_small_dataset(tmp_path, nested=True)   # 3 workers x 3 shards x 8 = 72 samples
     ds = FireDataset(root)
     n = len(ds)
 
-    full_mean, full_std = compute_channel_stats(ds, max_samples=None)
-    samp_mean, samp_std = compute_channel_stats(ds, max_samples=n // 2, seed=0)
-    # Subset estimate tracks the full one (loose tolerance -- it's a random half of a tiny set).
-    np.testing.assert_allclose(samp_mean, full_mean, atol=0.2)
-    np.testing.assert_allclose(samp_std, full_std, atol=0.2)
+    full_min, full_max = compute_channel_minmax(ds, max_samples=None)
+    samp_min, samp_max = compute_channel_minmax(ds, max_samples=n // 2, seed=0)
+    # A subset can only shrink the observed range: its min is >= the full min, its max <= the full
+    # max. This is exactly why min-max defaults to a full scan (a subset under-covers the extremes).
+    assert np.all(samp_min >= full_min - 1e-9)
+    assert np.all(samp_max <= full_max + 1e-9)
 
     # Budget is met by reading whole shards, so the recorded count rounds up to a shard multiple.
     stats = ensure_channel_stats(root, max_samples=n // 2, verbose=False)
