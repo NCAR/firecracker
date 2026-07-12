@@ -344,10 +344,12 @@ class BatchedRollout:
     def collect(self, steps: int | None = None, stride: int | None = None) -> torch.Tensor:
         """Step the `B` worlds `steps` times, pooling every `stride`-th tick's observation.
 
-        Consecutive frames change little, so subsampling (default stride=16) yields more
-        decorrelated samples per byte: `steps // stride` frames are stored, each a B-batch of
-        observations. Returns the filled pool (`capacity x C x N x N` on the buffer device),
-        overwriting any previously collected samples.
+        Sampling starts at the ignition frame (t=0, before the first step) and stores every
+        `stride`-th tick thereafter (t = 0, stride, 2*stride, ...), so the very first frame of each
+        episode is captured. Consecutive frames change little, so subsampling (default stride=16)
+        yields more decorrelated samples per byte: `steps // stride` frames are stored, each a
+        B-batch of observations. Returns the filled pool (`capacity x C x N x N` on the buffer
+        device), overwriting any previously collected samples.
         """
         steps  = self.steps  if steps  is None else int(steps)
         stride = self.stride if stride is None else int(stride)
@@ -360,11 +362,14 @@ class BatchedRollout:
 
         write = 0
         for t in range(steps):
-            self._sim.step_fields(self._state)
-            if (t + 1) % stride == 0:   # store every stride-th frame
+            # Store every stride-th frame, starting at the ignition frame (t=0). The write guard keeps
+            # exactly `capacity` frames when steps isn't a multiple of stride (t=0 would otherwise add
+            # one extra frame past the pool), dropping the trailing frame rather than overflowing.
+            if t % stride == 0 and write < capacity:
                 obs = self.observe().to(device=self._buffer_device, dtype=self._buffer_dtype)
                 self._pool[write:write + self.num_envs] = obs
                 write += self.num_envs
+            self._sim.step_fields(self._state)
 
         self._filled = write
         return self._pool
