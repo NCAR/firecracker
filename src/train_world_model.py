@@ -63,7 +63,7 @@ from config import load_config
 from rollout import FireDataset
 from ram_loader import prewarm_shards
 from traj_loader import TrajectoryDataset, TrajectoryBatchLoader, split_episodes
-from dynamics import LatentTransition
+from dynamics import LatentTransition, RewardHead
 # Reuse the autoencoder trainer's device/dtype/stats helpers and its architecture registry so the
 # two entrypoints stay in lockstep (same arch names, same weight-dtype handling) with no copy.
 from train_autoencoder import (
@@ -182,10 +182,19 @@ def covariance_loss(z):
     return off_sq / d
 
 
+def _newly_ignited(x_prev, x_cur, ignited_channel, thr=0.5):
+    """Count cells that ignite between two frames: ignited in x_cur but not in x_prev. Returns (B,)
+    float counts (the normalized 'ignited' mask is ~binary, so a 0.5 threshold reads it cleanly)."""
+    prev = x_prev[:, ignited_channel] > thr
+    cur = x_cur[:, ignited_channel] > thr
+    return (cur & ~prev).flatten(1).sum(dim=1).float()
+
+
 def run_epoch(
     model, transition, ema_model, loader, device, optimizer, scaler,
     rec_loss_fn, pred_weight, rec_weight, freeze_ae, ema_decay, max_grad_norm, epoch, tag, log_interval,
-    out_activation="none", cov_weight=0.0,
+    out_activation="none", cov_weight=0.0, rollout_steps=1,
+    reward_head=None, ignited_channel=None, reward_weight=0.0,
 ):
     """One pass over `loader`. Trains when `optimizer` is given, else evaluates (no grad).
 
@@ -193,18 +202,25 @@ def run_epoch(
     training and not frozen, `ema_model` is EMA-updated toward `model` after each optimizer step.
     For a frozen AE `ema_model` is None and the (fixed) online encoder supplies the target directly.
 
-    Returns (mean_total, mean_pred, mean_rec, mean_mae, grad_norm_mean, grad_norm_max). `mean_mae`
-    is a loss-independent reconstruction MAE yardstick over x_t (sigmoid applied when
-    out_activation=='sigmoid' so the bce/sigmoid and linear arms are directly comparable); it is 0
-    for a frozen AE.
+    Three disjoint losses meet only at the encoder: (1) self-prediction unrolls `transition` K steps
+    from the root latent z0 against stop-grad EMA targets; (2) reconstruction decodes ONE random
+    window frame per sample via its own independent encode (never through the heads); (3) the reward
+    head predicts the one-step newly-ignited count from each rolled-out latent (grad -> dynamics +
+    encoder, never the decoder). Reconstruction/reward are skipped when their component is absent.
+
+    Returns (mean_total, mean_pred, mean_rec, mean_mae, grad_norm_mean, grad_norm_max, mean_reward).
+    `mean_mae` is a loss-independent reconstruction MAE yardstick over the reconstructed frame
+    (sigmoid applied for the bce head so arms are comparable); it and mean_rec are 0 for a frozen AE.
     """
     training = optimizer is not None
     transition.train(training)
+    if reward_head is not None:
+        reward_head.train(training)
     model.train(training and not freeze_ae)                # a frozen AE stays in eval (BN uses running stats)
     use_amp = scaler is not None and device.type == "cuda"
     param_dtype = next(model.parameters()).dtype
 
-    tot = tot_pred = tot_rec = tot_mae = 0.0
+    tot = tot_pred = tot_rec = tot_mae = tot_reward = 0.0
     seen = 0
     gnorm_sum = 0.0
     gnorm_max = 0.0
@@ -212,39 +228,69 @@ def run_epoch(
     grad_ctx = torch.enable_grad() if training else torch.no_grad()
     with grad_ctx:
         for step, batch in enumerate(loader):
-            # (B, window, C, H, W); v1 uses the first two frames as the (t, t+1) pair.
+            # (B, window, C, H, W). Frame k (0..window-1) is t + k*step; we unroll K=rollout_steps
+            # of them and reconstruct every frame we touch.
             x = batch.to(device=device, dtype=param_dtype, non_blocking=True)
-            x_t, x_next = x[:, 0], x[:, 1]
+            K = min(rollout_steps, x.shape[1] - 1)                  # rollout length, capped by the window
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                # Online latent z_t: shared by both paths (reconstruction + prediction), so both
-                # backprop into the encoder. A frozen AE needs no encoder graph -> encode under no_grad.
+                # --- PREDICTION + REWARD: unroll the dynamics head K times from the root latent z0. The
+                # head consumes its OWN previous output (a true rollout, so error compounds and persistence
+                # is penalized at longer horizons); each step is scored against the stop-grad EMA target of
+                # the real future frame, and the reward head predicts that step's newly-ignited count from
+                # the rolled-out latent. Gradient reaches the encoder ONLY through z0; future frames are
+                # encoded under no_grad and never decoded here, and reward targets are counts from the data
+                # (no grad). A frozen AE needs no encoder graph, so z0 is encoded under no_grad too.
                 enc_ctx = torch.no_grad() if freeze_ae else torch.enable_grad()
                 with enc_ctx:
-                    z_t = model.encode(x_t)
-                # Next-frame TARGET latent: the EMA encoder (stop-grad). x_next is never decoded. For a
-                # frozen AE the encoder is fixed, so its own output is already a stable target.
+                    z0 = model.encode(x[:, 0])
                 target_encoder = model if ema_model is None else ema_model
-                with torch.no_grad():
-                    z_next_tgt = target_encoder.encode(x_next)
-                z_hat = transition(z_t)
-                pred = cosine_prediction_loss(z_hat, z_next_tgt)
+                z_hat = z0
+                pred = 0.0
+                reward = torch.zeros((), device=device)
+                for k in range(1, K + 1):
+                    z_hat = transition(z_hat)                       # unit-norm prediction, fed back in
+                    with torch.no_grad():
+                        z_tgt = target_encoder.encode(x[:, k])     # EMA, stop-grad; x[:,k] not decoded here
+                    pred = pred + cosine_prediction_loss(z_hat, z_tgt)
+                    if reward_head is not None:
+                        r_hat = reward_head(z_hat)                  # reward of transition (k-1 -> k)
+                        with torch.no_grad():
+                            r_tgt = torch.log1p(_newly_ignited(x[:, k - 1], x[:, k], ignited_channel))
+                        reward = reward + F.smooth_l1_loss(r_hat, r_tgt)
+                pred = pred / K
+                if reward_head is not None:
+                    reward = reward / K
+
+                # --- RECONSTRUCTION anchor on ONE RANDOM window frame per sample, via its OWN encode->decode.
+                # A fresh independent encode (not z0, not the EMA target) means the recon graph runs
+                # decoder->encoder only and NEVER touches `transition` -- the two losses stay on disjoint
+                # paths. Because the frame index is uniform over 0..K across steps, every position (incl.
+                # the last-K*step episode tail that is otherwise only ever a rollout target) is grounded in
+                # expectation, at a flat one decode per step.
                 if freeze_ae:
                     rec = torch.zeros((), device=device)
                     mae = torch.zeros((), device=device)
                 else:
-                    dec_t = model.decode(z_t)                       # reconstruct x_t only
-                    rec = rec_loss_fn(dec_t, x_t)
-                    # Loss-independent reconstruction MAE (sigmoid for the logits/bce head), so the
-                    # arms are comparable regardless of which rec loss trained them.
+                    b = x.shape[0]
+                    j = torch.randint(0, K + 1, (b,), device=x.device)
+                    x_rec = x[torch.arange(b, device=x.device), j]  # (B,C,H,W): a random frame per sample
+                    z_rec = model.encode(x_rec)                     # independent encode; grad -> encoder only
+                    dec = model.decode(z_rec)
+                    rec = rec_loss_fn(dec, x_rec)
+                    # Loss-independent reconstruction MAE (sigmoid for the logits/bce head), a yardstick
+                    # comparable across arms regardless of the rec loss.
                     with torch.no_grad():
-                        rt = dec_t.sigmoid() if out_activation == "sigmoid" else dec_t
-                        mae = F.l1_loss(rt, x_t)
+                        rt = dec.sigmoid() if out_activation == "sigmoid" else dec
+                        mae = F.l1_loss(rt, x_rec)
+
                 loss = pred_weight * pred + rec_weight * rec
+                if reward_head is not None and reward_weight > 0:
+                    loss = loss + reward_weight * reward
                 if training and not freeze_ae and cov_weight > 0:
-                    loss = loss + cov_weight * covariance_loss(z_t)
+                    loss = loss + cov_weight * covariance_loss(z0)
 
             if training:
                 gnorm_val = 0.0
@@ -252,13 +298,13 @@ def run_epoch(
                     scaler.scale(loss).backward()
                     if max_grad_norm > 0:
                         scaler.unscale_(optimizer)
-                        gnorm_val = float(torch.nn.utils.clip_grad_norm_(_trained_params(model, transition, freeze_ae), max_grad_norm))
+                        gnorm_val = float(torch.nn.utils.clip_grad_norm_(_trained_params(model, transition, freeze_ae, reward_head), max_grad_norm))
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
                     if max_grad_norm > 0:
-                        gnorm_val = float(torch.nn.utils.clip_grad_norm_(_trained_params(model, transition, freeze_ae), max_grad_norm))
+                        gnorm_val = float(torch.nn.utils.clip_grad_norm_(_trained_params(model, transition, freeze_ae, reward_head), max_grad_norm))
                     optimizer.step()
                 # After the online weights move, pull the EMA target encoder toward them.
                 if ema_model is not None:
@@ -271,23 +317,28 @@ def run_epoch(
             n = x.shape[0]
             tot += loss.item() * n
             tot_pred += pred.item() * n
-            tot_rec += float(rec) * n
-            tot_mae += float(mae) * n
+            tot_rec += rec.item() * n
+            tot_mae += mae.item() * n
+            tot_reward += reward.item() * n
             seen += n
             if training and log_interval and step % log_interval == 0:
                 print(f"  epoch {epoch:3d} [{tag}] step {step:5d}/{len(loader)}  "
-                      f"loss {loss.item():.6f}  pred {pred.item():.6f}  rec {float(rec):.6f}")
+                      f"loss {loss.item():.6f}  pred {pred.item():.6f}  rec {rec.item():.6f}")
 
     denom = max(seen, 1)
     return (tot / denom, tot_pred / denom, tot_rec / denom, tot_mae / denom,
-            gnorm_sum / max(gnorm_steps, 1), gnorm_max)
+            gnorm_sum / max(gnorm_steps, 1), gnorm_max, tot_reward / denom)
 
 
-def _trained_params(model, transition, freeze_ae):
-    """The parameters the optimizer updates (dynamics head only when the AE is frozen)."""
-    if freeze_ae:
-        return list(transition.parameters())
-    return list(model.parameters()) + list(transition.parameters())
+def _trained_params(model, transition, freeze_ae, reward_head=None):
+    """The parameters the optimizer updates: the dynamics head always, the AE unless frozen, and the
+    reward head when present."""
+    params = list(transition.parameters())
+    if not freeze_ae:
+        params = list(model.parameters()) + params
+    if reward_head is not None:
+        params += list(reward_head.parameters())
+    return params
 
 
 def main() -> None:
@@ -302,6 +353,9 @@ def main() -> None:
     parser.add_argument("--window", type=int, default=2,
                         help="frames per trajectory window (v1 trains on the first (t, t+1) pair)")
     parser.add_argument("--step", type=int, default=1, help="frame gap within a window")
+    parser.add_argument("--rollout-steps", type=int, default=1,
+                        help="dynamics-head unroll length K (needs window >= K+1); the head is fed its "
+                             "own output for K steps and every one of the K+1 frames is reconstructed")
     parser.add_argument("--val-frac", type=float, default=0.05, help="fraction of episodes held out")
     parser.add_argument("--prewarm", action="store_true", help="stream shards into page cache first")
     # Model
@@ -318,6 +372,12 @@ def main() -> None:
     parser.add_argument("--dyn-depth", type=int, default=2, help="dynamics head hidden layers")
     parser.add_argument("--dyn-hidden", type=int, default=None,
                         help="dynamics head hidden width (default 1024)")
+    parser.add_argument("--reward-weight", type=float, default=0.0,
+                        help="weight on the one-step reward loss (0 = no reward head); the reward is the "
+                             "newly-ignited-cell count, predicted from each rolled-out latent")
+    parser.add_argument("--reward-depth", type=int, default=2, help="reward head hidden layers")
+    parser.add_argument("--reward-hidden", type=int, default=None,
+                        help="reward head hidden width (default 256)")
     parser.add_argument("--ema-decay", type=float, default=0.996,
                         help="momentum for the EMA target encoder that supplies the prediction target "
                              "(theta_ema <- decay*theta_ema + (1-decay)*theta_online each step). "
@@ -378,6 +438,8 @@ def main() -> None:
               f"python tools/normalize_dataset.py --data {args.data}")
     args._in_channels = int(dataset.meta["num_channels"])
     args._grid_size = int(dataset.meta["grid_size"])
+    if args.window < args.rollout_steps + 1:
+        raise SystemExit(f"--window ({args.window}) must be >= --rollout-steps + 1 ({args.rollout_steps + 1})")
     traj = TrajectoryDataset(dataset, num_envs=args.num_envs, window=args.window, step=args.step)
     train_w, val_w = split_episodes(traj, val_frac=args.val_frac, seed=args.seed)
     pin = device.type == "cuda"
@@ -414,8 +476,30 @@ def main() -> None:
                   "depth": args.dyn_depth}
     n_ae = sum(p.numel() for p in model.parameters())
     n_dyn = sum(p.numel() for p in transition.parameters())
+
+    # Optional reward head. The reward is the newly-ignited-cell count, read off the dataset's binary
+    # 'ignited' channel on the fly (no new dataset). Resolve that channel by name from the meta.
+    reward_head = None
+    reward_config = None
+    ignited_channel = None
+    if args.reward_weight > 0:
+        names = list(dataset.meta.get("channels", []))
+        if "ignited" in names:
+            ignited_channel = names.index("ignited")
+        else:
+            ignited_channel = args._in_channels - 1
+            print(f"WARNING: no 'ignited' channel name in meta; assuming last channel "
+                  f"({ignited_channel}) for the reward target")
+        reward_head = RewardHead(
+            model.latent_dim, hidden_dim=args.reward_hidden, depth=args.reward_depth,
+        ).to(device=device, dtype=weight_dtype)
+        reward_config = {"latent_dim": model.latent_dim, "hidden_dim": reward_head.hidden_dim,
+                         "depth": args.reward_depth, "ignited_channel": ignited_channel}
+    n_rew = sum(p.numel() for p in reward_head.parameters()) if reward_head is not None else 0
     print(f"model: autoencoder params={n_ae:,} ({'frozen' if args.freeze_ae else 'trainable'}) + "
-          f"dynamics params={n_dyn:,}  latent_dim={model.latent_dim}")
+          f"dynamics params={n_dyn:,}"
+          + (f" + reward params={n_rew:,} (ignited ch {ignited_channel})" if reward_head else "")
+          + f"  latent_dim={model.latent_dim}")
 
     if args.rec_loss == "huber":
         rec_loss_fn = nn.HuberLoss(delta=args.huber_delta)
@@ -427,7 +511,7 @@ def main() -> None:
         rec_loss_fn = nn.MSELoss()
     # Recorded so eval/viewers know whether decode() outputs logits (apply sigmoid) or raw values.
     model_config["out_activation"] = args.out_activation
-    optimizer = torch.optim.AdamW(_trained_params(model, transition, args.freeze_ae),
+    optimizer = torch.optim.AdamW(_trained_params(model, transition, args.freeze_ae, reward_head),
                                   lr=args.lr, weight_decay=args.weight_decay, eps=args.adam_eps)
     scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
 
@@ -449,12 +533,14 @@ def main() -> None:
                 "seed": args.seed, "epochs": args.epochs, "batch_size": args.batch_size,
                 "lr": args.lr, "weight_decay": args.weight_decay, "adam_eps": args.adam_eps,
                 "max_grad_norm": args.max_grad_norm, "amp": scaler is not None,
-                "window": args.window, "step": args.step, "val_frac": args.val_frac,
+                "window": args.window, "step": args.step, "rollout_steps": args.rollout_steps,
+                "val_frac": args.val_frac,
                 "pred_weight": args.pred_weight, "rec_weight": args.rec_weight,
                 "rec_loss": args.rec_loss, "out_activation": args.out_activation,
                 "huber_delta": args.huber_delta, "freeze_ae": args.freeze_ae,
                 "ema_decay": None if args.freeze_ae else args.ema_decay,
                 "init_from": args.init_from, "dyn_params": n_dyn, "ae_params": n_ae,
+                "reward_weight": args.reward_weight, "reward_params": n_rew,
                 "n_train_windows": len(train_w), "n_val_windows": len(val_w),
             },
         )
@@ -471,6 +557,9 @@ def main() -> None:
             "freeze_ae": args.freeze_ae,
             "wandb_run_id": run.id if run is not None else None,
         }
+        if reward_head is not None:
+            ckpt["reward_state"] = reward_head.state_dict()
+            ckpt["reward_config"] = reward_config
         if channel_stats is not None:
             ckpt["model_config"] = {**model_config, **channel_stats}
         torch.save(ckpt, path)
@@ -478,8 +567,8 @@ def main() -> None:
     metrics_path = out_dir / "metrics.csv"
     metrics_file = metrics_path.open("w", newline="")
     metrics_writer = csv.writer(metrics_file)
-    metrics_writer.writerow(["epoch", "train_loss", "train_pred", "train_rec", "train_mae",
-                             "val_loss", "val_pred", "val_rec", "val_mae",
+    metrics_writer.writerow(["epoch", "train_loss", "train_pred", "train_rec", "train_reward", "train_mae",
+                             "val_loss", "val_pred", "val_rec", "val_reward", "val_mae",
                              "grad_norm_mean", "grad_norm_max", "seconds"])
 
     # 3. Train ---------------------------------------------------------------
@@ -489,24 +578,27 @@ def main() -> None:
     best_pred = float("inf")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_pred, tr_rec, tr_mae, gmean, gmax = run_epoch(
+        tr_loss, tr_pred, tr_rec, tr_mae, gmean, gmax, tr_rew = run_epoch(
             model, transition, ema_model, train_loader, device, optimizer, scaler,
             rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae, args.ema_decay,
             args.max_grad_norm, epoch, "train", args.log_interval, args.out_activation,
-            cov_weight=args.cov_weight,
+            cov_weight=args.cov_weight, rollout_steps=args.rollout_steps,
+            reward_head=reward_head, ignited_channel=ignited_channel, reward_weight=args.reward_weight,
         )
-        va_loss, va_pred, va_rec, va_mae, _, _ = run_epoch(
+        va_loss, va_pred, va_rec, va_mae, _, _, va_rew = run_epoch(
             model, transition, ema_model, val_loader, device, None, None,
             rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae, args.ema_decay,
-            0.0, epoch, "val", 0, args.out_activation,
+            0.0, epoch, "val", 0, args.out_activation, rollout_steps=args.rollout_steps,
+            reward_head=reward_head, ignited_channel=ignited_channel, reward_weight=args.reward_weight,
         )
         dt = time.time() - t0
+        rew_str = f" reward {tr_rew:.4f}/{va_rew:.4f}" if reward_head is not None else ""
         print(f"epoch {epoch:3d}/{args.epochs}  train {tr_loss:.6f} (pred {tr_pred:.6f} rec {tr_rec:.6f} mae {tr_mae:.6f})  "
               f"val {va_loss:.6f} (pred {va_pred:.6f} rec {va_rec:.6f} mae {va_mae:.6f})  "
-              f"grad(mean {gmean:.3f} max {gmax:.3f})  ({dt:.1f}s)")
-        metrics_writer.writerow([epoch, f"{tr_loss:.6f}", f"{tr_pred:.6f}", f"{tr_rec:.6f}", f"{tr_mae:.6f}",
-                                 f"{va_loss:.6f}", f"{va_pred:.6f}", f"{va_rec:.6f}", f"{va_mae:.6f}",
-                                 f"{gmean:.6f}", f"{gmax:.6f}", f"{dt:.2f}"])
+              f"grad(mean {gmean:.3f} max {gmax:.3f}){rew_str}  ({dt:.1f}s)")
+        metrics_writer.writerow([epoch, f"{tr_loss:.6f}", f"{tr_pred:.6f}", f"{tr_rec:.6f}", f"{tr_rew:.6f}",
+                                 f"{tr_mae:.6f}", f"{va_loss:.6f}", f"{va_pred:.6f}", f"{va_rec:.6f}",
+                                 f"{va_rew:.6f}", f"{va_mae:.6f}", f"{gmean:.6f}", f"{gmax:.6f}", f"{dt:.2f}"])
         metrics_file.flush()
 
         if va_pred < best_pred:
@@ -519,7 +611,7 @@ def main() -> None:
                 "epoch": epoch,
                 "train_loss": tr_loss, "train_pred": tr_pred, "train_rec": tr_rec, "train_mae": tr_mae,
                 "val_loss": va_loss, "val_pred": va_pred, "val_rec": va_rec, "val_mae": va_mae,
-                "best_pred": best_pred,
+                "train_reward": tr_rew, "val_reward": va_rew, "best_pred": best_pred,
                 "grad_norm_mean": gmean, "grad_norm_max": gmax,
                 "lr": optimizer.param_groups[0]["lr"], "epoch_seconds": dt,
             }, step=epoch)

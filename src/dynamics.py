@@ -69,3 +69,37 @@ class LatentTransition(nn.Module):
         if self.normalize_output:
             out = F.normalize(out, dim=-1)
         return out
+
+
+class RewardHead(nn.Module):
+    """Predicts the scalar one-step reward from a latent (MuZero-style).
+
+    Applied to the *rolled-out* latent z_hat_k, so its gradient shapes the dynamics head and (through
+    the rollout root) the encoder -- this is the world model's observation-grounded signal once the
+    decoder is dropped/lightened. Outputs a raw scalar trained against log1p(reward) for a compressed,
+    zero-friendly target on heavy-tailed counts; apply expm1 to the output to recover the count.
+
+    Args:
+        latent_dim: width of the input latent (matches the autoencoder's latent_dim).
+        hidden_dim: hidden width (defaults to 256 -- the reward is a much simpler map than the dynamics).
+        depth:      number of hidden Linear+BN+ReLU blocks before the scalar projection.
+    """
+
+    def __init__(self, latent_dim: int, *, hidden_dim: int | None = None, depth: int = 2) -> None:
+        super().__init__()
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1, got {depth}")
+        hidden_dim = hidden_dim if hidden_dim is not None else 256
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        layers: list[nn.Module] = []
+        width = latent_dim
+        for _ in range(depth):
+            layers += [nn.Linear(width, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU(inplace=True)]
+            width = hidden_dim
+        layers.append(nn.Linear(width, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Predict the scalar reward for the transition into `z` (B x latent_dim) -> (B,)."""
+        return self.net(z).squeeze(-1)

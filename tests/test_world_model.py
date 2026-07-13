@@ -100,9 +100,9 @@ def test_update_ema_blends_toward_online():
         assert torch.equal(be, bo)
 
 
-def test_end_to_end_ema_target_and_single_decode(tmp_path):
-    """A non-frozen step reconstructs only x_t (rec > 0), trains via the EMA target, and the EMA
-    encoder is pulled toward the online encoder after the optimizer step."""
+def test_end_to_end_ema_target_and_recon(tmp_path):
+    """A non-frozen step reconstructs the window frames (rec > 0), trains via the EMA target, and the
+    EMA encoder is pulled toward the online encoder after the optimizer step."""
     _, ds = _build_dataset(tmp_path)
     model = _ae(ds.meta["num_channels"])
     head = LatentTransition(LATENT, depth=2)
@@ -117,11 +117,121 @@ def test_end_to_end_ema_target_and_single_decode(tmp_path):
     loader = TrajectoryBatchLoader(traj, train_w, batch_size=4, shuffle=True, seed=0, drop_last=True)
     opt = torch.optim.Adam(twm._trained_params(model, head, freeze_ae=False), lr=1e-2)
 
-    _, pred, rec, mae, _, _ = twm.run_epoch(model, head, ema, loader, torch.device("cpu"), opt, None,
+    _, pred, rec, mae, _, _, _ = twm.run_epoch(model, head, ema, loader, torch.device("cpu"), opt, None,
                                             torch.nn.MSELoss(), 1.0, 1.0, False, 0.9, 1.0, 1, "train", 0)
     assert rec > 0.0 and mae > 0.0                          # x_t IS reconstructed end-to-end
     # The EMA encoder moved toward the (now-updated) online weights.
     assert any(not torch.equal(a, b) for a, b in zip(ema.parameters(), ema_before))
+
+
+def test_multistep_rollout_trains(tmp_path):
+    """A K>1 rollout runs end-to-end: finite pred/rec, and both the head and the AE weights move."""
+    _, ds = _build_dataset(tmp_path)
+    model = _ae(ds.meta["num_channels"])
+    head = LatentTransition(LATENT, depth=2)
+    ema = twm.copy.deepcopy(model)
+    for p in ema.parameters():
+        p.requires_grad_(False)
+    ema.eval()
+    ae_before = [p.detach().clone() for p in model.parameters()]
+    head_before = [p.detach().clone() for p in head.parameters()]
+
+    traj = TrajectoryDataset(ds, window=3)                 # 3 frames -> rollout_steps up to 2
+    train_w, _ = split_episodes(traj, val_frac=0.25, seed=0)
+    loader = TrajectoryBatchLoader(traj, train_w, batch_size=4, shuffle=True, seed=0, drop_last=True)
+    opt = torch.optim.Adam(twm._trained_params(model, head, freeze_ae=False), lr=1e-2)
+    _, pred, rec, mae, _, _, _ = twm.run_epoch(model, head, ema, loader, torch.device("cpu"), opt, None,
+                                            torch.nn.MSELoss(), 1.0, 1.0, False, 0.9, 1.0, 1, "train", 0,
+                                            rollout_steps=2)
+    assert np.isfinite(pred) and np.isfinite(rec) and rec > 0.0 and mae > 0.0
+    assert any(not torch.equal(a, b) for a, b in zip(model.parameters(), ae_before))
+    assert any(not torch.equal(a, b) for a, b in zip(head.parameters(), head_before))
+
+
+def test_rollout_and_recon_paths_are_disjoint(tmp_path):
+    """The trainer's two losses must stay on disjoint graphs: the prediction rollout trains the head
+    and (via z0) the encoder but NOT the decoder; the per-frame reconstruction trains encoder+decoder
+    but NEVER flows through the unrolled dynamics heads. This mirrors run_epoch's forward exactly."""
+    _, ds = _build_dataset(tmp_path)
+    model = _ae(ds.meta["num_channels"]); head = LatentTransition(LATENT, depth=2)
+    model.train(); head.train()
+    traj = TrajectoryDataset(ds, window=3)
+    train_w, _ = split_episodes(traj, val_frac=0.25, seed=0)
+    x = next(iter(TrajectoryBatchLoader(traj, train_w, 4, shuffle=False, seed=0, drop_last=True)))
+    K = 2
+    dec_names = tuple(n for n, _ in model.named_parameters() if n.startswith(("from_latent", "decoder")))
+    enc_names = tuple(n for n, _ in model.named_parameters() if n.startswith(("encoder", "to_latent")))
+
+    def gsum(named):  # summed |grad| over a name set, treating None as 0
+        return sum((p.grad.abs().sum().item() if p.grad is not None else 0.0)
+                   for n, p in model.named_parameters() if n in named)
+
+    # PREDICTION path: unroll the head from z0 against stop-grad targets.
+    model.zero_grad(); head.zero_grad()
+    z0 = model.encode(x[:, 0]); z_hat = z0; pred = 0.0
+    for k in range(1, K + 1):
+        z_hat = head(z_hat)
+        with torch.no_grad():
+            z_tgt = model.encode(x[:, k])
+        pred = pred + twm.cosine_prediction_loss(z_hat, z_tgt)
+    (pred / K).backward()
+    head_g = sum(p.grad.abs().sum().item() for p in head.parameters() if p.grad is not None)
+    assert gsum(dec_names) == 0.0                          # prediction never touches the decoder
+    assert head_g > 0.0 and gsum(enc_names) > 0.0          # it does train head + encoder (via z0)
+
+    # RECONSTRUCTION path: per-frame independent encode->decode.
+    model.zero_grad(); head.zero_grad()
+    z0 = model.encode(x[:, 0]); rec = 0.0
+    for k in range(K + 1):
+        z_rec = z0 if k == 0 else model.encode(x[:, k])
+        rec = rec + torch.nn.functional.mse_loss(model.decode(z_rec), x[:, k])
+    (rec / (K + 1)).backward()
+    head_g2 = sum(p.grad.abs().sum().item() for p in head.parameters() if p.grad is not None)
+    assert head_g2 == 0.0                                  # recon never flows through the unrolled heads
+    assert gsum(dec_names) > 0.0 and gsum(enc_names) > 0.0  # it does train decoder + encoder
+
+
+def test_reward_head_trains_and_grounds_dynamics(tmp_path):
+    """With a reward head, run_epoch returns a finite reward loss and trains the head; and the reward
+    gradient reaches the head + dynamics + encoder but NEVER the decoder."""
+    from dynamics import RewardHead
+    _, ds = _build_dataset(tmp_path)
+    model = _ae(ds.meta["num_channels"]); head = LatentTransition(LATENT, depth=2)
+    reward_head = RewardHead(LATENT, depth=2)
+    ema = twm.copy.deepcopy(model)
+    for p in ema.parameters():
+        p.requires_grad_(False)
+    ema.eval()
+    rh_before = [p.detach().clone() for p in reward_head.parameters()]
+
+    traj = TrajectoryDataset(ds, window=3)
+    train_w, _ = split_episodes(traj, val_frac=0.25, seed=0)
+    loader = TrajectoryBatchLoader(traj, train_w, batch_size=4, shuffle=True, seed=0, drop_last=True)
+    opt = torch.optim.Adam(twm._trained_params(model, head, False, reward_head), lr=1e-2)
+    ich = ds.meta["num_channels"] - 1                      # last channel is 'ignited'
+    _, _, _, _, _, _, reward = twm.run_epoch(
+        model, head, ema, loader, torch.device("cpu"), opt, None, torch.nn.MSELoss(),
+        1.0, 1.0, False, 0.9, 1.0, 1, "train", 0, rollout_steps=2,
+        reward_head=reward_head, ignited_channel=ich, reward_weight=1.0)
+    assert np.isfinite(reward) and reward > 0.0
+    assert any(not torch.equal(a, b) for a, b in zip(reward_head.parameters(), rh_before))
+
+    # Isolate the reward gradient: it must train the head+dynamics+encoder, not the decoder.
+    x = next(iter(loader))
+    model.zero_grad(); head.zero_grad(); reward_head.zero_grad()
+    z_hat = model.encode(x[:, 0]); rloss = 0.0
+    for k in range(1, 3):
+        z_hat = head(z_hat)
+        r_tgt = torch.log1p(twm._newly_ignited(x[:, k - 1], x[:, k], ich))
+        rloss = rloss + torch.nn.functional.smooth_l1_loss(reward_head(z_hat), r_tgt)
+    (rloss / 2).backward()
+    dec_g = sum(p.grad.abs().sum().item() for n, p in model.named_parameters()
+                if n.startswith(("from_latent", "decoder")) and p.grad is not None)
+    enc_g = sum(p.grad.abs().sum().item() for n, p in model.named_parameters()
+                if n.startswith(("encoder", "to_latent")) and p.grad is not None)
+    head_g = sum(p.grad.abs().sum().item() for p in head.parameters() if p.grad is not None)
+    assert dec_g == 0.0                                    # reward never touches the decoder
+    assert head_g > 0.0 and enc_g > 0.0                    # it does train dynamics + encoder (via z0)
 
 
 def test_freeze_ae_updates_only_head(tmp_path):
@@ -138,7 +248,7 @@ def test_freeze_ae_updates_only_head(tmp_path):
     train_w, _ = split_episodes(traj, val_frac=0.25, seed=0)
     loader = TrajectoryBatchLoader(traj, train_w, batch_size=4, shuffle=True, seed=0, drop_last=True)
     opt = torch.optim.Adam(twm._trained_params(model, head, freeze_ae=True), lr=1e-2)
-    _, pred, rec, _, _, _ = twm.run_epoch(model, head, None, loader, torch.device("cpu"), opt, None,
+    _, pred, rec, _, _, _, _ = twm.run_epoch(model, head, None, loader, torch.device("cpu"), opt, None,
                                           torch.nn.MSELoss(), 1.0, 1.0, True, 0.996, 1.0, 1, "train", 0)
 
     assert rec == 0.0                                   # reconstruction dropped when the AE is frozen
@@ -203,3 +313,26 @@ def test_main_smoke_freeze(tmp_path, monkeypatch):
     ckpt = torch.load(out / "best.pt", map_location="cpu")
     assert ckpt["freeze_ae"] is True
     assert "dynamics_state" in ckpt and "model_state" in ckpt
+
+
+def test_main_smoke_rollout_reward(tmp_path, monkeypatch):
+    """End-to-end main() from scratch with a multi-step rollout + reward head: metrics.csv carries the
+    reward columns and the checkpoint carries the reward head."""
+    data_root, ds = _build_dataset(tmp_path)
+    out = tmp_path / "wm_rr"
+    argv = [
+        "train_world_model.py",
+        "--data", str(data_root),
+        "--channels", "8,16", "--latent-dim", "32", "--latent-bn",
+        "--window", "3", "--rollout-steps", "2",
+        "--reward-weight", "1.0",
+        "--val-frac", "0.25", "--epochs", "2", "--batch-size", "4",
+        "--out", str(out),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    twm.main()
+
+    header = (out / "metrics.csv").read_text().splitlines()[0].split(",")
+    assert "train_reward" in header and "val_reward" in header
+    ckpt = torch.load(out / "best.pt", map_location="cpu")
+    assert "reward_state" in ckpt and ckpt["reward_config"]["ignited_channel"] is not None
