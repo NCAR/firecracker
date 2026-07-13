@@ -215,6 +215,7 @@ class ConvAutoencoder(nn.Module):
         activation: type[nn.Module] = nn.ReLU,
         normalize_latent: bool = True,
         bottleneck_channels: int | None = None,
+        latent_bn: bool = False,
     ) -> None:
         super().__init__()
         n_stages = len(channels)
@@ -255,6 +256,13 @@ class ConvAutoencoder(nn.Module):
                 nn.BatchNorm2d(self.conv_channels),
             )
         self.to_latent = nn.Linear(self.flat_dim, latent_dim)
+        # Optional BatchNorm on the latent (SimSiam/BYOL projector-output BN). It centers each latent
+        # dim across the batch, which makes a constant embedding impossible -- the direction-collapse
+        # (all z parallel, participation_ratio -> 0) that the L2-norm alone cannot prevent. affine=False
+        # (as in SimSiam's output projector) so the net can't learn a scale/shift that re-enables it.
+        self.latent_bn = latent_bn
+        if latent_bn:
+            self.latent_norm = nn.BatchNorm1d(latent_dim, affine=False)
         self.from_latent = nn.Linear(latent_dim, self.flat_dim)
         self.decoder = Decoder(in_channels, channels, activation)
 
@@ -268,6 +276,8 @@ class ConvAutoencoder(nn.Module):
         if self.bottleneck_channels is not None:
             h = self.enc_project(h)  # conv_channels -> bottleneck_channels (1x1), spatial preserved
         z = self.to_latent(h.flatten(1))
+        if self.latent_bn:
+            z = self.latent_norm(z)     # batch-center each dim (anti-collapse) before the L2 projection
         if self.normalize_latent:
             z = F.normalize(z, dim=-1)
         return z

@@ -117,6 +117,8 @@ def build_autoencoder(args, config, device, weight_dtype):
         }
         if mc.get("bottleneck_channels") is not None:
             kwargs["bottleneck_channels"] = mc["bottleneck_channels"]
+        if mc.get("latent_bn"):
+            kwargs["latent_bn"] = True
         model = ARCHITECTURES[arch](**kwargs).to(device=device, dtype=weight_dtype)
         model.load_state_dict(ckpt["model_state"])
         # The checkpoint may be bf16 (that's what ships in models/); building at weight_dtype before
@@ -152,6 +154,8 @@ def build_autoencoder(args, config, device, weight_dtype):
         kwargs["normalize_latent"] = arch_cfg["normalize_latent"]
     if arch_cfg.get("bottleneck_channels") is not None:
         kwargs["bottleneck_channels"] = arch_cfg["bottleneck_channels"]
+    if args.latent_bn or arch_cfg.get("latent_bn"):
+        kwargs["latent_bn"] = True
     model = ARCHITECTURES[arch](**kwargs).to(device=device, dtype=weight_dtype)
     model_config = {
         "arch": arch,
@@ -161,15 +165,27 @@ def build_autoencoder(args, config, device, weight_dtype):
         "latent_dim": model.latent_dim,
         "normalize_latent": model.normalize_latent,
         "bottleneck_channels": model.bottleneck_channels,
+        "latent_bn": model.latent_bn,
         "weight_dtype": str(weight_dtype).removeprefix("torch."),
     }
     return model, model_config, _load_channel_stats(args.data)
 
 
+def covariance_loss(z):
+    """VICReg off-diagonal covariance penalty: push cross-dimension covariances of the latent to
+    zero. BatchNorm(affine=False) already fixes per-dim variance, so a low participation ratio is
+    dim *correlation* (variance piled on a few axes); decorrelating raises the latent's effective rank."""
+    z = z - z.mean(0, keepdim=True)
+    n, d = z.shape
+    cov = (z.T @ z) / (n - 1)
+    off_sq = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
+    return off_sq / d
+
+
 def run_epoch(
     model, transition, ema_model, loader, device, optimizer, scaler,
     rec_loss_fn, pred_weight, rec_weight, freeze_ae, ema_decay, max_grad_norm, epoch, tag, log_interval,
-    out_activation="none",
+    out_activation="none", cov_weight=0.0,
 ):
     """One pass over `loader`. Trains when `optimizer` is given, else evaluates (no grad).
 
@@ -227,6 +243,8 @@ def run_epoch(
                         rt = dec_t.sigmoid() if out_activation == "sigmoid" else dec_t
                         mae = F.l1_loss(rt, x_t)
                 loss = pred_weight * pred + rec_weight * rec
+                if training and not freeze_ae and cov_weight > 0:
+                    loss = loss + cov_weight * covariance_loss(z_t)
 
             if training:
                 gnorm_val = 0.0
@@ -295,6 +313,8 @@ def main() -> None:
     parser.add_argument("--channels", type=lambda s: [int(p) for p in s.split(",") if p.strip()],
                         default=None, help="encoder channel widths, e.g. 32,64,128 (from-scratch only)")
     parser.add_argument("--latent-dim", type=int, default=None, help="latent width (from-scratch only)")
+    parser.add_argument("--latent-bn", action="store_true",
+                        help="BatchNorm(affine=False) on the latent before L2-norm (anti-collapse)")
     parser.add_argument("--dyn-depth", type=int, default=2, help="dynamics head hidden layers")
     parser.add_argument("--dyn-hidden", type=int, default=None,
                         help="dynamics head hidden width (default 1024)")
@@ -305,6 +325,8 @@ def main() -> None:
     # Loss weights
     parser.add_argument("--pred-weight", type=float, default=1.0, help="weight on the prediction loss")
     parser.add_argument("--rec-weight", type=float, default=1.0, help="weight on the reconstruction loss")
+    parser.add_argument("--cov-weight", type=float, default=0.0,
+                        help="weight on the VICReg covariance/decorrelation penalty (0 = off)")
     parser.add_argument("--rec-loss", choices=("mse", "huber", "bce"), default="mse",
                         help="reconstruction loss: mse | huber | bce. 'bce' uses BCEWithLogitsLoss "
                              "(decoder emits logits; sigmoid is applied only for reconstructions), so "
@@ -471,6 +493,7 @@ def main() -> None:
             model, transition, ema_model, train_loader, device, optimizer, scaler,
             rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae, args.ema_decay,
             args.max_grad_norm, epoch, "train", args.log_interval, args.out_activation,
+            cov_weight=args.cov_weight,
         )
         va_loss, va_pred, va_rec, va_mae, _, _ = run_epoch(
             model, transition, ema_model, val_loader, device, None, None,
