@@ -30,8 +30,8 @@ explicitly: TrajectoryDataset(ds, num_envs=4, stride=64).
 
 from __future__ import annotations
 
-import queue
-import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
 import numpy as np
@@ -125,13 +125,19 @@ def split_episodes(traj: TrajectoryDataset, val_frac: float, seed: int):
 
 
 class TrajectoryBatchLoader:
-    """Thread-prefetched loader yielding (batch, window, C, H, W) tensors over frame windows.
+    """Thread-pool-prefetched loader yielding (batch, window, C, H, W) tensors over frame windows.
 
-    Mirrors ram_loader.RamBatchLoader: one background thread stages the next batch via a
-    single vectorized FireDataset.get_batch (grouped by shard), overlapping GPU compute and
-    spawning no worker processes (so it is safe under the heavy process packing that crashes
-    DataLoader's shared-memory workers). All windows in a batch are flattened to one index
-    list, read once, then reshaped back to (batch, window, ...).
+    A pool of `num_workers` background threads stages batches concurrently, each via a single
+    vectorized FireDataset.get_batch (grouped by shard), overlapping GPU compute and spawning no
+    worker PROCESSES (so it is safe under the heavy process packing that crashes DataLoader's
+    shared-memory workers). All windows in a batch are flattened to one index list, read once,
+    then reshaped back to (batch, window, ...).
+
+    Assembling one batch is the scattered gather of `batch*window` frames plus an optional
+    pin_memory -- both release the GIL for the bulk copy, so several threads genuinely overlap.
+    With a single thread the fast batch-256 GPU step outran the loader (GPU-starved); the pool
+    keeps `prefetch` batches in flight so the next is ready when the GPU asks. Batches are yielded
+    in their shuffled order (FIFO on the futures), so results stay reproducible for a given seed.
 
     Args:
         traj:        a TrajectoryDataset.
@@ -141,18 +147,21 @@ class TrajectoryBatchLoader:
         seed:        seed for the shuffle RNG.
         drop_last:   drop a trailing partial batch (train) or keep it (val).
         pin_memory:  pin each batch for faster host->device copies (CUDA only).
-        prefetch:    max batches the background thread may stage ahead.
+        prefetch:    max batches staged ahead (depth of the in-flight pipeline).
+        num_workers: threads assembling batches concurrently.
     """
 
     def __init__(self, traj, window_ids, batch_size, *, shuffle, seed,
-                 drop_last=True, pin_memory=False, prefetch=3):
+                 drop_last=True, pin_memory=False, prefetch=6, num_workers=4):
         self.traj = traj
         self.window_ids = np.asarray(window_ids, dtype=np.int64)
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
         self.pin_memory = bool(pin_memory)
-        self.prefetch = max(1, int(prefetch))
+        self.num_workers = max(1, int(num_workers))
+        # Keep at least as many batches in flight as workers, or the pool can never fill.
+        self.prefetch = max(self.num_workers, int(prefetch))
         self._rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
@@ -176,25 +185,21 @@ class TrajectoryBatchLoader:
         return batch.pin_memory() if self.pin_memory else batch
 
     def __iter__(self) -> Iterator[torch.Tensor]:
-        q: queue.Queue = queue.Queue(maxsize=self.prefetch)
-        sentinel = object()
-
-        def producer() -> None:
-            try:
-                for chunk in self._chunks():
-                    q.put(self._make_batch(chunk))
-            except Exception as exc:  # surface a fetch error to the consumer instead of hanging
-                q.put(exc)
-            else:
-                q.put(sentinel)
-
-        thread = threading.Thread(target=producer, daemon=True)
-        thread.start()
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, Exception):
-                raise item
-            yield item
-        thread.join()
+        chunks = self._chunks()
+        with ThreadPoolExecutor(max_workers=self.num_workers) as ex:
+            futures: deque = deque()
+            # Prime the pipeline with up to `prefetch` batches, then keep it topped up: pop the
+            # oldest future (preserving order), submit one more, yield. .result() re-raises any
+            # assembly error in the consumer. shutdown on __exit__ drains in-flight batches.
+            for _ in range(self.prefetch):
+                try:
+                    futures.append(ex.submit(self._make_batch, next(chunks)))
+                except StopIteration:
+                    break
+            while futures:
+                batch = futures.popleft().result()
+                try:
+                    futures.append(ex.submit(self._make_batch, next(chunks)))
+                except StopIteration:
+                    pass
+                yield batch
