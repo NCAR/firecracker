@@ -68,41 +68,69 @@ model.load_state_dict(ckpt["model_state"])
 
 ## World model checkpoints
 
-`world_model_convbn256_16ch_best_bf16.pt` is a latent **world model**
-(`src/train_world_model.py`), not an autoencoder: a dynamics head that predicts the next latent,
-trained on top of a **frozen** autoencoder. It is the lowest-val-loss replicate (`run_14`) of the
-`wm-frozen-convbn256-lr1e3` 16-replicate sweep (50 epochs, frozen `conv_bottleneck_256` encoder /
-decoder).
+World models (`src/train_world_model.py`), not autoencoders: a dynamics head that predicts the next
+latent, on top of a `conv_bottleneck_256` autoencoder (frozen in the first, trained end-to-end in the
+second). The second also carries a **reward head**.
 
-| File                                       | Base AE                      | In ch | Dtype    | Source run                                          | Best epoch | Val loss (1−cos) |
-|--------------------------------------------|------------------------------|------:|----------|-----------------------------------------------------|-----------:|-----------------:|
-| `world_model_convbn256_16ch_best_bf16.pt`  | conv-bottleneck-256 (frozen) |    16 | bfloat16 | `wm-frozen-convbn256-lr1e3_20260711_000856/run_14`  |         50 | 0.017485 |
+| File                                            | Base AE                          | In ch | Dtype    | Source run                                          | Best epoch | Val pred (1−cos) |
+|-------------------------------------------------|----------------------------------|------:|----------|-----------------------------------------------------|-----------:|-----------------:|
+| `world_model_convbn256_16ch_best_bf16.pt`       | conv-bottleneck-256 (frozen)     |    16 | bfloat16 | `wm-frozen-convbn256-lr1e3_20260711_000856/run_14`  |         50 | 0.017485 |
+| `world_model_rollout_reward_16ch_best_bf16.pt`  | conv-bottleneck-256 (end-to-end) |    16 | bfloat16 | `wm-bnbce-rollout-reward_20260713_182122/run_00`    |         40 | 0.028538 |
 
-The val loss is the cosine next-latent prediction loss `1 − cos(ẑ_{t+1}, sg(z_{t+1}))`, so it is
-**not** comparable to the autoencoders' reconstruction (huber/mse) losses above. Because the AE was
-frozen, `model_state` here is the `conv_bottleneck_256` autoencoder unchanged (its bf16 weights were
-upcast to f32 for training and stored back as bf16); only `dynamics_state` was trained.
+The val "pred" is the cosine next-latent prediction loss `1 − cos(ẑ_{t+1}, sg(z_{t+1}))`, so it is
+**not** comparable to the autoencoders' reconstruction (huber/mse) losses above. The two world models'
+pred losses are also not directly comparable to each other: the frozen model's `0.017485` is a
+**single-step** prediction, while the end-to-end model's `0.028538` is the **mean over a 5-step latent
+rollout** (`--rollout-steps 5`, the head fed its own output), a strictly harder target.
 
-Beyond the autoencoder keys, the file carries `dynamics_state`, `dynamics_config`
+`world_model_convbn256_16ch_best_bf16.pt` is the lowest-val-loss replicate (`run_14`) of the
+`wm-frozen-convbn256-lr1e3` 16-replicate sweep (50 epochs, **frozen** encoder/decoder). Because the AE
+was frozen, its `model_state` is the `conv_bottleneck_256` autoencoder unchanged; only `dynamics_state`
+was trained.
+
+`world_model_rollout_reward_16ch_best_bf16.pt` is the best replicate (`run_00`) of the
+`wm-bnbce-rollout-reward` 8-replicate sweep, ranked by a **rebalanced** val_loss
+(`2·pred + 0.2·rec + 1·reward`, min 0.17734 at epoch 41). Here the whole network is trained
+**end-to-end** — encoder, decoder, dynamics, and a reward head — with a BYOL/SPR EMA target, a
+5-step latent rollout, a random-frame reconstruction anchor (`sigmoid`/BCE decoder, so
+`model_config.out_activation = "sigmoid"` and `decode()` emits **logits** — apply a sigmoid for
+reconstructions), and a **reward head** that predicts the per-step newly-ignited-cell count as
+`log1p(count)` (apply `expm1` to recover the count; `reward_config.ignited_channel = 15`). The saved
+checkpoint is epoch **40**, the lowest-`val_pred` (`best_pred = 0.028538`) epoch, not epoch 41: the run
+was walltime-killed at epoch 41 before that epoch's weights were checkpointed, and epoch 40 is both the
+prediction-optimal epoch and a statistical tie on the rebalanced loss. Unlike the older models this one
+was trained on a **min-max [0,1]** dataset, so `model_config` carries `channel_min`/`channel_max`
+(verified against the dataset `stats.json`) inline plus the 16 `channel_names`.
+
+Beyond the autoencoder keys, both files carry `dynamics_state`, `dynamics_config`
 (`{latent_dim, hidden_dim, depth}`, with `hidden_dim` resolved to its actual width), and
-`freeze_ae`. Rebuild both nets with:
+`freeze_ae`. The end-to-end model additionally carries `reward_state` + `reward_config`
+(`{latent_dim, hidden_dim, depth, ignited_channel}`). Rebuild with:
 
 ```python
 import torch
 from strided_autoencoder import ConvAutoencoder
-from dynamics import LatentTransition
+from dynamics import LatentTransition, RewardHead
 
-ckpt = torch.load("models/world_model_convbn256_16ch_best_bf16.pt", map_location="cpu")
+ckpt = torch.load("models/world_model_rollout_reward_16ch_best_bf16.pt", map_location="cpu")
 mc, dc = ckpt["model_config"], ckpt["dynamics_config"]
 ae = ConvAutoencoder(
     in_channels=mc["in_channels"], grid_size=mc["grid_size"], channels=tuple(mc["channels"]),
     latent_dim=mc["latent_dim"], normalize_latent=mc["normalize_latent"],
-    bottleneck_channels=mc.get("bottleneck_channels"),
+    bottleneck_channels=mc.get("bottleneck_channels"), latent_bn=bool(mc.get("latent_bn")),
 )
 ae.load_state_dict(ckpt["model_state"]); ae.eval()
 dyn = LatentTransition(dc["latent_dim"], hidden_dim=dc["hidden_dim"], depth=dc["depth"])
 dyn.load_state_dict(ckpt["dynamics_state"]); dyn.eval()
-# z_t = ae.encode(x);  z_hat = dyn(z_t);  x_hat = ae.decode(z_hat)
+
+# Reward head (end-to-end model only): predicts log1p(newly-ignited-cell count) from a latent.
+rc = ckpt["reward_config"]
+rew = RewardHead(rc["latent_dim"], hidden_dim=rc["hidden_dim"], depth=rc["depth"])
+rew.load_state_dict(ckpt["reward_state"]); rew.eval()
+
+# z_t = ae.encode(x);  z_hat = dyn(z_t);  logits = ae.decode(z_hat)
+# x_hat = logits.sigmoid() if mc.get("out_activation") == "sigmoid" else logits
+# reward_count = rew(z_hat).expm1()
 ```
 
 Or view it rolling forward against the live physics:
