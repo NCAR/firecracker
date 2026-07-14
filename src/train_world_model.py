@@ -383,8 +383,8 @@ def main() -> None:
                              "(theta_ema <- decay*theta_ema + (1-decay)*theta_online each step). "
                              "Ignored with --freeze-ae (the fixed encoder is its own target).")
     # Loss weights
-    parser.add_argument("--pred-weight", type=float, default=1.0, help="weight on the prediction loss")
-    parser.add_argument("--rec-weight", type=float, default=1.0, help="weight on the reconstruction loss")
+    parser.add_argument("--pred-weight", type=float, default=2.0, help="weight on the prediction loss")
+    parser.add_argument("--rec-weight", type=float, default=0.2, help="weight on the reconstruction loss")
     parser.add_argument("--cov-weight", type=float, default=0.0,
                         help="weight on the VICReg covariance/decorrelation penalty (0 = off)")
     parser.add_argument("--rec-loss", choices=("mse", "huber", "bce"), default="mse",
