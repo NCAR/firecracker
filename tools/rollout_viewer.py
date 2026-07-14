@@ -95,59 +95,111 @@ def _validate_shapes(ae_cfg: dict, env: FirecrackerEnv, path: Path) -> None:
 # ONLINE: roll against the live simulation
 # ---------------------------------------------------------------------------
 
+def _slerp(a: torch.Tensor, b: torch.Tensor, t: float) -> torch.Tensor:
+    """Spherical linear interpolation between two unit-norm latents a, b (each (1, D)) at fraction
+    t in [0, 1]. The dynamics head emits unit-norm latents (normalize_latent), so interpolating on the
+    hypersphere -- rather than a straight lerp that dips inside it -- keeps every in-between latent on
+    the manifold the decoder was trained on. Falls back to a renormalized lerp when a, b are nearly
+    (anti)parallel and the sine denominator underflows."""
+    if t <= 0.0:
+        return a
+    if t >= 1.0:
+        return b
+    dot = (a * b).sum(-1, keepdim=True).clamp(-1.0, 1.0)
+    omega = torch.arccos(dot)
+    sin_omega = torch.sin(omega)
+    if float(sin_omega.abs().min()) < 1e-6:                    # ~(anti)parallel: lerp + renormalize
+        out = a + t * (b - a)
+        return out / out.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return (torch.sin((1.0 - t) * omega) / sin_omega) * a + (torch.sin(t * omega) / sin_omega) * b
+
+
 class RolloutViewer(ComparisonViewer):
     """ComparisonViewer whose single model panel shows an open-loop latent rollout against the live
     physics. Only the panel's *source* differs from the base class: instead of encode(current obs) ->
-    decode, it decodes a latent advanced by the dynamics head. The decode is cached and only re-run
-    when the latent actually changes (once per --ticks-per-step), so a slow host isn't decoding every
-    physics tick."""
+    decode, it decodes a latent advanced by the dynamics head. Rather than holding one latent and
+    jumping it once per --ticks-per-step, it keeps the current latent z0 and PREFETCHES the next one
+    z1 = dynamics(z0); each physics tick it decodes a slerp(z0, z1, frac) so the prediction morphs
+    smoothly across the stride instead of stepping. With interpolation off it holds z0 and the decode
+    is cached (re-run only when the latent changes), so a slow host isn't decoding every physics tick."""
 
-    def __init__(self, env: FirecrackerEnv, ae_model, ae_cfg: dict, dynamics: torch.nn.Module) -> None:
+    def __init__(self, env: FirecrackerEnv, ae_model, ae_cfg: dict, dynamics: torch.nn.Module,
+                 interpolate: bool = True) -> None:
         super().__init__(env, [(ae_model, ae_cfg, "Neural rollout")])
         self.dynamics = dynamics
-        self._z: torch.Tensor | None = None
+        self.interpolate = interpolate
+        self._z0: torch.Tensor | None = None   # current latent (integer dynamics step)
+        self._z1: torch.Tensor | None = None   # prefetched next latent = dynamics(z0)
+        self._frac = 0.0                        # interpolation position z0 -> z1 within the stride
         self._steps = 0
-        self._z_version = 0          # bumped whenever the latent changes
+        self._z_version = 0          # bumped whenever the DISPLAYED latent changes (anchor/advance/frac)
         self._recon_version = -1     # version the cached decode was made at
 
+    def _next(self, z: torch.Tensor) -> torch.Tensor:
+        md = next(self.dynamics.parameters()).dtype
+        with torch.no_grad():
+            return self.dynamics(z.to(md))
+
     def anchor_to_current(self) -> None:
-        """(Re)set the rollout latent to the encoding of the current physics observation."""
+        """(Re)set the rollout to the encoding of the current physics observation and prefetch the
+        next latent so the stride can be interpolated from the very first tick."""
         p = self.panels[0]
         gt = self.env._observation()
         x = torch.from_numpy(gt).to(self.device)
         x_in = (x - p.offset) / p.scale if p.offset is not None else x
         md = next(p.model.parameters()).dtype
         with torch.no_grad():
-            self._z = p.model.encode(x_in.unsqueeze(0).to(md))
+            self._z0 = p.model.encode(x_in.unsqueeze(0).to(md))
+        self._z1 = self._next(self._z0)
         self._steps = 0
+        self._frac = 0.0
         self._z_version += 1
         self._gt_obs = None          # force the next render to recompute, even if the env isn't dirty
 
     def advance_rollout(self) -> None:
-        """Step the latent one dynamics step (anchoring first if not yet anchored)."""
-        if self._z is None:
+        """Complete a stride: the prefetched next latent becomes current, and the one after it is
+        prefetched. Resets the interpolation fraction (anchoring first if not yet anchored)."""
+        if self._z0 is None:
             self.anchor_to_current()
             return
-        md = next(self.dynamics.parameters()).dtype
-        with torch.no_grad():
-            self._z = self.dynamics(self._z.to(md))
+        self._z0 = self._z1
+        self._z1 = self._next(self._z0)
         self._steps += 1
+        self._frac = 0.0
         self._z_version += 1
         self._gt_obs = None          # force the next render to recompute, even if the env isn't dirty
 
+    def set_frac(self, frac: float) -> None:
+        """Set the interpolation position within the current stride (0 = z0, 1 = z1). No-op (and no
+        decode) when interpolation is off, preserving the cached one-decode-per-stride behavior."""
+        if not self.interpolate:
+            return
+        frac = min(max(frac, 0.0), 1.0)
+        if frac != self._frac:
+            self._frac = frac
+            self._z_version += 1
+            self._gt_obs = None
+
+    def _display_latent(self) -> torch.Tensor:
+        """The latent actually decoded: the slerp between z0 and its prefetched successor when
+        interpolating, else just z0 (the stepwise-held latent)."""
+        if not self.interpolate or self._z1 is None or self._frac <= 0.0:
+            return self._z0
+        return _slerp(self._z0.float(), self._z1.float(), self._frac)
+
     def _compute_reconstruction(self) -> None:
-        """Override: the model panel decodes the ROLLED latent, cached across physics ticks. The
-        ground-truth obs is refreshed every call (cheap) so the TAB error map tracks the live physics
-        as it advances toward the model's prediction."""
+        """Override: the model panel decodes the (possibly interpolated) rolled latent, cached across
+        ticks by version. The ground-truth obs is refreshed every call (cheap) so the TAB error map
+        tracks the live physics as it advances toward the model's prediction."""
         p = self.panels[0]
         self._gt_obs = self.env._observation()                        # live physics, for the error map
-        if self._z is None:
+        if self._z0 is None:
             self.anchor_to_current()
         if self._recon_version == self._z_version:
             return                                                    # latent unchanged -> reuse decode
         md = next(p.model.parameters()).dtype
         with torch.no_grad():
-            x_hat = p.model.decode(self._z.to(md))[0].float()
+            x_hat = p.model.decode(self._display_latent().to(md))[0].float()
         if p.out_sigmoid:                                        # logits -> [0,1] reconstruction
             x_hat = torch.sigmoid(x_hat)
         recon = x_hat * p.scale + p.offset if p.offset is not None else x_hat
@@ -157,18 +209,21 @@ class RolloutViewer(ComparisonViewer):
         self._recon_version = self._z_version
 
     def _model_title(self, i: int, mode) -> str:
-        base = f"Neural rollout  (t+{self._steps})"
+        pos = self._steps + self._frac if self.interpolate else float(self._steps)
+        base = f"Neural rollout  (t+{pos:.2f})" if self.interpolate else f"Neural rollout  (t+{self._steps})"
         return base if mode in RECONSTRUCTABLE else f"{base} (n/a)"
 
 
 def run_online(args, config, env, ae_model, ae_cfg, dynamics) -> None:
-    viewer = RolloutViewer(env, ae_model, ae_cfg, dynamics)
+    viewer = RolloutViewer(env, ae_model, ae_cfg, dynamics, interpolate=not args.no_interpolate)
     env.reset()
     viewer.anchor_to_current()
 
     tick_interval = 1.0 / max(args.ticks_per_second, 1e-6)
+    mode = "stepwise (cached)" if args.no_interpolate else "smoothly interpolated (slerp) every tick"
     print(f"online: physics at {args.ticks_per_second} ticks/s; dynamics step every "
-          f"{args.ticks_per_step} ticks (~{args.ticks_per_step / args.ticks_per_second:.0f} s per model step)")
+          f"{args.ticks_per_step} ticks (~{args.ticks_per_step / args.ticks_per_second:.0f} s per model step); "
+          f"prediction {mode}")
 
     phys_ticks = 0
     last_tick = time.monotonic()
@@ -194,9 +249,11 @@ def run_online(args, config, env, ae_model, ae_cfg, dynamics) -> None:
             last_tick = now
             stepped = True
 
-        if stepped and phys_ticks >= args.ticks_per_step:
-            viewer.advance_rollout()                # a full stride elapsed -> advance the prediction
-            phys_ticks = 0
+        if stepped:
+            if phys_ticks >= args.ticks_per_step:
+                viewer.advance_rollout()            # a full stride elapsed -> the prefetched latent becomes current
+                phys_ticks = 0
+            viewer.set_frac(phys_ticks / max(args.ticks_per_step, 1))  # morph z0 -> z1 across the stride
 
         if env._reset_requested:
             env.reset()
@@ -391,6 +448,10 @@ def main() -> None:
                         help="physics ticks per dynamics step (default 256 = the training stride)")
     parser.add_argument("--ticks-per-second", type=float, default=10.0,
                         help="online physics tick rate; keeps the UI responsive (default 10)")
+    parser.add_argument("--no-interpolate", action="store_true",
+                        help="online: hold each predicted latent and jump once per stride (the old "
+                             "stepwise behavior) instead of smoothly slerp-interpolating to the "
+                             "prefetched next latent every tick; decodes once per stride (cheaper on CPU)")
     parser.add_argument("--interval", type=float, default=0.3,
                         help="seconds between frames in offline autoplay (default 0.3)")
     args = parser.parse_args()
