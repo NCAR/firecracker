@@ -14,6 +14,7 @@ import argparse
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 from conftest import make_config, build_map, pad_map
@@ -336,3 +337,49 @@ def test_main_smoke_rollout_reward(tmp_path, monkeypatch):
     assert "train_reward" in header and "val_reward" in header
     ckpt = torch.load(out / "best.pt", map_location="cpu")
     assert "reward_state" in ckpt and ckpt["reward_config"]["ignited_channel"] is not None
+
+
+def test_main_smoke_resume(tmp_path, monkeypatch):
+    """--resume continues a run in place: last.pt carries the full training state (optimizer + EMA),
+    the epoch counter advances, and metrics.csv is appended (not re-headered) so all epochs survive."""
+    data_root, ds = _build_dataset(tmp_path)
+    out = tmp_path / "wm_resume"
+    base = [
+        "train_world_model.py",
+        "--data", str(data_root),
+        "--channels", "8,16", "--latent-dim", "32", "--latent-bn",
+        "--window", "3", "--rollout-steps", "2", "--reward-weight", "1.0",
+        "--val-frac", "0.25", "--batch-size", "4", "--out", str(out),
+    ]
+    # First leg: 2 epochs. last.pt must carry the full state needed to resume.
+    monkeypatch.setattr(sys, "argv", base + ["--epochs", "2"])
+    twm.main()
+    ck2 = torch.load(out / "last.pt", map_location="cpu")
+    assert ck2["epoch"] == 2
+    assert "optimizer_state" in ck2 and "ema_state" in ck2 and "reward_state" in ck2
+    assert len((out / "metrics.csv").read_text().strip().splitlines()) == 3   # header + 2 epochs
+
+    # Resume to 4 epochs from last.pt: epochs 3-4 are appended to the same log.
+    monkeypatch.setattr(sys, "argv", base + ["--epochs", "4", "--resume", str(out / "last.pt")])
+    twm.main()
+    ck4 = torch.load(out / "last.pt", map_location="cpu")
+    assert ck4["epoch"] == 4
+    lines = (out / "metrics.csv").read_text().strip().splitlines()
+    assert len(lines) == 5                                                    # header + 4 epochs
+    assert [ln.split(",")[0] for ln in lines[1:]] == ["1", "2", "3", "4"]
+
+
+def test_resume_init_from_mutually_exclusive(tmp_path, monkeypatch):
+    """--resume and --init-from together is a hard error (resume already restores the weights)."""
+    data_root, ds = _build_dataset(tmp_path)
+    out = tmp_path / "wm_x"
+    argv = [
+        "train_world_model.py", "--data", str(data_root),
+        "--channels", "8,16", "--latent-dim", "32", "--latent-bn",
+        "--window", "3", "--rollout-steps", "2",
+        "--val-frac", "0.25", "--epochs", "1", "--batch-size", "4", "--out", str(out),
+        "--resume", "some.pt", "--init-from", "other.pt",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit):
+        twm.main()

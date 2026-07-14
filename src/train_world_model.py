@@ -411,6 +411,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=0)
     parser.add_argument("--out", default="runs/world_model", help="output dir for checkpoints + metrics")
+    parser.add_argument("--resume", default=None,
+                        help="path to a world-model checkpoint (last.pt) to resume from: restores the "
+                             "autoencoder, dynamics head, reward head, EMA target encoder, optimizer, "
+                             "GradScaler, best-pred, and continues at the next epoch. Architecture must "
+                             "match (validated). metrics.csv is appended to rather than truncated. "
+                             "Mutually exclusive with --init-from")
+    parser.add_argument("--save-interval", type=int, default=0,
+                        help="also write epoch_NNN.pt every N epochs (0 = only best.pt + last.pt)")
     # Weights & Biases (matches the autoencoder trainer's flags so tools/sweep.py drives both the
     # same way: it injects --wandb-group / --wandb-name per replicate when --wandb is forwarded).
     parser.add_argument("--wandb", action="store_true", help="log the run to Weights & Biases")
@@ -420,6 +428,8 @@ def main() -> None:
     parser.add_argument("--wandb-name", default=None, help="W&B run name (default: seed<seed>)")
     parser.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     args = parser.parse_args()
+    if args.resume is not None and args.init_from is not None:
+        raise SystemExit("--resume and --init-from are mutually exclusive (resume restores the weights).")
 
     torch.manual_seed(args.seed)
     config = load_config(args.config)
@@ -515,6 +525,52 @@ def main() -> None:
                                   lr=args.lr, weight_decay=args.weight_decay, eps=args.adam_eps)
     scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
 
+    # Resume: restore the FULL training state (all weights + EMA target + optimizer + scaler) and
+    # continue at the next epoch. The architecture is rebuilt from CLI/config above, so guard against a
+    # silent mismatch that would let load_state_dict succeed on a differently-shaped model and corrupt
+    # the run. `best_pred` and `start_epoch` seed the loop below (inf/1, or restored here).
+    start_epoch = 1
+    best_pred = float("inf")
+    resume_wandb_id = None
+    if args.resume is not None:
+        ckpt = torch.load(args.resume, map_location=device)
+        ck_cfg = ckpt.get("model_config", {})
+        mismatch = {
+            k: (ck_cfg.get(k), model_config.get(k))
+            for k in ("arch", "in_channels", "grid_size", "channels", "latent_dim")
+            if ck_cfg.get(k) != model_config.get(k)
+        }
+        if mismatch:
+            raise SystemExit(
+                f"--resume checkpoint architecture does not match this run: {mismatch}. "
+                "Pass the same --arch/--channels/--latent-dim/--latent-bn the checkpoint was trained with."
+            )
+        model.load_state_dict(ckpt["model_state"])
+        transition.load_state_dict(ckpt["dynamics_state"])
+        if (reward_head is not None) != ("reward_state" in ckpt):
+            raise SystemExit(
+                "--resume reward-head mismatch: the checkpoint "
+                f"{'has' if 'reward_state' in ckpt else 'has no'} reward head but this run "
+                f"{'has one' if reward_head is not None else 'has none'} "
+                "(set --reward-weight to match the checkpoint).")
+        if reward_head is not None:
+            reward_head.load_state_dict(ckpt["reward_state"])
+        # The EMA target encoder carries its own momentum history; rebuilding it from the online
+        # weights would throw that away, so restore it explicitly (None for a frozen AE).
+        if ema_model is not None and ckpt.get("ema_state") is not None:
+            ema_model.load_state_dict(ckpt["ema_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        if scaler is not None and ckpt.get("scaler_state") is not None:
+            scaler.load_state_dict(ckpt["scaler_state"])
+        # Older checkpoints predate best_pred; fall back to that epoch's val_loss so best.pt is not
+        # overwritten by a worse model on the first resumed epoch.
+        best_pred = ckpt.get("best_pred", ckpt.get("val_loss", float("inf")))
+        start_epoch = int(ckpt["epoch"]) + 1
+        # Reattach to the original W&B run (if any) so resumed epochs extend the same history.
+        resume_wandb_id = ckpt.get("wandb_run_id")
+        print(f"resume: loaded '{args.resume}' (epoch {ckpt['epoch']}, best_pred {best_pred:.6f}); "
+              f"continuing at epoch {start_epoch}")
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -528,6 +584,7 @@ def main() -> None:
         run = wandb.init(
             project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group,
             name=args.wandb_name or f"seed{args.seed}", mode=args.wandb_mode,
+            id=resume_wandb_id, resume="allow" if resume_wandb_id is not None else None,
             config={
                 **model_config, **dyn_config,
                 "seed": args.seed, "epochs": args.epochs, "batch_size": args.batch_size,
@@ -556,6 +613,10 @@ def main() -> None:
             "dynamics_config": dyn_config,
             "freeze_ae": args.freeze_ae,
             "wandb_run_id": run.id if run is not None else None,
+            # Full optimizer/scaler/EMA state so --resume continues in place (not just a warm restart).
+            "optimizer_state": optimizer.state_dict(),
+            "scaler_state": scaler.state_dict() if scaler is not None else None,
+            "ema_state": ema_model.state_dict() if ema_model is not None else None,
         }
         if reward_head is not None:
             ckpt["reward_state"] = reward_head.state_dict()
@@ -564,19 +625,22 @@ def main() -> None:
             ckpt["model_config"] = {**model_config, **channel_stats}
         torch.save(ckpt, path)
 
+    # On resume, append to the existing log (and skip the header) so earlier epochs are preserved.
     metrics_path = out_dir / "metrics.csv"
-    metrics_file = metrics_path.open("w", newline="")
+    resuming_log = args.resume is not None and metrics_path.exists()
+    metrics_file = metrics_path.open("a" if resuming_log else "w", newline="")
     metrics_writer = csv.writer(metrics_file)
-    metrics_writer.writerow(["epoch", "train_loss", "train_pred", "train_rec", "train_reward", "train_mae",
-                             "val_loss", "val_pred", "val_rec", "val_reward", "val_mae",
-                             "grad_norm_mean", "grad_norm_max", "seconds"])
+    if not resuming_log:
+        metrics_writer.writerow(["epoch", "train_loss", "train_pred", "train_rec", "train_reward", "train_mae",
+                                 "val_loss", "val_pred", "val_rec", "val_reward", "val_mae",
+                                 "grad_norm_mean", "grad_norm_max", "seconds"])
 
     # 3. Train ---------------------------------------------------------------
     # best.pt is selected on val_pred (the cosine next-latent loss): it's the world model's actual
     # objective and, unlike val_loss (pred + a Huber/BCE rec of different scales), is comparable
-    # across the linear-Huber and sigmoid-BCE arms of the A/B.
-    best_pred = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    # across the linear-Huber and sigmoid-BCE arms of the A/B. (best_pred seeded above: inf, or
+    # restored from --resume.)
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         tr_loss, tr_pred, tr_rec, tr_mae, gmean, gmax, tr_rew = run_epoch(
             model, transition, ema_model, train_loader, device, optimizer, scaler,
@@ -605,6 +669,10 @@ def main() -> None:
             best_pred = va_pred
             save_checkpoint(out_dir / "best.pt", epoch, va_loss, best_pred)
             print(f"  new best val_pred {va_pred:.6f} -> {out_dir / 'best.pt'}")
+        # Overwrite last.pt every epoch so a walltime kill mid-run is fully resumable (--resume last.pt).
+        save_checkpoint(out_dir / "last.pt", epoch, va_loss, best_pred)
+        if args.save_interval and epoch % args.save_interval == 0:
+            save_checkpoint(out_dir / f"epoch_{epoch:03d}.pt", epoch, va_loss, best_pred)
 
         if run is not None:
             run.log({
