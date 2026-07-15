@@ -74,8 +74,15 @@ def load_world_model(path: Path, device: torch.device):
     dc = ckpt["dynamics_config"]
     # Match the autoencoder's load dtype (f32 on CPU where half is slow; the trained dtype on GPU).
     dyn_dtype = next(ae_model.parameters()).dtype
+    # Rebuild with the checkpoint's own head geometry. Defaults reproduce pre-existing checkpoints that
+    # omit these keys: residual/normalize_output default True (the SPR regime) and norm defaults to
+    # batchnorm (the historical layer). The decode-rollout regime records normalize_output=False and
+    # norm=layernorm, both of which MUST be honored -- otherwise the head re-normalizes rolled latents the
+    # decoder never saw normalized, and a layernorm state_dict won't even load into a batchnorm module.
     dynamics = LatentTransition(
         dc["latent_dim"], hidden_dim=dc.get("hidden_dim"), depth=dc.get("depth", 2),
+        residual=dc.get("residual", True), normalize_output=dc.get("normalize_output", True),
+        norm=dc.get("norm", "batchnorm"),
     ).to(device=device, dtype=dyn_dtype)
     dynamics.load_state_dict(ckpt["dynamics_state"])
     dynamics.eval()
