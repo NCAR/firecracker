@@ -323,7 +323,7 @@ def aggregate(out_root: Path) -> None:
     ax.plot(es, mean, color="C0", linewidth=2.0, zorder=3,
             label=f"mean val ({len(run_dirs)} runs)")
     ax.set_xlabel("epoch")
-    ax.set_ylabel("validation loss (MSE)")
+    ax.set_ylabel("validation loss")
     ax.set_title(out_root.name)
     ax.legend()
     fig.tight_layout()
