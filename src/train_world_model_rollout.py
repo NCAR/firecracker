@@ -403,7 +403,7 @@ def main() -> None:
         # Merge ONLY the numeric normalization stats. A blind {**mc, **stats} would clobber
         # model_config["channels"] (encoder widths) with the stats' "channels" (per-channel NAMES) --
         # the exact pollution that broke a prior artifact. Keep the widths; stash names separately.
-        for k in ("channel_min", "channel_max", "channel_mean", "channel_std"):
+        for k in ("channel_min", "channel_max", "channel_mean", "channel_std", "signed_channels"):
             if k in channel_stats:
                 model_config[k] = channel_stats[k]
         if "channels" in channel_stats:

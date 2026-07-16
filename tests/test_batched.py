@@ -17,7 +17,7 @@ import torch
 
 import physics_constants as pc
 from conftest import to_numpy
-from simulation import Simulation, SimState, BIOME_NAMES, obs_channel_names
+from simulation import Simulation, SimState, obs_channel_names
 from map_loader import save_map
 from config import boundary_pad
 from rollout import (
@@ -26,6 +26,7 @@ from rollout import (
     bake_normalization,
     compute_channel_minmax,
     ensure_channel_stats,
+    stats_affine,
 )
 from scenarios import (
     hot_blob, mass_gradient, off_equilibrium, uniform, build_map, make_config, pad_map, ramp_terrain,
@@ -130,31 +131,29 @@ def test_build_observation_shape_and_channels():
     terrain = torch.rand(B, N, N)
     wind_x = torch.rand(B, N, N) * 2.0 - 1.0   # signed
     wind_y = torch.rand(B, N, N) * 2.0 - 1.0
-    # One-hot biome per cell (random of the three classes), stacked to (B, N_biome, N, N).
-    labels = torch.randint(0, len(BIOME_NAMES), (B, N, N))
-    biome_onehot = torch.nn.functional.one_hot(labels, len(BIOME_NAMES)).permute(0, 3, 1, 2).float()
     ign = torch.tensor([500.0, 600.0]).view(len(names), 1, 1)   # per-type ignition thresholds [K]
 
     obs = Simulation.build_observation(
-        air_temps, fuel_temps, fuel, terrain, wind_x, wind_y, biome_onehot, ign
+        air_temps, fuel_temps, fuel, terrain, wind_x, wind_y, ign
     )
 
     def norm(channel, raw):
         offset, scale = pc.OBS_NORM[channel]
         return (to_numpy(raw) - offset) / scale
 
-    # C = 5 fixed channels (air temperature + terrain + 2 wind + ignited) + two per fuel type
-    # (temperature + mass) + N_biome one-hot channels; 2 fuel types + 3 biomes -> 12.
+    # C = 6 fixed channels (air temperature + 2 slope + 2 wind + ignited) + two per fuel type
+    # (temperature + mass); 2 fuel types -> 10. Biome is not an observation channel.
     assert obs.shape == (B, len(obs_channel_names(names)), N, N)
+    slope_x, slope_y = Simulation._periodic_grad(terrain, pc.DEFAULT_CELL_SIZE_M)   # observed slope
     np.testing.assert_allclose(to_numpy(obs[:, 0]), norm("air_temperature", air_temps))               # air temp
     np.testing.assert_allclose(to_numpy(obs[:, 1]), norm("fuel_temperature", fuel_temps[:, 0]))       # temp type 0
     np.testing.assert_allclose(to_numpy(obs[:, 2]), norm("fuel_temperature", fuel_temps[:, 1]))       # temp type 1
     np.testing.assert_allclose(to_numpy(obs[:, 3]), norm("fuel", fuel[:, 0]))                          # mass type 0
     np.testing.assert_allclose(to_numpy(obs[:, 4]), norm("fuel", fuel[:, 1]))                          # mass type 1
-    np.testing.assert_allclose(to_numpy(obs[:, 5]), norm("terrain", terrain))                          # terrain
-    np.testing.assert_allclose(to_numpy(obs[:, 6]), norm("wind_x", wind_x))                            # fire wind u
-    np.testing.assert_allclose(to_numpy(obs[:, 7]), norm("wind_y", wind_y))                            # fire wind v
-    np.testing.assert_allclose(to_numpy(obs[:, 8:-1]), to_numpy(biome_onehot))                         # one-hot biome
+    np.testing.assert_allclose(to_numpy(obs[:, 5]), norm("slope_x", slope_x), rtol=1e-6, atol=1e-6)   # terrain slope u
+    np.testing.assert_allclose(to_numpy(obs[:, 6]), norm("slope_y", slope_y), rtol=1e-6, atol=1e-6)   # terrain slope v
+    np.testing.assert_allclose(to_numpy(obs[:, 7]), norm("wind_x", wind_x))                            # fire wind u
+    np.testing.assert_allclose(to_numpy(obs[:, 8]), norm("wind_y", wind_y))                            # fire wind v
     expected_ignited = (fuel_temps >= ign).any(dim=1).to(fuel_temps.dtype)                             # burning mask
     np.testing.assert_allclose(to_numpy(obs[:, -1]), to_numpy(expected_ignited))
 
@@ -276,10 +275,10 @@ def _build_small_dataset(tmp_path, *, nested=False):
     config = make_config(grid_size=grid)
     maps_dir = tmp_path / "maps"
     maps_dir.mkdir()
-    # Ramped terrain (across columns) so the terrain channel isn't spatially constant, plus a
+    # Ramped terrain (across columns) so the slope channels aren't spatially constant, plus a
     # temperature ramp across rows that crosses the woodland threshold (298 K) so the map spans all
-    # three biomes (cool -> woodland; warm+low -> grassland; warm+high -> shrubland). With the two
-    # ramps on independent axes every channel -- including each one-hot biome channel -- has real
+    # three biomes (cool -> woodland; warm+low -> grassland; warm+high -> shrubland), varying the
+    # per-type fuel placement. With the two ramps on independent axes every channel has real
     # variance, so standardisation drives each to a genuine unit std (not the constant-channel
     # no-op guard). temp_eq (which classify_biomes reads) defaults to the air field.
     terrain = (ramp_terrain(grid) * 300.0).astype(np.float32)
@@ -303,15 +302,20 @@ def _build_small_dataset(tmp_path, *, nested=False):
 
 
 def test_bake_normalization_min_max_to_unit_range(tmp_path):
-    """bake_normalization rewrites the shards so FireDataset (raw read) yields [0, 1] per channel."""
+    """bake_normalization rewrites the shards so FireDataset (raw read) yields the scaled range per
+    channel: [0, 1] for min-max channels, [-1, 1] about 0 for the signed (wind) channels."""
+    from rollout import SIGNED_CHANNELS
     root = _build_small_dataset(tmp_path, nested=True)
-    n_ch = int(FireDataset(root).meta["num_channels"])
-    assert not FireDataset(root).is_normalized                # raw dataset, not yet flagged
+    meta = FireDataset(root).meta
+    n_ch = int(meta["num_channels"])
+    names = list(meta["channels"])
+    signed = torch.tensor([nm in SIGNED_CHANNELS for nm in names])
+    assert signed.any()                                      # the small dataset carries wind_x/wind_y
+    assert not FireDataset(root).is_normalized               # raw dataset, not yet flagged
 
     # A channel whose raw values never vary (e.g. a fully-saturated ignited mask on this tiny grid)
-    # has a zero span -- bake floors its scale to 1, so it maps to a constant ~0 (min 0, max 0)
-    # rather than spanning [0, 1]. Note which channels vary now, before baking overwrites the shards,
-    # and expect a full unit range only for those.
+    # has a zero span -- bake floors its scale to 1, so it maps to a constant ~0 rather than spanning
+    # its range. Note which channels vary now, before baking overwrites the shards.
     raw = FireDataset(root).get_batch(np.arange(len(FireDataset(root)))).to(torch.float64)
     per_ch_raw = raw.permute(1, 0, 2, 3).reshape(n_ch, -1)
     varying = (per_ch_raw.amax(dim=1) - per_ch_raw.amin(dim=1)) >= 1e-8
@@ -323,10 +327,18 @@ def test_bake_normalization_min_max_to_unit_range(tmp_path):
     assert ds.is_normalized
     batch = ds.get_batch(np.arange(len(ds)))                 # (N, C, H, W), no read-time transform
     per_ch = batch.to(torch.float64).permute(1, 0, 2, 3).reshape(n_ch, -1)
-    # Every channel's min is ~0; a varying channel reaches ~1, a constant one stays at 0.
-    torch.testing.assert_close(per_ch.amin(dim=1), torch.zeros(n_ch, dtype=torch.float64),
-                               atol=1e-4, rtol=0)
-    torch.testing.assert_close(per_ch.amax(dim=1), varying.to(torch.float64), atol=1e-4, rtol=0)
+    lo, hi = per_ch.amin(dim=1), per_ch.amax(dim=1)
+
+    # Min-max channels: min ~0, and a varying one reaches ~1 (a constant one stays at 0).
+    mm = ~signed
+    torch.testing.assert_close(lo[mm], torch.zeros(mm.sum(), dtype=torch.float64), atol=1e-4, rtol=0)
+    torch.testing.assert_close(hi[mm], (varying & mm)[mm].to(torch.float64), atol=1e-4, rtol=0)
+    # Signed (wind) channels: symmetric about 0 -> everything within [-1, 1] and the dominant extreme
+    # hits +/-1 (unlike a min-max channel, whose min would be pinned to 0).
+    sgn = signed & varying
+    assert torch.all(lo[sgn] >= -1 - 1e-4) and torch.all(hi[sgn] <= 1 + 1e-4)
+    torch.testing.assert_close(torch.maximum(hi[sgn].abs(), lo[sgn].abs()),
+                               torch.ones(sgn.sum(), dtype=torch.float64), atol=1e-4, rtol=0)
     # __getitem__ and get_batch read the same baked values.
     torch.testing.assert_close(ds[0], batch[0])
 
@@ -352,6 +364,44 @@ def test_channel_minmax_match_manual_over_union(tmp_path):
     ref_max = allx.amax(dim=(0, 2, 3))
     np.testing.assert_allclose(cmin, ref_min.numpy(), atol=1e-6)
     np.testing.assert_allclose(cmax, ref_max.numpy(), atol=1e-6)
+
+
+def test_stats_affine_signed_channels_map_to_symmetric_range():
+    """Signed channels (wind) scale to [-1, 1] about 0; others keep min-max to [0, 1]."""
+    stats = {
+        "channels": ["air_temperature", "wind_x", "wind_y"],
+        "signed_channels": ["wind_x", "wind_y"],
+        "channel_min": [10.0, -1.4, -2.0],
+        "channel_max": [30.0, 1.0, 2.0],
+    }
+    offset, scale = stats_affine(stats)
+    # Unsigned channel: offset = min, scale = max - min (forward maps [min, max] -> [0, 1]).
+    np.testing.assert_allclose([offset[0], scale[0]], [10.0, 20.0])
+    # Signed channels: offset 0, scale = max(|min|, |max|), so 0 stays at 0 and the sign is kept.
+    np.testing.assert_allclose(offset[1:], [0.0, 0.0])
+    np.testing.assert_allclose(scale[1:], [1.4, 2.0])            # max(|-1.4|,|1.0|), max(|-2|,|2|)
+
+    # Forward transform: calm wind -> 0, and each channel's extreme lands within [-1, 1].
+    fwd = lambda x, i: (x - offset[i]) / scale[i]
+    assert fwd(0.0, 1) == 0.0
+    np.testing.assert_allclose(fwd(-1.4, 1), -1.0)               # the dominant extreme hits -1
+    assert abs(fwd(1.0, 1)) <= 1.0
+    # Inverse round-trips (de-normalization for inference/eval).
+    np.testing.assert_allclose(fwd(0.83, 1) * scale[1] + offset[1], 0.83)
+
+
+def test_stats_affine_signed_resolves_names_from_checkpoint_key():
+    """A checkpoint reuses `channels` for widths, so names live under `channel_names`; use them."""
+    stats = {
+        "channels": [32, 64, 128],                               # encoder WIDTHS, not names
+        "channel_names": ["air_temperature", "wind_x", "wind_y"],
+        "signed_channels": ["wind_x", "wind_y"],
+        "channel_min": [10.0, -1.4, -2.0],
+        "channel_max": [30.0, 1.0, 2.0],
+    }
+    offset, scale = stats_affine(stats)
+    np.testing.assert_allclose(offset, [10.0, 0.0, 0.0])
+    np.testing.assert_allclose(scale, [20.0, 1.4, 2.0])
 
 
 def test_channel_minmax_sampling_within_full(tmp_path):

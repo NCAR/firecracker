@@ -2,9 +2,9 @@
 World-model observation normalization (Phase 7).
 
 Simulation.build_observation stacks SI fields -- the air temperature [K], one temperature channel
-per fuel type [K], one vegetation-mass channel per fuel type [kg/m^2], terrain elevation [m], the
-two near-surface fire-wind components [m/s], and the one-hot vegetation biome -- whose raw
-magnitudes span several orders. Each channel is mapped to roughly [0, 1] by the documented affine window in
+per fuel type [K], one vegetation-mass channel per fuel type [kg/m^2], the two signed terrain-slope
+components, and the two near-surface fire-wind components [m/s] -- whose raw magnitudes span several
+orders. Each channel is mapped to roughly [0, 1] by the documented affine window in
 physics_constants.OBS_NORM, (value - offset) / scale, so the world model sees comparable scales.
 These tests call build_observation directly on synthetic tensors and pin that mapping (the
 per-channel reductions, the normalization, and that it is rank-agnostic across a batch axis).
@@ -13,34 +13,30 @@ per-channel reductions, the normalization, and that it is rank-agnostic across a
 import torch
 
 import physics_constants as pc
-from simulation import Simulation, BIOME_NAMES, obs_channel_names
+from simulation import Simulation, obs_channel_names
 
 
 GRID = 8
 DTYPE = torch.float64
-N_BIOME = len(BIOME_NAMES)
 
 
 IGN_DEFAULT = 573.0   # default per-type ignition threshold [K]; ambient (T_REF) stays below it
 
 
 def _obs(fuel_temperatures, fuel, terrain, wind_x=None, wind_y=None,
-         air_temperatures=None, biome_onehot=None, ignition_thresholds=None):
+         air_temperatures=None, ignition_thresholds=None):
     if wind_x is None:
         wind_x = torch.zeros_like(terrain)
     if wind_y is None:
         wind_y = torch.zeros_like(terrain)
     if air_temperatures is None:
         air_temperatures = torch.full_like(terrain, float(pc.T_REF))   # rest air -> channel ~ 0
-    if biome_onehot is None:
-        # Neutral all-zero biome block for tests not exercising biomes (keeps them at 0).
-        biome_onehot = terrain.new_zeros((*terrain.shape[:-2], N_BIOME, *terrain.shape[-2:]))
     if ignition_thresholds is None:
         n_fuel = fuel_temperatures.shape[-3]
         ignition_thresholds = torch.full((n_fuel, 1, 1), IGN_DEFAULT, dtype=fuel_temperatures.dtype)
     return Simulation.build_observation(
         air_temperatures, fuel_temperatures, fuel, terrain, wind_x, wind_y,
-        biome_onehot, ignition_thresholds,
+        ignition_thresholds,
     )
 
 
@@ -48,36 +44,24 @@ def _const(value, *shape):
     return torch.full(shape, float(value), dtype=DTYPE)
 
 
-def test_channel_count_is_five_plus_two_per_fuel_type_plus_biomes():
+def test_channel_count_is_six_plus_two_per_fuel_type():
     """The channel axis is air temperature + one temperature channel per fuel type + one mass
-    channel per fuel type + terrain + 2 wind + one-hot biome + ignited mask, so
-    C = 5 + 2*N_fuel + N_biome (here 2 fuel types, 3 biomes -> 12)."""
+    channel per fuel type + 2 slope + 2 wind + ignited mask, so C = 6 + 2*N_fuel (here 2 fuel
+    types -> 10). Biome is no longer an observation channel."""
     obs = _obs(_const(pc.T_REF, 2, GRID, GRID), _const(0.0, 2, GRID, GRID), _const(0.0, GRID, GRID))
-    assert obs.shape == (9 + N_BIOME, GRID, GRID)
+    assert obs.shape == (10, GRID, GRID)
     names = obs_channel_names(["grass", "tree"])
-    assert len(names) == 9 + N_BIOME
+    assert len(names) == 10
     assert names == ("air_temperature",
                      "fuel_temperature_grass", "fuel_temperature_tree",
-                     "fuel_grass", "fuel_tree", "terrain", "wind_x", "wind_y",
-                     "biome_woodland", "biome_grassland", "biome_shrubland", "ignited")
+                     "fuel_grass", "fuel_tree", "slope_x", "slope_y", "wind_x", "wind_y", "ignited")
 
 
 def test_rest_state_maps_near_zero():
-    """Ambient air/fuel temp (~T_REF), no fuel, sea-level terrain, empty biome, nothing ignited
+    """Ambient air/fuel temp (~T_REF), no fuel, flat terrain (zero slope), nothing ignited
     -> every channel ~ 0."""
     obs = _obs(_const(pc.T_REF, 2, GRID, GRID), _const(0.0, 2, GRID, GRID), _const(0.0, GRID, GRID))
     torch.testing.assert_close(obs, torch.zeros_like(obs), atol=1e-9, rtol=0.0)
-
-
-def test_biome_channels_are_one_hot():
-    """The N_biome channels ahead of the trailing ignited mask pass the one-hot biome through
-    unchanged (identity window), in OBS_CHANNELS_BIOME order (woodland, grassland, shrubland)."""
-    onehot = torch.zeros(N_BIOME, GRID, GRID, dtype=DTYPE)
-    onehot[0, :4, :] = 1.0    # top half woodland
-    onehot[1, 4:, :] = 1.0    # bottom half grassland
-    obs = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID),
-               _const(0.0, GRID, GRID), biome_onehot=onehot)
-    torch.testing.assert_close(obs[-(N_BIOME + 1):-1], onehot, atol=1e-9, rtol=0.0)
 
 
 def test_ignited_channel_is_burning_mask():
@@ -105,22 +89,41 @@ def test_air_temperature_channel_is_leading_and_rises_with_heat():
     assert abs(expected_hot - 1.0) < 1e-9
 
 
-def test_terrain_normalized_by_elev_max():
-    """Terrain at the documented ceiling maps to 1; the channel is z / ELEV_MAX_M.
-    With 1 fuel type terrain sits at index 2*N_fuel + 1 = 3 (air, temp, mass, terrain, ...)."""
-    obs = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID), _const(pc.ELEV_MAX_M, GRID, GRID))
-    torch.testing.assert_close(obs[3], torch.ones((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
+def test_terrain_enters_as_signed_slope_not_height():
+    """Terrain is observed as its slope grad(z) = tan(slope), not its height. A ramp z = x*dx rising
+    one metre per metre eastward has slope d/dx = 1 (-> 1/SLOPE_REF_TAN = 1) on the interior columns
+    and zero slope in y. With 1 fuel type slope_x/slope_y sit at indices 2*N_fuel+1 = 3 and 4."""
+    xs = torch.arange(GRID, dtype=DTYPE) * pc.DEFAULT_CELL_SIZE_M     # z = x_index * dx [m]
+    terrain = xs.expand(GRID, GRID).clone()                          # z[y, x] = x*dx -> dz/dx = 1
+    obs = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID), terrain)
+    expect = 1.0 / pc.SLOPE_REF_TAN
+    # Interior columns only: the periodic centered difference wraps at the first/last column.
+    torch.testing.assert_close(obs[3, :, 1:-1], _const(expect, GRID, GRID - 2), atol=1e-9, rtol=0.0)
+    torch.testing.assert_close(obs[4], torch.zeros((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
+    # A flat terrain (any constant height) has zero slope -> both channels 0 (height is not observed).
+    flat = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID), _const(pc.ELEV_MAX_M, GRID, GRID))
+    torch.testing.assert_close(flat[3:5], torch.zeros((2, GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
+
+
+def test_slope_sign_follows_uphill_direction():
+    """Slope is signed: a westward-rising ramp gives negative slope_x (downhill east), the mirror of
+    an eastward-rising one, so the network reads the uphill direction, not just steepness."""
+    xs = torch.arange(GRID, dtype=DTYPE) * pc.DEFAULT_CELL_SIZE_M
+    up = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID), xs.expand(GRID, GRID).clone())
+    down = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID),
+                torch.flip(xs, dims=[0]).expand(GRID, GRID).clone())
+    torch.testing.assert_close(up[3, :, 1:-1], -down[3, :, 1:-1], atol=1e-9, rtol=0.0)
 
 
 def test_wind_components_signed_and_normalized_by_wind_ref():
     """The wind channels pass the fire wind through, signed about 0 and scaled by WIND_REF_M_S.
-    With 1 fuel type wind_x/wind_y are the last two channels (indices 4 and 5)."""
+    With 1 fuel type the two slope channels precede them, so wind_x/wind_y are indices 5 and 6."""
     wx = _const(pc.WIND_REF_M_S, GRID, GRID)        # +peak -> +1
     wy = _const(-pc.WIND_REF_M_S / 2.0, GRID, GRID)  # half the peak, reversed -> -0.5
     obs = _obs(_const(pc.T_REF, 1, GRID, GRID), _const(0.0, 1, GRID, GRID),
                _const(0.0, GRID, GRID), wx, wy)
-    torch.testing.assert_close(obs[4], torch.ones((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
-    torch.testing.assert_close(obs[5], _const(-0.5, GRID, GRID), atol=1e-9, rtol=0.0)
+    torch.testing.assert_close(obs[5], torch.ones((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
+    torch.testing.assert_close(obs[6], _const(-0.5, GRID, GRID), atol=1e-9, rtol=0.0)
 
 
 def test_fuel_channels_are_per_type_then_normalized():
@@ -132,7 +135,7 @@ def test_fuel_channels_are_per_type_then_normalized():
     obs = _obs(_const(pc.T_REF, 2, GRID, GRID), fuel, _const(0.0, GRID, GRID))
     torch.testing.assert_close(obs[3], torch.ones((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)
     torch.testing.assert_close(obs[4], _const(0.5, GRID, GRID), atol=1e-9, rtol=0.0)
-    torch.testing.assert_close(obs[5], torch.zeros((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)  # terrain
+    torch.testing.assert_close(obs[5], torch.zeros((GRID, GRID), dtype=DTYPE), atol=1e-9, rtol=0.0)  # slope_x (flat)
 
 
 def test_fuel_temperature_is_per_type_and_rises_with_fire():
@@ -155,7 +158,7 @@ def test_batched_matches_single_world():
     fuel = torch.rand(3, 2, GRID, GRID, dtype=DTYPE) * 10.0
     terrain = torch.rand(3, GRID, GRID, dtype=DTYPE) * pc.ELEV_MAX_M
     batched = _obs(temps, fuel, terrain)
-    assert batched.shape == (3, 9 + N_BIOME, GRID, GRID)   # 5 fixed + 2*(2 fuel types) + biomes
+    assert batched.shape == (3, 10, GRID, GRID)           # 6 fixed + 2*(2 fuel types)
     for b in range(3):
         single = _obs(temps[b], fuel[b], terrain[b])
         torch.testing.assert_close(batched[b], single, atol=1e-12, rtol=0.0)
@@ -176,14 +179,16 @@ def test_env_observation_matches_world_model(make_env):
     # The env observation is build_observation cropped to the observed interior, so crop expected.
     expected = env._crop(Simulation.build_observation(
         env._air_temperatures, env._fuel_temperatures, env._fuel, env._terrain,
-        env._x_wind_fire, env._y_wind_fire, env._biome_onehot, env._sim.ignition_thresholds
+        env._x_wind_fire, env._y_wind_fire, env._sim.ignition_thresholds,
+        env._sim.cell_size_m,
     )).detach().cpu().numpy().astype("float32")
     np.testing.assert_array_equal(obs, expected)
 
     step_obs, *_ = env.step(0)
     step_expected = env._crop(Simulation.build_observation(
         env._air_temperatures, env._fuel_temperatures, env._fuel, env._terrain,
-        env._x_wind_fire, env._y_wind_fire, env._biome_onehot, env._sim.ignition_thresholds
+        env._x_wind_fire, env._y_wind_fire, env._sim.ignition_thresholds,
+        env._sim.cell_size_m,
     )).detach().cpu().numpy().astype("float32")
     np.testing.assert_array_equal(step_obs, step_expected)
 

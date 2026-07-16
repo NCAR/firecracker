@@ -3,7 +3,9 @@ normalize_dataset.py
 
 Normalize a built Firecracker dataset *on disk*: rewrite every shard to the per-channel min-max
 scale (x - min) / (max - min) so each channel lands in [0, 1]. Most channels aren't normally
-distributed, so min-max is preferred over z-scoring. Because each shard is read hundreds of times
+distributed, so min-max is preferred over z-scoring. Signed channels with a meaningful zero (the
+wind components) are instead scaled symmetrically to [-1, 1] so calm wind stays at 0 and the sign
+is preserved (see rollout.SIGNED_CHANNELS / stats_affine). Because each shard is read hundreds of times
 over a training run, baking the scale in once here keeps the training hot path a plain memmap copy
 (FireDataset applies no per-read normalization).
 

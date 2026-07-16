@@ -133,6 +133,11 @@ def build_autoencoder(args, config, device, weight_dtype):
         stats = None
         if "channel_min" in mc and "channel_max" in mc:
             stats = {"channel_min": mc["channel_min"], "channel_max": mc["channel_max"]}
+            # Carry the signed-channel marking + names so the symmetric [-1, 1] wind transform is
+            # reproduced (stats_affine locates signed channels by name via channel_names).
+            for k in ("signed_channels", "channel_names"):
+                if k in mc:
+                    stats[k] = mc[k]
         elif "channel_mean" in mc and "channel_std" in mc:
             stats = {"channel_mean": mc["channel_mean"], "channel_std": mc["channel_std"]}
         return model, mc, stats

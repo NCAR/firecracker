@@ -34,6 +34,7 @@ EMISSIVITY: float = 0.95                    # grey-body emissivity of the surfac
 ELEV_MAX_M:     float = 500.0               # documented terrain elevation ceiling over the domain [m]
 FUEL_REF_KG_M2: float = 20.0                # representative dense-forest areal biomass [kg/m^2]
 WIND_REF_M_S:   float = 30.0                # solver's peak-wind calibration target [m/s] (synoptic x channeling gain)
+SLOPE_REF_TAN:  float = 1.0                 # slope-observation reference: grad(z)=tan(slope); a 45-deg slope -> +/-1
 
 # --- Observation normalization ---------------------------------------------
 # The world-model observation (Simulation.build_observation) carries SI fields whose
@@ -51,13 +52,18 @@ OBS_NORM: dict[str, tuple[float, float]] = {
     "fuel_temperature": (T_REF, 2000.0),
     # bare ground -> 0; dense forest (~FUEL_REF) -> ~1.
     "fuel":             (0.0, FUEL_REF_KG_M2),
-    # sea level -> 0; domain ceiling -> 1.
+    # sea level -> 0; domain ceiling -> 1. (Terrain height is no longer an observation channel --
+    # the fire reads slope, not height -- but the window is kept for the field's provenance.)
     "terrain":          (0.0, ELEV_MAX_M),
+    # signed terrain slope components grad(z) = tan(slope), uphill +: calm/flat -> 0, a 45-deg slope
+    # -> ~+/-1. Physically it is slope, not height, that skews fire spread (Rothermel slope effect),
+    # and the derivative is hard for a conv stack to synthesize from a raw height field, so it is
+    # supplied directly. Signed and zero-centered; the high side is not clamped (steeper -> above 1).
+    "slope_x":          (0.0, SLOPE_REF_TAN),
+    "slope_y":          (0.0, SLOPE_REF_TAN),
     # near-surface fire wind components [m/s]: signed, calm -> 0, a ~30 m/s peak -> ~+/-1.
     "wind_x":           (0.0, WIND_REF_M_S),
     "wind_y":           (0.0, WIND_REF_M_S),
-    # one-hot vegetation biome channels are already 0/1, so the window is the identity.
-    "biome":            (0.0, 1.0),
     # binary "ignited"/burning mask is already 0/1, so the window is the identity.
     "ignited":          (0.0, 1.0),
 }

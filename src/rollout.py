@@ -70,7 +70,6 @@ from torch.utils.data import Dataset
 from config import load_config, boundary_pad
 from simulation import Simulation, SimState, obs_channel_names
 from map_loader import load_map, resolve_map, list_maps, validate_against_config
-from gen_maps import MapGenerator
 
 DEFAULT_GRID_SIZE = 256
 
@@ -80,6 +79,15 @@ _SHARD_GLOB = "shard_*.npy"
 # Per-channel normalization stats (min/max) sit at the dataset root, next to meta.json for a
 # flat dataset or above the per-worker subdirs for a nested one — see compute_channel_minmax.
 _STATS_NAME = "stats.json"
+
+# Channels that are signed with a physically meaningful zero: the near-surface wind components (calm
+# air is 0 m/s, the sign is the direction) and the terrain-slope components (flat ground is 0, the
+# sign is the uphill direction). These are scaled symmetrically to [-1, 1] — offset 0, scale
+# max(|min|, |max|) — instead of the default min-max to [0, 1], so the zero lands exactly at 0 and
+# the sign is preserved (see stats_affine). Every other channel stays on min-max. Extend this set to
+# add more signed channels; write_channel_minmax records the per-dataset subset into stats.json's
+# "signed_channels" so the exact transform travels with the data and checkpoints.
+SIGNED_CHANNELS: frozenset[str] = frozenset({"wind_x", "wind_y", "slope_x", "slope_y"})
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -118,11 +126,6 @@ class BatchedRollout:
         maps_cfg = cfg.get("maps", {})
 
         self._sim = Simulation(config)
-        # Reuses the map generator's elementwise biome classifier (thresholds only, no device/noise)
-        # to label each world's cells for the one-hot biome observation channels, sharing one source
-        # of truth with fuel placement -- the same thing FirecrackerEnv does for the BIOME view.
-        self._biome_gen = MapGenerator(config)
-        self._biome_onehot: torch.Tensor | None = None   # (B, N_biome, N, N) static per-world one-hot
 
         # Explicit constructor args win over config, which wins over code defaults.
         self.num_envs       = int(num_envs       if num_envs       is not None else roll_cfg.get("num_envs",       64))
@@ -288,12 +291,6 @@ class BatchedRollout:
             radiant_flux=torch.zeros_like(mass),
             channel_gain=channel_gain,
         )
-        # One-hot vegetation biome per world for the observation, classified over the padded grid
-        # from the same terrain + rest surface temperature the generator used at bake time.
-        # classify_biomes is elementwise, so this stacks straight into (B, N_biome, N, N); the
-        # sponge ring crops off in observe() alongside the other channels.
-        wood, grass, shrub = self._biome_gen.classify_biomes(terrain, self._state.temp_eq)
-        self._biome_onehot = torch.stack([wood, grass, shrub], dim=1).to(self._sim.dtype)
         if self._spawn_fire:
             self._ignite()
         self._filled = 0
@@ -344,7 +341,7 @@ class BatchedRollout:
         wind_y = s.y_wind_fire if s.y_wind_fire is not None else s.y_wind_vel
         obs = Simulation.build_observation(
             s.air_temperatures, s.fuel_temperatures, s.fuel, s.terrain, wind_x, wind_y,
-            self._biome_onehot, self._sim.ignition_thresholds,
+            self._sim.ignition_thresholds, self._sim.cell_size_m,
         )
         if self._pad == 0:
             return obs
@@ -649,18 +646,52 @@ def compute_channel_minmax(
     return cmin, cmax
 
 
+def _signed_channel_indices(stats: dict) -> list[int]:
+    """Indices of the channels `stats` marks signed (mapped to [-1, 1]; see SIGNED_CHANNELS).
+
+    The signed set is stored by name in `stats["signed_channels"]`; resolving it to positions needs
+    the ordered channel names. A raw dataset stats.json keeps those under `channels`, but a checkpoint
+    config reuses `channels` for the encoder WIDTHS, so the names are stashed under `channel_names`
+    there — prefer that, and fall back to `channels` only when its entries are actually strings.
+    Raises if signed channels are declared but no name order is available to locate them, rather than
+    silently applying the wrong (min-max) transform to a signed channel.
+    """
+    signed = stats.get("signed_channels")
+    if not signed:
+        return []
+    order = stats.get("channel_names")
+    if order is None:
+        cand = stats.get("channels")
+        order = cand if (cand and isinstance(cand[0], str)) else None
+    if order is None:
+        raise ValueError(
+            "stats declares signed_channels but carries no channel name order (channel_names / "
+            "channels) to resolve them; cannot apply the symmetric [-1, 1] transform."
+        )
+    signed = set(signed)
+    return [i for i, name in enumerate(order) if name in signed]
+
+
 def stats_affine(stats: dict) -> tuple[np.ndarray, np.ndarray]:
     """The baked normalization as an affine pair `(offset, scale)`: forward is (x - offset) / scale,
     inverse is y * scale + offset.
 
     Min-max datasets/checkpoints carry `channel_min`/`channel_max` (offset = min, scale = max - min);
     legacy z-scored ones carry `channel_mean`/`channel_std` (offset = mean, scale = std), so old
-    checkpoints still de-normalize correctly. A zero/tiny span is floored to 1 so a constant channel
-    is a safe no-op (the constant maps to 0). Returns two float64 arrays of length num_channels.
+    checkpoints still de-normalize correctly. Channels listed in `signed_channels` (the near-surface
+    wind) instead map symmetrically to [-1, 1] — offset 0, scale max(|min|, |max|) — so calm wind
+    lands at 0 and the sign is preserved; this applies to the min-max form only. A zero/tiny span is
+    floored to 1 so a constant channel is a safe no-op (the constant maps to 0). Returns two float64
+    arrays of length num_channels.
     """
     if "channel_min" in stats and "channel_max" in stats:
-        offset = np.asarray(stats["channel_min"], dtype=np.float64)
-        scale = np.asarray(stats["channel_max"], dtype=np.float64) - offset
+        cmin = np.asarray(stats["channel_min"], dtype=np.float64)
+        cmax = np.asarray(stats["channel_max"], dtype=np.float64)
+        offset = cmin.copy()
+        scale = cmax - cmin
+        for i in _signed_channel_indices(stats):          # symmetric about 0 -> [-1, 1]
+            offset[i] = 0.0
+            scale[i] = max(abs(cmin[i]), abs(cmax[i]))
     else:
         offset = np.asarray(stats["channel_mean"], dtype=np.float64)
         scale = np.asarray(stats["channel_std"], dtype=np.float64).copy()
@@ -683,6 +714,11 @@ def write_channel_minmax(
     }
     if channels is not None:
         stats["channels"] = list(channels)
+        # Record which of this dataset's channels are scaled symmetrically to [-1, 1] (signed, with a
+        # meaningful zero) rather than min-max to [0, 1], so stats_affine reproduces the exact bake.
+        signed = [c for c in channels if c in SIGNED_CHANNELS]
+        if signed:
+            stats["signed_channels"] = signed
     if n_samples is not None:
         stats["n_samples"] = int(n_samples)
     if total_samples is not None:
@@ -724,8 +760,10 @@ def ensure_channel_stats(
     )
     if verbose:
         names = stats.get("channels") or [f"ch{i}" for i in range(len(cmin))]
+        signed = set(stats.get("signed_channels", []))
         for name, lo, hi in zip(names, cmin, cmax):
-            print(f"  {name:<18} min {lo:+.4g}  max {hi:+.4g}")
+            tag = "  -> [-1,1] signed" if name in signed else ""
+            print(f"  {name:<18} min {lo:+.4g}  max {hi:+.4g}{tag}")
     return stats
 
 

@@ -5,7 +5,9 @@ Find per-channel min-max normalization statistics (min/max) for a built Firecrac
 write them to <data>/stats.json. normalize_dataset.py then bakes the min-max scale (x-min)/(max-min)
 into the shards so each channel leaves the dataset in [0, 1] — most channels aren't normally
 distributed, so min-max is preferred over z-scoring (and genuine outliers ride above 1 rather than
-being flattened by a std). This step only writes stats.json; the shards are scaled by the bake.
+being flattened by a std). Signed channels (the wind components) are instead scaled symmetrically to
+[-1, 1] about their zero; stats.json records that subset under "signed_channels". This step only
+writes stats.json; the shards are scaled by the bake.
 
 Unlike a mean/std, min and max are extreme order statistics: a subset of shards *under*-estimates
 the true range, so the default reads the whole dataset (--max-samples 0). Pass a positive

@@ -570,9 +570,13 @@ def main() -> None:
     # model was trained under (the transform baked into the shards; absent if none was found). Copy
     # the min/max pair for a min-max dataset, or the legacy mean/std pair for an older z-scored one.
     if channel_stats is not None:
-        for k in ("channel_min", "channel_max", "channel_mean", "channel_std"):
+        for k in ("channel_min", "channel_max", "channel_mean", "channel_std", "signed_channels"):
             if k in channel_stats:
                 model_config[k] = channel_stats[k]
+        # Stash the ordered observation names under a distinct key: model_config["channels"] already
+        # holds the encoder WIDTHS, so stats_affine needs channel_names to locate the signed channels.
+        if "channels" in channel_stats:
+            model_config["channel_names"] = channel_stats["channels"]
 
     # Resume: reload model/optimizer/scaler state and continue at the next epoch. The architecture
     # is rebuilt from CLI/config above (not the checkpoint), so guard against a silent mismatch that
