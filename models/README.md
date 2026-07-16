@@ -76,6 +76,11 @@ second). The second also carries a **reward head**.
 |-------------------------------------------------|----------------------------------|------:|----------|-----------------------------------------------------|-----------:|-----------------:|
 | `world_model_convbn256_16ch_best_bf16.pt`       | conv-bottleneck-256 (frozen)     |    16 | bfloat16 | `wm-frozen-convbn256-lr1e3_20260711_000856/run_14`  |         50 | 0.017485 |
 | `world_model_rollout_reward_16ch_best_bf16.pt`  | conv-bottleneck-256 (end-to-end) |    16 | bfloat16 | `wm-bnbce-rollout-reward_20260713_182122/run_00`    |         40 | 0.028538 |
+| `world_model_rollout_ln_16ch_best_bf16.pt`      | conv-bottleneck-256 (end-to-end) |    16 | bfloat16 | `wm-rollout-ln-b128_20260715_014354/run_03`         |         13 | 0.360788† |
+
+† `world_model_rollout_ln`'s value is **not** a cosine-pred loss but the decode-supervised
+fire-weighted masked BCE over the full 9-step rollout (see its paragraph below); the two world-model
+loss columns are not comparable to each other or to the autoencoders.
 
 The val "pred" is the cosine next-latent prediction loss `1 − cos(ẑ_{t+1}, sg(z_{t+1}))`, so it is
 **not** comparable to the autoencoders' reconstruction (huber/mse) losses above. The two world models'
@@ -102,10 +107,29 @@ prediction-optimal epoch and a statistical tie on the rebalanced loss. Unlike th
 was trained on a **min-max [0,1]** dataset, so `model_config` carries `channel_min`/`channel_max`
 (verified against the dataset `stats.json`) inline plus the 16 `channel_names`.
 
-Beyond the autoencoder keys, both files carry `dynamics_state`, `dynamics_config`
-(`{latent_dim, hidden_dim, depth}`, with `hidden_dim` resolved to its actual width), and
-`freeze_ae`. The end-to-end model additionally carries `reward_state` + `reward_config`
-(`{latent_dim, hidden_dim, depth, ignited_channel}`). Rebuild with:
+`world_model_rollout_ln_16ch_best_bf16.pt` is the best replicate (`run_03`, lowest val_loss and
+lowest val_fire_mae) of the `wm-rollout-ln-b128` 4-replicate sweep, a different **decode-supervised
+latent-rollout** regime (`src/train_world_model_rollout.py`): encode t0 **once**, roll the dynamics
+head forward K=8 additive-residual steps, **decode every step**, and supervise each decoded step
+against the real future frame with a single fire-weighted masked BCE (BPTT through the rollout). There
+is **no cosine-pred loss and no reward head** here. The saved checkpoint is epoch **13** (val_loss
+0.360788, val_fire_mae 0.0258). Two things distinguish it from the reward model: the dynamics head uses
+**LayerNorm** (`dynamics_config.norm = "layernorm"`) rather than BatchNorm — per-sample, depth-invariant
+normalization that avoids BN's running-stat mixing across rollout depths (measured latent drift
+z_K/z_0 ≈ 1.04) — and it is **not** `normalize_output` (`False`), so the rolled latents are kept near
+the encoder's `latent_bn`-centered z0 distribution only by the decode supervision, valid within the K=8
+horizon. Like the reward model it is min-max [0,1] data (`model_config` carries `channel_min`/
+`channel_max` + 16 `channel_names` inline, verified against the dataset `stats.json`), a `sigmoid`/BCE
+decoder that emits **logits** (`out_activation = "sigmoid"`; apply a sigmoid for reconstructions), and
+the fire-weighting recipe in `loss_config` (`{w_temp 4, w_wind 3, w_ignited 6, front_weight 4,
+front_dilate 2, temp_pct 99}`). Its dynamics head is wider/deeper than the reward model's
+(`hidden_dim 1024, depth 4`).
+
+Beyond the autoencoder keys, all three files carry `dynamics_state`, `dynamics_config`
+(`{latent_dim, hidden_dim, depth, ...}`, with `hidden_dim` resolved to its actual width), and
+`freeze_ae`. `world_model_rollout_reward` additionally carries `reward_state` + `reward_config`
+(`{latent_dim, hidden_dim, depth, ignited_channel}`); `world_model_rollout_ln` has **no** reward head,
+and its `dynamics_config` also records `residual`, `normalize_output`, and `norm`. Rebuild with:
 
 ```python
 import torch
@@ -120,13 +144,20 @@ ae = ConvAutoencoder(
     bottleneck_channels=mc.get("bottleneck_channels"), latent_bn=bool(mc.get("latent_bn")),
 )
 ae.load_state_dict(ckpt["model_state"]); ae.eval()
-dyn = LatentTransition(dc["latent_dim"], hidden_dim=dc["hidden_dim"], depth=dc["depth"])
+# Pass the optional dynamics_config fields with backward-compatible defaults so both the
+# BatchNorm reward model and the LayerNorm decode-rollout model rebuild + strict-load correctly.
+dyn = LatentTransition(
+    dc["latent_dim"], hidden_dim=dc["hidden_dim"], depth=dc["depth"],
+    residual=dc.get("residual", True), normalize_output=dc.get("normalize_output", True),
+    norm=dc.get("norm", "batchnorm"),
+)
 dyn.load_state_dict(ckpt["dynamics_state"]); dyn.eval()
 
-# Reward head (end-to-end model only): predicts log1p(newly-ignited-cell count) from a latent.
-rc = ckpt["reward_config"]
-rew = RewardHead(rc["latent_dim"], hidden_dim=rc["hidden_dim"], depth=rc["depth"])
-rew.load_state_dict(ckpt["reward_state"]); rew.eval()
+# Reward head: world_model_rollout_reward only (world_model_rollout_ln has none — guard on the key).
+if "reward_config" in ckpt:
+    rc = ckpt["reward_config"]
+    rew = RewardHead(rc["latent_dim"], hidden_dim=rc["hidden_dim"], depth=rc["depth"])
+    rew.load_state_dict(ckpt["reward_state"]); rew.eval()
 
 # z_t = ae.encode(x);  z_hat = dyn(z_t);  logits = ae.decode(z_hat)
 # x_hat = logits.sigmoid() if mc.get("out_activation") == "sigmoid" else logits
