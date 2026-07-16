@@ -56,7 +56,7 @@ class TrajectoryDataset:
         step:     frame gap between successive window elements (1 = adjacent stored frames).
     """
 
-    def __init__(self, dataset, *, num_envs=None, stride=None, window=2, step=1):
+    def __init__(self, dataset, *, num_envs=None, stride=None, window=2, step=1, partial=False):
         self.ds = dataset
         meta = dataset.meta
         if num_envs is None and "num_envs" not in meta:
@@ -76,16 +76,23 @@ class TrajectoryDataset:
         self.n_shards = len(dataset.shard_paths)
         self.window = int(window)
         self.step = int(step)
+        self.partial = bool(partial)
         if self.window < 1 or self.step < 1:
             raise ValueError("window and step must be >= 1")
-        self.span = (self.window - 1) * self.step          # frames a window spans
-        if self.span >= self.F:
+        self.span = (self.window - 1) * self.step          # frames a full window spans
+        # A full window needs `span` future frames. A PARTIAL window only needs one target frame
+        # (t0 + one step); the rest are padded and flagged by window_mask, so tail frames can still be
+        # a window start -- this is what gives the encoder coverage of the late-episode states. When
+        # partial is off, behavior (starts, indices, mask) is identical to the fixed-window original.
+        min_span = self.step if self.partial else self.span
+        if min_span >= self.F:
             raise ValueError(
-                f"window span {self.span} >= episode length {self.F}; shorten window/step."
+                f"window {'min-span' if self.partial else 'span'} {min_span} >= episode length "
+                f"{self.F}; shorten window/step."
             )
         # One episode per (shard, env). Windows start densely at frames 0 .. starts_per_ep-1.
         self.episodes = [(s, e) for s in range(self.n_shards) for e in range(self.B)]
-        self.starts_per_ep = self.F - self.span
+        self.starts_per_ep = self.F - min_span
 
     def __len__(self) -> int:
         return len(self.episodes) * self.starts_per_ep
@@ -95,10 +102,21 @@ class TrajectoryDataset:
         return shard * self.per_shard + frame * self.B + env
 
     def window_indices(self, win_id: int) -> list[int]:
-        """The `window` global flat indices making up window `win_id`, in time order."""
+        """The `window` global flat indices making up window `win_id`, in time order. Frames past the
+        episode end are clamped to the last stored frame (only reachable for partial windows; the
+        companion window_mask flags those padded slots). For full windows the clamp never fires, so the
+        indices are identical to the fixed-window original."""
         ep, k = divmod(int(win_id), self.starts_per_ep)
         shard, env = self.episodes[ep]
-        return [self._global(shard, env, k + j * self.step) for j in range(self.window)]
+        last = self.F - 1
+        return [self._global(shard, env, min(k + j * self.step, last)) for j in range(self.window)]
+
+    def window_mask(self, win_id: int) -> np.ndarray:
+        """Boolean (window,) mask: which window elements are real future frames vs padded past the
+        episode end. All-True for full (non-partial) windows."""
+        _, k = divmod(int(win_id), self.starts_per_ep)
+        last = self.F - 1
+        return np.array([k + j * self.step <= last for j in range(self.window)], dtype=bool)
 
     def episode_windows(self, episode_ids) -> np.ndarray:
         """All window ids belonging to the given episode ids (used to build train/val splits)."""
@@ -177,12 +195,19 @@ class TrajectoryBatchLoader:
         for i in range(0, stop, self.batch_size):
             yield order[i : i + self.batch_size]
 
-    def _make_batch(self, ids) -> torch.Tensor:
+    def _make_batch(self, ids):
         # (batch, window) global indices -> one flat read -> (batch, window, C, H, W).
         idx = np.stack([self.traj.window_indices(int(w)) for w in ids])
         frames = self.traj.ds.get_batch(idx.reshape(-1))       # (batch*window, C, H, W)
         batch = frames.view(len(ids), self.traj.window, *frames.shape[1:])
-        return batch.pin_memory() if self.pin_memory else batch
+        batch = batch.pin_memory() if self.pin_memory else batch
+        # Partial (variable-horizon) datasets also emit a (batch, window) validity mask so the trainer
+        # can zero the loss on padded steps. Fixed-window datasets keep the original bare-tensor yield.
+        if getattr(self.traj, "partial", False):
+            masks = np.stack([self.traj.window_mask(int(w)) for w in ids])
+            mask = torch.from_numpy(masks)
+            return (batch, mask.pin_memory()) if self.pin_memory else (batch, mask)
+        return batch
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         chunks = self._chunks()
