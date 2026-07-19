@@ -126,6 +126,30 @@ def masked_weighted_bce(logits: torch.Tensor, target: torch.Tensor, step_mask: t
     return num / den
 
 
+def masked_weighted_huber(pred: torch.Tensor, target: torch.Tensor, step_mask: torch.Tensor,
+                          channel_w: torch.Tensor, *, ignited_idx: int | None = None,
+                          front_weight: float = 0.0, front_dilate: int = 1,
+                          delta: float = 0.1) -> torch.Tensor:
+    """Regression twin of masked_weighted_bce for an out_activation='none' decoder: per-pixel Huber on
+    the RAW decoder output (values in ~[0,1], NOT logits -- no sigmoid), with the identical per-channel
+    and fire-front weighting, masked to valid rollout steps, reduced to a weighted mean. `delta` matches
+    the AE's Huber transition (0.1 for min-max [0,1] data). Weighting logic mirrors masked_weighted_bce
+    exactly so the two loss modes are directly comparable channel-for-channel."""
+    B, S, C, H, W = pred.shape
+    err = F.huber_loss(pred, target, reduction="none", delta=delta)              # (B,S,C,H,W)
+    w = channel_w.to(err).view(1, 1, C, 1, 1)
+    weight = w * step_mask.to(err).view(B, S, 1, 1, 1)
+    if front_weight > 0 and ignited_idx is not None:
+        ign = target[:, :, ignited_idx:ignited_idx + 1]                          # (B,S,1,H,W)
+        if front_dilate > 0:
+            k = 2 * front_dilate + 1
+            ign = F.max_pool2d(ign.reshape(B * S, 1, H, W), k, 1, front_dilate).reshape(B, S, 1, H, W)
+        weight = weight * (1.0 + front_weight * (ign > 0.5).to(err))             # (B,S,C,H,W)
+    num = (err * weight).sum()
+    den = weight.expand_as(err).sum().clamp_min(1.0)
+    return num / den
+
+
 def masked_change_bce(logits: torch.Tensor, target: torch.Tensor, prev: torch.Tensor,
                       step_mask: torch.Tensor, channel_w: torch.Tensor, *, eps: float = 1e-3,
                       ignited_idx: int | None = None, front_weight: float = 0.0,

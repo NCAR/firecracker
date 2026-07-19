@@ -64,6 +64,7 @@ def build_ae(args, config, device, weight_dtype):
     Returns (model, model_config, channel_stats)."""
     normalize_latent = bool(args.normalize_latent)
     latent_bn = not args.no_latent_bn
+    out_act = "none" if args.recon_loss == "huber" else "sigmoid"   # regression vs sigmoid/BCE decoder
     if args.init_from is not None:
         # WARM-START: reuse a pretrained AE's conv weights to bootstrap, but build the model with THIS
         # run's latent scheme (normalize_latent / latent_bn), not the AE's -- the goal is transfer of
@@ -210,7 +211,7 @@ class EpochStats:
 
 def run_epoch(model, dynamics, loader, device, optimizer, scaler, *, gains, channel_w, ignited_idx,
               anchor_front, front_dilate, w_anchor, w_change, change_eps, max_grad_norm,
-              freeze_ae, freeze_encoder, use_amp, training, fire_idx):
+              freeze_ae, freeze_encoder, use_amp, training, fire_idx, recon_loss="bce", huber_delta=0.1):
     model.train(training and not freeze_ae)
     dynamics.train(training)
     tot = anchor_tot = change_tot = n_seen = 0.0
@@ -231,8 +232,14 @@ def run_epoch(model, dynamics, loader, device, optimizer, scaler, *, gains, chan
             logits, zs = rollout_logits(model, dynamics, x[:, 0], s, freeze_encoder=freeze_encoder,
                                         return_latents=True)
             # L_anchor: full-frame reconstruction that keeps the static majority (terrain/fuel) faithful.
-            anchor = wml.masked_weighted_bce(logits, x, mask, channel_w, ignited_idx=ignited_idx,
-                                             front_weight=anchor_front, front_dilate=front_dilate)
+            # 'huber' scores the raw regression output directly; 'bce' the sigmoid/logits (original regime).
+            if recon_loss == "huber":
+                anchor = wml.masked_weighted_huber(logits, x, mask, channel_w, ignited_idx=ignited_idx,
+                                                   front_weight=anchor_front, front_dilate=front_dilate,
+                                                   delta=huber_delta)
+            else:
+                anchor = wml.masked_weighted_bce(logits, x, mask, channel_w, ignited_idx=ignited_idx,
+                                                 front_weight=anchor_front, front_dilate=front_dilate)
             if w_change > 0:
                 # L_change: BCE on cells that change between consecutive real frames (steps 1..K), so a
                 # persistence prediction can't win. prev = x[:, :-1], target = x[:, 1:].
@@ -267,7 +274,8 @@ def run_epoch(model, dynamics, loader, device, optimizer, scaler, *, gains, chan
                         skipped += 1
                 optimizer.step()
         with torch.no_grad():
-            mae = wml.per_channel_recon_stats(logits.float().sigmoid(), x.float(), mask)
+            recon = logits.float() if recon_loss == "huber" else logits.float().sigmoid()
+            mae = wml.per_channel_recon_stats(recon, x.float(), mask)
             # Persistence baseline: MAE of copying the previous real frame over the transition steps.
             # Data-only, so it's the fixed bar the model must beat -- model dyn MAE >= this == collapse.
             persist = wml.persistence_mae(x[:, 1:].float(), x[:, :-1].float(), mask[:, 1:])
@@ -346,6 +354,13 @@ def main() -> None:
     p.add_argument("--temp-max-gain", type=float, default=25.0)
     p.add_argument("--no-temp-renorm", action="store_true", help="disable Option-B temperature rescaling")
     # optim
+    p.add_argument("--recon-loss", default="bce", choices=("bce", "huber"),
+                   help="decoder supervision: 'bce' (sigmoid/BCE-on-logits, out_activation='sigmoid'; the "
+                        "original decode-rollout regime) or 'huber' (regression on raw [0,1] output, "
+                        "out_activation='none') to fine-tune a HUBER-trained AE (e.g. pooled-deep11222). "
+                        "'huber' requires --w-change 0 (the change term is BCE-only).")
+    p.add_argument("--huber-delta", type=float, default=0.1,
+                   help="Huber transition point for --recon-loss huber (0.1 for min-max [0,1] data)")
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -375,6 +390,8 @@ def main() -> None:
         raise SystemExit("--freeze-ae already freezes the encoder; drop --freeze-encoder.")
     if (args.freeze_ae or args.freeze_encoder) and args.init_from is None and args.resume is None:
         raise SystemExit("--freeze-* requires --init-from (nothing to freeze when training from scratch).")
+    if args.recon_loss == "huber" and args.w_change > 0:
+        raise SystemExit("--recon-loss huber does not support --w-change > 0 (the change term is BCE-only).")
 
     torch.manual_seed(args.seed)
     config = load_config(args.config)
@@ -429,6 +446,29 @@ def main() -> None:
     dyn_config = {"latent_dim": model.latent_dim, "hidden_dim": dynamics.hidden_dim,
                   "depth": args.dyn_depth, "residual": True, "normalize_output": dyn_norm,
                   "norm": dynamics.norm}
+
+    # STAGE-3 warm-start: if the init-from checkpoint carries a trained dynamics head whose config
+    # matches, load it too. (build_ae's --init-from loads ONLY the AE and leaves the head at fresh init;
+    # loading the head here is what makes this a fine-tune of the WHOLE pretrained world model.) The
+    # config must match exactly or the strict load / geometry would be wrong -- hard-fail rather than
+    # silently train a mismatched head.
+    if args.init_from is not None:
+        _ck = torch.load(args.init_from, map_location=device)
+        if "dynamics_state" in _ck:
+            dcfg = _ck.get("dynamics_config", {})
+            for _k, _want in (("latent_dim", model.latent_dim), ("depth", args.dyn_depth),
+                              ("hidden_dim", dynamics.hidden_dim), ("norm", dynamics.norm)):
+                if _k in dcfg and dcfg[_k] != _want:
+                    raise SystemExit(f"init-from dynamics_config.{_k}={dcfg[_k]} != this run's {_want}; "
+                                     f"pass matching --dyn-depth/--dyn-hidden/--dyn-norm for the head warm-start.")
+            dynamics.load_state_dict(_ck["dynamics_state"], strict=True)
+            _shrink_and_perturb(dynamics, _ck["dynamics_state"], shrink=args.warmstart_shrink,
+                                noise=args.warmstart_noise)
+            print(f"init(warm-start): dynamics head loaded (strict) from '{args.init_from}' "
+                  f"depth={args.dyn_depth} hidden={dynamics.hidden_dim} norm={dynamics.norm}")
+        else:
+            print(f"init(warm-start): '{args.init_from}' has no dynamics_state; head trained from scratch")
+        del _ck
 
     # loss weights + temperature renorm gains -------------------------------
     channel_w = wml.build_channel_weights(names, temp=args.w_temp, wind=args.w_wind, ignited=args.w_ignited)
@@ -524,7 +564,8 @@ def main() -> None:
                   anchor_front=anchor_front, front_dilate=args.front_dilate,
                   w_anchor=args.w_anchor, w_change=args.w_change, change_eps=args.change_eps,
                   max_grad_norm=args.max_grad_norm, freeze_ae=args.freeze_ae,
-                  freeze_encoder=args.freeze_encoder, use_amp=bool(scaler is not None), fire_idx=fire_idx)
+                  freeze_encoder=args.freeze_encoder, use_amp=bool(scaler is not None), fire_idx=fire_idx,
+                  recon_loss=args.recon_loss, huber_delta=args.huber_delta)
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         tr = run_epoch(model, dynamics, train_loader, device, optimizer, scaler, training=True, **common)
