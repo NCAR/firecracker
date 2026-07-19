@@ -58,7 +58,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 try:
     import wandb
@@ -371,6 +371,19 @@ def main() -> None:
                              "them (default: 1.0)")
     parser.add_argument("--val-frac", type=float, default=0.05,
                         help="fraction of samples held out for validation")
+    parser.add_argument("--subsample-frac", type=float, default=1.0,
+                        help="train on a random this-fraction of the samples (default 1.0 = all). "
+                             "Consecutive stored frames (stride-sampled) are highly correlated, so a "
+                             "random half still covers the state distribution while halving the RAM/"
+                             "page-cache footprint -- lets a big dataset fit a smaller node. AE-ONLY: "
+                             "the dynamics head needs consecutive frames, so never subsample there. "
+                             "Disables prewarm (which would stream the full dataset regardless)")
+    parser.add_argument("--subsample-seed", type=int, default=0,
+                        help="seed for the --subsample-frac SELECTION (default 0). Deliberately "
+                             "separate from --seed so that a packed replicate sweep (each replicate "
+                             "with a different --seed) keeps the SAME subset: otherwise the per-seed "
+                             "subsets union to ~the whole dataset in the node's shared page cache, "
+                             "defeating the footprint reduction. Keep it constant across a sweep")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader worker processes (only used by --loader dataloader)")
     parser.add_argument("--loader", choices=("ram", "dataloader"), default="ram",
@@ -485,9 +498,15 @@ def main() -> None:
     # Decouple the first read of the data from training: stream all shards sequentially into the
     # (node-shared) page cache on a background thread so epoch 1 overlaps the load instead of
     # driving scattered random reads off GLADE. Fire-and-forget -- the thread is a daemon.
-    if args.prewarm:
+    # Prewarm streams *whole* shards, so under --subsample-frac it would pull the entire dataset into
+    # the page cache (the very footprint we're subsampling to avoid, e.g. to fit a RAM-tight node);
+    # skip it and let the (bounded) subset fault in during epoch 1.
+    if args.prewarm and args.subsample_frac >= 1.0:
         print(f"prewarm: streaming {len(dataset.shard_paths)} shards into page cache (background)")
         prewarm_shards(dataset)
+    elif args.prewarm:
+        print(f"prewarm: disabled (--subsample-frac {args.subsample_frac}) to keep the page-cache "
+              f"footprint to the subsampled fraction")
     # Normalization is baked into the shards offline (tools/normalize_dataset.py) so the training
     # hot path stays a plain memmap copy. Warn if the data hasn't been normalized; the applied
     # per-channel min/max travel in <data>/stats.json (recorded in the checkpoint for inference).
@@ -500,18 +519,36 @@ def main() -> None:
     grid_size = int(dataset.meta["grid_size"])
     in_channels = int(dataset.meta["num_channels"])
     n_total = len(dataset)
-    n_val = max(1, int(round(n_total * args.val_frac)))
-    n_train = n_total - n_val
+    # Seeded shuffled index list, optionally subsampled to a random fraction (--subsample-frac). The
+    # kept indices drive BOTH loaders; only these samples are ever read, so the page-cache footprint
+    # shrinks proportionally. frac=1.0 reproduces the previous full-dataset permutation exactly.
+    if not 0.0 < args.subsample_frac <= 1.0:
+        raise SystemExit(f"--subsample-frac must be in (0, 1], got {args.subsample_frac}")
+    if args.subsample_frac < 1.0:
+        n_keep = max(2, int(round(n_total * args.subsample_frac)))
+        # SHARED kept set: select with the fixed --subsample-seed (NOT --seed) so every replicate in
+        # a packed sweep reads the SAME samples -> the node's shared page cache holds one subsampled
+        # fraction, not the union of per-seed subsets (which covers ~the whole dataset and re-blows
+        # the RAM/cgroup budget). The per-replicate --seed only re-orders that shared set below (for a
+        # different train/val split), so the touched SET -- and hence the cache footprint -- is identical.
+        kept = np.random.default_rng(args.subsample_seed).permutation(n_total)[:n_keep]
+        sample_idx = kept[np.random.default_rng(args.seed).permutation(n_keep)]
+        print(f"subsample: training on {n_keep}/{n_total} samples (random {args.subsample_frac:.3f}, "
+              f"shared subsample-seed {args.subsample_seed}) -- AE-only frame thinning")
+    else:
+        sample_idx = np.random.default_rng(args.seed).permutation(n_total)  # full dataset (unchanged)
+    n_kept = len(sample_idx)
+    n_val = max(1, int(round(n_kept * args.val_frac)))
+    n_train = n_kept - n_val
     print(
-        f"dataset: {n_total} samples ({in_channels}x{grid_size}x{grid_size}) "
-        f"-> {n_train} train / {n_val} val  [loader={args.loader}]"
+        f"dataset: {n_total} samples ({in_channels}x{grid_size}x{grid_size}); "
+        f"using {n_kept} -> {n_train} train / {n_val} val  [loader={args.loader}]"
     )
 
     pin = device.type == "cuda"
     if args.loader == "ram":
         # Seeded index split (mirrors random_split's role) + thread-prefetched batch loaders.
-        perm = np.random.default_rng(args.seed).permutation(n_total)
-        val_idx, train_idx = perm[:n_val], perm[n_val:]
+        val_idx, train_idx = sample_idx[:n_val], sample_idx[n_val:]
         train_loader = RamBatchLoader(
             dataset, train_idx, args.batch_size, shuffle=True, seed=args.seed,
             drop_last=True, pin_memory=pin,
@@ -522,7 +559,9 @@ def main() -> None:
         )
     else:
         gen = torch.Generator().manual_seed(args.seed)
-        train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=gen)
+        # Restrict to the (possibly subsampled) kept indices before the train/val split.
+        base = dataset if n_kept == n_total else Subset(dataset, sample_idx.tolist())
+        train_ds, val_ds = random_split(base, [n_train, n_val], generator=gen)
         train_loader = DataLoader(
             train_ds, batch_size=args.batch_size, shuffle=True,
             num_workers=args.num_workers, pin_memory=pin, drop_last=True,
@@ -664,6 +703,7 @@ def main() -> None:
                 "ms_ssim_data_range": args.ms_ssim_data_range if args.loss == "ms-ssim+l1" else None,
                 "amp": scaler is not None,
                 "val_frac": args.val_frac,
+                "subsample_frac": args.subsample_frac,
                 "n_train": n_train,
                 "n_val": n_val,
                 "params": n_params,
