@@ -49,8 +49,38 @@ import torch.nn.functional as F
 from torch import nn
 
 
+class ResidualBlock(nn.Module):
+    """A single post-activation residual double-conv (no resample).
+
+    Computes `act(F(x) + shortcut(x))` with `F = conv -> BN -> act -> conv -> BN`. It is the
+    resample-free unit that DownBlock/UpBlock stack when a stage carries more than one residual
+    block (`num_blocks > 1`): the stage's first block changes channel width and lives inline on the
+    Down/UpBlock (so single-block stages keep their original parameter names), and every *extra*
+    block is one of these at the stage's output width (in_ch == out_ch, so the shortcut is a plain
+    identity). The second BN's gamma is zero-initialised so the block starts as its shortcut (see
+    DownBlock's note on why the activation must sit after the add, not end the branch)."""
+
+    def __init__(self, in_ch: int, out_ch: int, activation: type[nn.Module] = nn.ReLU) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.act = activation()
+        self.shortcut: nn.Module = (
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1)
+            if in_ch != out_ch else nn.Identity()
+        )
+        nn.init.zeros_(self.bn2.weight)  # block starts as identity (shortcut only)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.bn1(self.conv1(x)))
+        h = self.bn2(self.conv2(h))
+        return self.act(h + self.shortcut(x))
+
+
 class DownBlock(nn.Module):
-    """Residual double-conv stage, then a 2x2 average pool that halves H/W.
+    """`num_blocks` residual double-convs, then a 2x2 average pool that halves H/W.
 
     The block computes act(F(x) + shortcut(x)) and then pools, where F is the two-conv residual
     branch: conv -> BN -> act -> conv -> BN. The activation is applied AFTER the addition
@@ -74,8 +104,14 @@ class DownBlock(nn.Module):
         in_ch: int,
         out_ch: int,
         activation: type[nn.Module] = nn.ReLU,
+        num_blocks: int = 1,
     ) -> None:
         super().__init__()
+        if num_blocks < 1:
+            raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
+        # First residual block: it carries the stage's channel change (in_ch -> out_ch). Its layers
+        # stay inline (not wrapped in a ResidualBlock) so a single-block stage keeps the original
+        # parameter names and older checkpoints load unchanged.
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
@@ -86,6 +122,10 @@ class DownBlock(nn.Module):
             nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1)
             if in_ch != out_ch else nn.Identity()
         )
+        # Extra same-width residual blocks (empty for num_blocks=1, so no extra state_dict keys).
+        self.extra = nn.ModuleList(
+            ResidualBlock(out_ch, out_ch, activation) for _ in range(num_blocks - 1)
+        )
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2)  # parameter-free H/W halving
         nn.init.zeros_(self.bn2.weight)  # block starts as identity (shortcut only)
 
@@ -93,6 +133,8 @@ class DownBlock(nn.Module):
         h = self.act(self.bn1(self.conv1(x)))
         h = self.bn2(self.conv2(h))
         h = self.act(h + self.shortcut(x))
+        for blk in self.extra:
+            h = blk(h)
         return self.pool(h)
 
 
@@ -115,8 +157,11 @@ class UpBlock(nn.Module):
         out_ch: int,
         activation: type[nn.Module] = nn.ReLU,
         final: bool = False,
+        num_blocks: int = 1,
     ) -> None:
         super().__init__()
+        if num_blocks < 1:
+            raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
         self.up = nn.Upsample(scale_factor=2, mode="nearest")  # H/W doubled
         self.final = final
         if final:
@@ -131,6 +176,10 @@ class UpBlock(nn.Module):
             nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1)
             if in_ch != out_ch else nn.Identity()
         )
+        # Extra same-width residual blocks (empty for num_blocks=1, so no extra state_dict keys).
+        self.extra = nn.ModuleList(
+            ResidualBlock(out_ch, out_ch, activation) for _ in range(num_blocks - 1)
+        )
         nn.init.zeros_(self.bn2.weight)  # block starts as identity (shortcut only)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -139,7 +188,10 @@ class UpBlock(nn.Module):
             return self.conv(x)
         h = self.act(self.bn1(self.conv1(x)))
         h = self.bn2(self.conv2(h))
-        return self.act(h + self.shortcut(x))
+        h = self.act(h + self.shortcut(x))
+        for blk in self.extra:
+            h = blk(h)
+        return h
 
 
 class Encoder(nn.Module):
@@ -150,11 +202,14 @@ class Encoder(nn.Module):
         in_channels: int,
         channels: Sequence[int],
         activation: type[nn.Module] = nn.ReLU,
+        blocks_per_stage: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
+        bps = list(blocks_per_stage) if blocks_per_stage is not None else [1] * len(channels)
         widths = [in_channels, *channels]
         self.blocks = nn.Sequential(
-            *(DownBlock(widths[i], widths[i + 1], activation) for i in range(len(channels)))
+            *(DownBlock(widths[i], widths[i + 1], activation, num_blocks=bps[i])
+              for i in range(len(channels)))
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -169,13 +224,20 @@ class Decoder(nn.Module):
         in_channels: int,
         channels: Sequence[int],
         activation: type[nn.Module] = nn.ReLU,
+        blocks_per_stage: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         rev = list(reversed(channels))
         out_widths = [*rev[1:], in_channels]
+        # Mirror the encoder's per-stage depth: decoder stage i corresponds to the encoder stage at
+        # the same resolution/width, i.e. the reversed blocks_per_stage. The final reconstruction
+        # head is a single plain conv, so its block count is ignored.
+        bps = list(blocks_per_stage) if blocks_per_stage is not None else [1] * len(channels)
+        rev_bps = list(reversed(bps))
         self.blocks = nn.Sequential(
             *(
-                UpBlock(rev[i], out_widths[i], activation, final=(i == len(rev) - 1))
+                UpBlock(rev[i], out_widths[i], activation, final=(i == len(rev) - 1),
+                        num_blocks=rev_bps[i])
                 for i in range(len(rev))
             )
         )
@@ -216,6 +278,7 @@ class ConvAutoencoder(nn.Module):
         normalize_latent: bool = True,
         bottleneck_channels: int | None = None,
         latent_bn: bool = False,
+        blocks_per_stage: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         n_stages = len(channels)
@@ -223,6 +286,19 @@ class ConvAutoencoder(nn.Module):
             raise ValueError(
                 f"grid_size={grid_size} must be divisible by 2**len(channels)={2 ** n_stages}"
             )
+        # Per-stage residual depth (one entry per channel width). None = one block per stage (the
+        # original architecture). The decoder mirrors this list (reversed) so the net stays
+        # symmetric. Extra blocks are same-width residual units inserted before each pool.
+        if blocks_per_stage is not None:
+            blocks_per_stage = tuple(int(b) for b in blocks_per_stage)
+            if len(blocks_per_stage) != n_stages:
+                raise ValueError(
+                    f"blocks_per_stage must have one entry per stage (len(channels)={n_stages}), "
+                    f"got {len(blocks_per_stage)}"
+                )
+            if any(b < 1 for b in blocks_per_stage):
+                raise ValueError(f"blocks_per_stage entries must be >= 1, got {blocks_per_stage}")
+        self.blocks_per_stage = blocks_per_stage or (1,) * n_stages
 
         self.in_channels = in_channels
         self.grid_size = grid_size
@@ -245,7 +321,7 @@ class ConvAutoencoder(nn.Module):
         self.flat_channels = bottleneck_channels if bottleneck_channels is not None else self.conv_channels
         self.flat_dim = self.flat_channels * self.conv_spatial * self.conv_spatial
 
-        self.encoder = Encoder(in_channels, channels, activation)
+        self.encoder = Encoder(in_channels, channels, activation, self.blocks_per_stage)
         if bottleneck_channels is not None:
             self.enc_project = nn.Sequential(
                 nn.Conv2d(self.conv_channels, bottleneck_channels, kernel_size=1),
@@ -264,7 +340,7 @@ class ConvAutoencoder(nn.Module):
         if latent_bn:
             self.latent_norm = nn.BatchNorm1d(latent_dim, affine=False)
         self.from_latent = nn.Linear(latent_dim, self.flat_dim)
-        self.decoder = Decoder(in_channels, channels, activation)
+        self.decoder = Decoder(in_channels, channels, activation, self.blocks_per_stage)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Map a B x C x N x N batch to its B x latent_dim latent vector.

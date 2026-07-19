@@ -173,6 +173,8 @@ def load_model(path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]
         normalize_latent=cfg.get("normalize_latent", False),
         # Absent in pre-bottleneck checkpoints; None reproduces the un-bottlenecked model.
         bottleneck_channels=cfg.get("bottleneck_channels"),
+        # Absent in pre-multi-block checkpoints; None reproduces one residual block per stage.
+        blocks_per_stage=cfg.get("blocks_per_stage"),
         # Absent in pre-latent-BN checkpoints; False reproduces the model without the latent BatchNorm.
         latent_bn=bool(cfg.get("latent_bn")),
     ).to(device=device, dtype=load_dtype)

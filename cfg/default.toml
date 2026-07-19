@@ -358,7 +358,9 @@ arch = "pooled"
 # hypersphere); the decoder's dense layer learns to rescale it. On by default.
 [autoencoder.pooled]
 channels            = [32, 64, 128, 256, 512]  # encoder widths per downsample stage (channels5 arch, 8x8 bottleneck)
-latent_dim          = 512                      # dense latent vector width
+blocks_per_stage    = [1, 1, 2, 2, 2]          # residual blocks per stage: deepen the 128/256/512 stages (2 each);
+                                               # the decoder mirrors this. One block per stage if omitted.
+latent_dim          = 256                      # dense latent vector width
 normalize_latent    = true                     # unit-magnitude latent (unit hypersphere)
 bottleneck_channels = 256                      # 1x1-conv compress 512->256 ch before latent (and back after),
                                                # preserving 8x8 spatial while shrinking the flatten 32768->16384

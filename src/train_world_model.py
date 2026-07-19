@@ -117,6 +117,8 @@ def build_autoencoder(args, config, device, weight_dtype):
         }
         if mc.get("bottleneck_channels") is not None:
             kwargs["bottleneck_channels"] = mc["bottleneck_channels"]
+        if mc.get("blocks_per_stage") is not None:
+            kwargs["blocks_per_stage"] = tuple(mc["blocks_per_stage"])
         if mc.get("latent_bn"):
             kwargs["latent_bn"] = True
         model = ARCHITECTURES[arch](**kwargs).to(device=device, dtype=weight_dtype)
@@ -159,6 +161,11 @@ def build_autoencoder(args, config, device, weight_dtype):
         kwargs["normalize_latent"] = arch_cfg["normalize_latent"]
     if arch_cfg.get("bottleneck_channels") is not None:
         kwargs["bottleneck_channels"] = arch_cfg["bottleneck_channels"]
+    # blocks_per_stage is tied to the config's `channels`; skip it if --channels overrode the width
+    # list to a different length (stale, would mismatch the stage count).
+    cfg_bps = arch_cfg.get("blocks_per_stage")
+    if cfg_bps is not None and (channels is None or len(cfg_bps) == len(tuple(channels))):
+        kwargs["blocks_per_stage"] = tuple(cfg_bps)
     if args.latent_bn or arch_cfg.get("latent_bn"):
         kwargs["latent_bn"] = True
     model = ARCHITECTURES[arch](**kwargs).to(device=device, dtype=weight_dtype)
@@ -167,6 +174,7 @@ def build_autoencoder(args, config, device, weight_dtype):
         "in_channels": in_channels,
         "grid_size": grid_size,
         "channels": list(model.channels),
+        "blocks_per_stage": list(model.blocks_per_stage),
         "latent_dim": model.latent_dim,
         "normalize_latent": model.normalize_latent,
         "bottleneck_channels": model.bottleneck_channels,

@@ -41,6 +41,7 @@ def build_from_ckpt(ckpt, device):
         in_channels=mc["in_channels"], grid_size=mc["grid_size"], channels=tuple(mc["channels"]),
         latent_dim=mc["latent_dim"], normalize_latent=mc.get("normalize_latent", False),
         bottleneck_channels=mc.get("bottleneck_channels"), latent_bn=mc.get("latent_bn", False),
+        blocks_per_stage=mc.get("blocks_per_stage"),
     ).to(device).eval()
     ae.load_state_dict(ckpt["model_state"])
     dc = ckpt["dynamics_config"]

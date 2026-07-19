@@ -78,6 +78,8 @@ def build_ae(args, config, device, weight_dtype):
                   "normalize_latent": normalize_latent}
         if amc.get("bottleneck_channels") is not None:
             kwargs["bottleneck_channels"] = amc["bottleneck_channels"]
+        if amc.get("blocks_per_stage") is not None:
+            kwargs["blocks_per_stage"] = tuple(amc["blocks_per_stage"])
         if latent_bn:
             kwargs["latent_bn"] = True
         model = ARCHITECTURES[amc["arch"]](**kwargs).to(device=device, dtype=weight_dtype)
@@ -88,10 +90,11 @@ def build_ae(args, config, device, weight_dtype):
         _shrink_and_perturb(model, ckpt["model_state"], shrink=args.warmstart_shrink,
                             noise=args.warmstart_noise)
         mcfg = {"arch": amc["arch"], "in_channels": amc["in_channels"], "grid_size": amc["grid_size"],
-                "channels": list(model.channels), "latent_dim": model.latent_dim,
+                "channels": list(model.channels), "blocks_per_stage": list(model.blocks_per_stage),
+                "latent_dim": model.latent_dim,
                 "normalize_latent": model.normalize_latent, "bottleneck_channels": model.bottleneck_channels,
                 "latent_bn": model.latent_bn, "weight_dtype": str(weight_dtype).removeprefix("torch."),
-                "out_activation": "sigmoid", "warm_started_from": str(args.init_from)}
+                "out_activation": out_act, "warm_started_from": str(args.init_from)}
         return model, mcfg, _load_channel_stats(args.data)          # NEW data's stats, not the AE's
 
     ae_cfg = config.get("autoencoder", {})
@@ -107,15 +110,21 @@ def build_ae(args, config, device, weight_dtype):
         kwargs["latent_dim"] = latent_dim
     if arch_cfg.get("bottleneck_channels") is not None:
         kwargs["bottleneck_channels"] = arch_cfg["bottleneck_channels"]
+    # blocks_per_stage is tied to the config's `channels`; skip it if --channels overrode the width
+    # list to a different length (stale, would mismatch the stage count).
+    cfg_bps = arch_cfg.get("blocks_per_stage")
+    if cfg_bps is not None and (channels is None or len(cfg_bps) == len(tuple(channels))):
+        kwargs["blocks_per_stage"] = tuple(cfg_bps)
     if latent_bn:
         kwargs["latent_bn"] = True
     model = ARCHITECTURES[arch](**kwargs).to(device=device, dtype=weight_dtype)
     model_config = {
         "arch": arch, "in_channels": in_channels, "grid_size": grid_size,
-        "channels": list(model.channels), "latent_dim": model.latent_dim,
+        "channels": list(model.channels), "blocks_per_stage": list(model.blocks_per_stage),
+        "latent_dim": model.latent_dim,
         "normalize_latent": model.normalize_latent, "bottleneck_channels": model.bottleneck_channels,
         "latent_bn": model.latent_bn, "weight_dtype": str(weight_dtype).removeprefix("torch."),
-        "out_activation": "sigmoid",
+        "out_activation": out_act,
     }
     return model, model_config, _load_channel_stats(args.data)
 

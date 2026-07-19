@@ -43,6 +43,8 @@ def build_model(mc: dict, model_state: dict, device: torch.device, dtype: torch.
         normalize_latent=mc.get("normalize_latent", False),
         # Absent in pre-bottleneck checkpoints; None reproduces the un-bottlenecked model.
         bottleneck_channels=mc.get("bottleneck_channels"),
+        # Absent in pre-multi-block checkpoints; None reproduces one residual block per stage.
+        blocks_per_stage=mc.get("blocks_per_stage"),
     )
     return m.to(device=device, dtype=dtype)
 

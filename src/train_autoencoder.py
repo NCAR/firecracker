@@ -400,6 +400,11 @@ def main() -> None:
                         help="encoder channel widths per downsample stage; the last is the conv "
                              "channel count before flattening, e.g. 16,32,64,128,256,512; default "
                              "from [autoencoder.<arch>].channels")
+    parser.add_argument("--blocks-per-stage", type=_parse_channels, default=None,
+                        help="number of residual blocks in each downsample stage (one int per "
+                             "--channels entry), e.g. 1,1,2,2,2 to deepen the mid/deep stages; the "
+                             "decoder mirrors it. default from [autoencoder.<arch>].blocks_per_stage "
+                             "(one block per stage if unset)")
     parser.add_argument("--latent-dim", type=int, default=None,
                         help="width of the dense latent vector the flattened feature map "
                              "projects to; default from [autoencoder.<arch>].latent_dim")
@@ -454,6 +459,17 @@ def main() -> None:
     arch_cfg = ae_cfg.get(arch, {})
     channels = args.channels if args.channels is not None else arch_cfg.get("channels")
     channels = tuple(channels) if channels is not None else None
+    # An explicit --blocks-per-stage is honored as-is (the model validates its length). The config
+    # value is tied to the config's `channels`, so ignore it when --channels overrode the width list
+    # to a different length (it would be stale and mismatch the stage count).
+    if args.blocks_per_stage is not None:
+        blocks_per_stage: tuple[int, ...] | None = tuple(args.blocks_per_stage)
+    else:
+        cfg_bps = arch_cfg.get("blocks_per_stage")
+        blocks_per_stage = (
+            tuple(cfg_bps) if cfg_bps is not None
+            and (channels is None or len(cfg_bps) == len(channels)) else None
+        )
     latent_dim = args.latent_dim if args.latent_dim is not None else arch_cfg.get("latent_dim")
     normalize_latent = (
         args.normalize_latent if args.normalize_latent is not None
@@ -523,6 +539,8 @@ def main() -> None:
     model_kwargs = {"in_channels": in_channels, "grid_size": grid_size}
     if channels is not None:
         model_kwargs["channels"] = channels
+    if blocks_per_stage is not None:
+        model_kwargs["blocks_per_stage"] = blocks_per_stage
     if latent_dim is not None:
         model_kwargs["latent_dim"] = latent_dim
     if normalize_latent is not None:
@@ -532,7 +550,8 @@ def main() -> None:
     model = ARCHITECTURES[arch](**model_kwargs).to(device=device, dtype=weight_dtype)
     n_params = sum(p.numel() for p in model.parameters())
     conv_shape = f"{model.conv_channels}x{model.conv_spatial}x{model.conv_spatial}"
-    print(f"model: arch={arch} channels={tuple(model.channels)} conv_latent={conv_shape} "
+    print(f"model: arch={arch} channels={tuple(model.channels)} "
+          f"blocks_per_stage={tuple(model.blocks_per_stage)} conv_latent={conv_shape} "
           f"bottleneck_channels={model.bottleneck_channels} flat_dim={model.flat_dim} "
           f"latent_dim={model.latent_dim} normalize_latent={model.normalize_latent} "
           f"params={n_params:,}")
@@ -559,6 +578,7 @@ def main() -> None:
         "in_channels": in_channels,
         "grid_size": grid_size,
         "channels": list(model.channels),
+        "blocks_per_stage": list(model.blocks_per_stage),
         "latent_dim": model.latent_dim,
         "normalize_latent": model.normalize_latent,
         "bottleneck_channels": model.bottleneck_channels,
@@ -589,7 +609,8 @@ def main() -> None:
         ck_cfg = ckpt.get("model_config", {})
         mismatch = {
             k: (ck_cfg.get(k), model_config.get(k))
-            for k in ("arch", "in_channels", "grid_size", "channels", "latent_dim")
+            for k in ("arch", "in_channels", "grid_size", "channels", "blocks_per_stage",
+                      "latent_dim")
             if ck_cfg.get(k) != model_config.get(k)
         }
         if mismatch:

@@ -1,7 +1,7 @@
 # Trained autoencoder checkpoints
 
-Best replicate from each 16-replicate grouped-parallel sweep
-(50 epochs, seeds 0–15). Each file is a `torch.save` dict with keys
+Best replicate from each grouped-parallel sweep (typically 16 replicates /
+50 epochs, seeds 0–15; per-model counts noted below). Each file is a `torch.save` dict with keys
 `epoch`, `val_loss`, `model_state`, and `model_config`. The Adam
 `optimizer_state` has been stripped (weights are bit-exact; only training
 resumption is unavailable), which cuts the float32 size roughly to model weights
@@ -18,6 +18,7 @@ for the 24.5M-param conv-bottleneck).
 | `strided_huber_16ch_arch3_best_bf16.pt` | strided / huber (arch3) | 16 | bfloat16 | `lr1e3-arch3-16ch_20260707_163330/run_07` | 50 | 0.085238 |
 | `residual_double_conv_16ch_best_bf16.pt` | strided / huber (residual double-conv) | 16 | bfloat16 | `residual-double-conv-16ch_20260707_232304/run_15` | 49 | 0.077465 |
 | `conv_bottleneck_256_16ch_best_bf16.pt` | pooled / huber (1×1 channel bottleneck) | 16 | bfloat16 | `exp-conv-bottleneck_20260709_204409/run_07` | 49 | 0.073867 |
+| `pooled_huber_deep11222_l256_14ch_best_bf16.pt` | pooled / huber (deep 11222, latent 256) | 14 | bfloat16 | `pooled-huber-deep11222-l256-14ch_20260717_161036/run_07` | 20 | 0.003027‡ |
 
 The `arch2` model is the retuned strided stack — tapered widths
 `[64, 64, 128, 128, 256, 256]` with a 512-d latent — vs. the earlier 16ch
@@ -49,6 +50,21 @@ compressed 512→256 channels (1×1 conv + BatchNorm) before flattening and expa
 41M an un-bottlenecked 8×8×512 stack would need. It is the best (lowest-val-loss)
 replicate of the `exp-conv-bottleneck` (lr 1e-3, batch 64, huber) sweep, reaching
 val-loss 0.0739 — the lowest of any 16ch model to date.
+
+The `pooled-deep11222` model keeps the conv-bottleneck's 5-stage `[32, 64, 128,
+256, 512]` avg-pool stack and 1×1 channel bottleneck (512→256→512, 8×8 grid
+preserved), but deepens the three high-width stages to **two residual blocks
+each** (`blocks_per_stage = [1, 1, 2, 2, 2]`, decoder mirrored) and drops the
+latent to **256-d** — reallocating params from the dense latent projection into
+conv depth at a near-constant ~23.85M total. It is the best (lowest-val-loss)
+replicate (`run_07`) of the `pooled-huber-deep11222-l256-14ch` (**8**-replicate,
+**20**-epoch, lr default, huber δ=0.1) sweep. ‡ Its val-loss `0.003027` is **not
+comparable** to the 16ch models above: this is the new **14-channel**, **min-max
+[0, 1]** dataset (`model_config` carries `channel_min`/`channel_max`,
+`signed_channels`, and the 14 `channel_names` inline, verified against the dataset
+`stats.json`), whereas the 16ch models are z-scored (`channel_mean`/`channel_std`)
+— different targets, different loss scale. This is the current AE baseline for the
+separately-trained dynamics head.
 
 Selected as the lowest-val-loss replicate in each sweep. Per-channel input
 normalization stats live with the dataset (`<data>/stats.json`) and the
