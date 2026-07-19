@@ -445,7 +445,12 @@ def main() -> None:
                                 ).to(device=device, dtype=weight_dtype)
     dyn_config = {"latent_dim": model.latent_dim, "hidden_dim": dynamics.hidden_dim,
                   "depth": args.dyn_depth, "residual": True, "normalize_output": dyn_norm,
-                  "norm": dynamics.norm}
+                  "norm": dynamics.norm,
+                  # Sim-ticks a single dynamics step represents: the dataset's stored-frame spacing
+                  # (traj.stride) times the trajectory frame gap (--step). Recorded so the rollout
+                  # viewer can advance the physics exactly one training step per model step without
+                  # being told the stride on the command line.
+                  "ticks_per_step": traj.stride * args.step}
 
     # STAGE-3 warm-start: if the init-from checkpoint carries a trained dynamics head whose config
     # matches, load it too. (build_ae's --init-from loads ONLY the AE and leaves the head at fresh init;

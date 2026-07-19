@@ -7,11 +7,12 @@ diverges from the physics. Two modes:
 
   ONLINE (default) -- roll against the LIVE physics simulation.
       python tools/rollout_viewer.py --model models/world_model_convbn256_16ch_best_bf16.pt
-    The model was trained on jumps of `--ticks-per-step` sim-ticks (default 256 = the dataset
-    stride), so one dynamics step means that many physics ticks. Rather than burst-simulate them
-    (which freezes the UI for ~25 s), physics runs at `--ticks-per-second` (default 10) and the
-    dynamics head advances once every `--ticks-per-step` ticks -- the model updates ~every 25 s while
-    the physics panel animates smoothly. A re-anchors the latent to the current frame.
+    The model was trained on jumps of `--ticks-per-step` sim-ticks; that stride is read from the
+    checkpoint by default (dyn_config["ticks_per_step"] = dataset stride x trajectory --step), so one
+    dynamics step means that many physics ticks. Rather than burst-simulate them (which would freeze
+    the UI), physics runs at `--ticks-per-second` (default 10) and the dynamics head advances once
+    every `--ticks-per-step` ticks -- the model updates every ticks_per_step/ticks_per_second seconds
+    while the physics panel animates smoothly. A re-anchors the latent to the current frame.
 
   OFFLINE (--data DIR) -- roll against RECORDED dataset frames, no simulation at all.
       python tools/rollout_viewer.py --model <ckpt> --data data/fire --num-envs 32
@@ -56,10 +57,12 @@ from model_viewer import (
 # ---------------------------------------------------------------------------
 
 def load_world_model(path: Path, device: torch.device):
-    """Load a world-model checkpoint -> (autoencoder, ae_config, dynamics_head), all in eval mode.
+    """Load a world-model checkpoint -> (autoencoder, ae_config, dynamics_head, trained_ticks_per_step).
 
     Reuses model_viewer.load_model for the autoencoder half (it reads model_state/model_config),
     then rebuilds the LatentTransition head from dynamics_config and loads dynamics_state.
+    trained_ticks_per_step is the sim-ticks a single dynamics step spans (dyn_config["ticks_per_step"],
+    written by the trainers), or None for older checkpoints that predate the field.
     """
     ae_model, ae_cfg = load_model(path, device)                       # autoencoder + its config
     try:
@@ -86,7 +89,8 @@ def load_world_model(path: Path, device: torch.device):
     ).to(device=device, dtype=dyn_dtype)
     dynamics.load_state_dict(ckpt["dynamics_state"])
     dynamics.eval()
-    return ae_model, ae_cfg, dynamics
+    trained_ticks_per_step = dc.get("ticks_per_step")
+    return ae_model, ae_cfg, dynamics, trained_ticks_per_step
 
 
 def _validate_shapes(ae_cfg: dict, env: FirecrackerEnv, path: Path) -> None:
@@ -222,12 +226,12 @@ class RolloutViewer(ComparisonViewer):
 
 
 def run_online(args, config, env, ae_model, ae_cfg, dynamics) -> None:
-    viewer = RolloutViewer(env, ae_model, ae_cfg, dynamics, interpolate=not args.no_interpolate)
+    viewer = RolloutViewer(env, ae_model, ae_cfg, dynamics, interpolate=args.interpolate)
     env.reset()
     viewer.anchor_to_current()
 
     tick_interval = 1.0 / max(args.ticks_per_second, 1e-6)
-    mode = "stepwise (cached)" if args.no_interpolate else "smoothly interpolated (slerp) every tick"
+    mode = "smoothly interpolated (slerp) every tick" if args.interpolate else "stepwise (cached)"
     print(f"online: physics at {args.ticks_per_second} ticks/s; dynamics step every "
           f"{args.ticks_per_step} ticks (~{args.ticks_per_step / args.ticks_per_second:.0f} s per model step); "
           f"prediction {mode}")
@@ -451,14 +455,16 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=None,
                         help="envs-per-shard for datasets whose meta predates the field (data/fire: 32)")
     # Online cadence
-    parser.add_argument("--ticks-per-step", type=int, default=256,
-                        help="physics ticks per dynamics step (default 256 = the training stride)")
+    parser.add_argument("--ticks-per-step", type=int, default=None,
+                        help="physics ticks per dynamics step; defaults to the training stride recorded "
+                             "in the checkpoint (falling back to 256 for checkpoints that predate it)")
     parser.add_argument("--ticks-per-second", type=float, default=10.0,
                         help="online physics tick rate; keeps the UI responsive (default 10)")
-    parser.add_argument("--no-interpolate", action="store_true",
-                        help="online: hold each predicted latent and jump once per stride (the old "
-                             "stepwise behavior) instead of smoothly slerp-interpolating to the "
-                             "prefetched next latent every tick; decodes once per stride (cheaper on CPU)")
+    parser.add_argument("--interpolate", action="store_true",
+                        help="online: smoothly slerp-interpolate the prediction to the prefetched next "
+                             "latent every tick instead of holding each predicted latent and jumping "
+                             "once per stride (the default stepwise behavior, which decodes once per "
+                             "stride and is cheaper on CPU)")
     parser.add_argument("--interval", type=float, default=0.3,
                         help="seconds between frames in offline autoplay (default 0.3)")
     args = parser.parse_args()
@@ -468,9 +474,25 @@ def main() -> None:
                          map_name=args.map_name, maps_dir=args.maps_dir)
     device = env._sim.device
     path = resolve_model_path(args.model)
-    ae_model, ae_cfg, dynamics = load_world_model(path, device)
+    ae_model, ae_cfg, dynamics, trained_tps = load_world_model(path, device)
     _validate_shapes(ae_cfg, env, path)
     print(f"Loaded world model: {path}  (latent_dim={ae_cfg['latent_dim']}, device={device})")
+
+    # Resolve the physics-ticks-per-dynamics-step: honor an explicit --ticks-per-step, else use the
+    # stride the head was trained on (recorded in the checkpoint), else fall back to the old 256 default
+    # for checkpoints that predate the field. Warn on an explicit override that disagrees with training,
+    # since a mismatched stride is exactly the drift this field exists to prevent.
+    if args.ticks_per_step is None:
+        if trained_tps is not None:
+            args.ticks_per_step = int(trained_tps)
+            print(f"ticks-per-step: {args.ticks_per_step} (from the checkpoint's training stride)")
+        else:
+            args.ticks_per_step = 256
+            print("ticks-per-step: 256 (checkpoint predates the recorded training stride; pass "
+                  "--ticks-per-step to match how the head was trained)")
+    elif trained_tps is not None and int(trained_tps) != args.ticks_per_step:
+        print(f"warning: --ticks-per-step {args.ticks_per_step} differs from the checkpoint's training "
+              f"stride {int(trained_tps)}; the physics will not advance one training step per model step.")
 
     if args.data is not None:
         run_offline(args, config, env, ae_model, ae_cfg, dynamics)

@@ -535,7 +535,12 @@ def main() -> None:
     # Record the RESOLVED hidden width (transition.hidden_dim), not the raw --dyn-hidden which is
     # None when defaulted, so a rebuild reproduces the exact head even if the default later changes.
     dyn_config = {"latent_dim": model.latent_dim, "hidden_dim": transition.hidden_dim,
-                  "depth": args.dyn_depth, "norm": transition.norm}
+                  "depth": args.dyn_depth, "norm": transition.norm,
+                  # Sim-ticks a single dynamics step represents: the dataset's stored-frame spacing
+                  # (traj.stride) times the trajectory frame gap (--step). Recorded so the rollout
+                  # viewer can advance the physics exactly one training step per model step without
+                  # being told the stride on the command line.
+                  "ticks_per_step": traj.stride * args.step}
     n_ae = sum(p.numel() for p in model.parameters())
     n_dyn = sum(p.numel() for p in transition.parameters())
 
