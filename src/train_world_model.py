@@ -207,7 +207,7 @@ def run_epoch(
     model, transition, ema_model, loader, device, optimizer, scaler,
     rec_loss_fn, pred_weight, rec_weight, freeze_ae, ema_decay, max_grad_norm, epoch, tag, log_interval,
     out_activation="none", cov_weight=0.0, rollout_steps=1,
-    reward_head=None, ignited_channel=None, reward_weight=0.0,
+    reward_head=None, ignited_channel=None, reward_weight=0.0, pred_discount=1.0,
 ):
     """One pass over `loader`. Trains when `optimizer` is given, else evaluates (no grad).
 
@@ -238,6 +238,7 @@ def run_epoch(
     gnorm_sum = 0.0
     gnorm_max = 0.0
     gnorm_steps = 0
+    per_step_sum = None      # running n-weighted sum of the per-step cosine loss (len = K); the drift curve
     grad_ctx = torch.enable_grad() if training else torch.no_grad()
     with grad_ctx:
         for step, batch in enumerate(loader):
@@ -262,18 +263,29 @@ def run_epoch(
                 target_encoder = model if ema_model is None else ema_model
                 z_hat = z0
                 pred = 0.0
+                step_losses = []                                   # per-step cosine, for the drift breakdown
                 reward = torch.zeros((), device=device)
+                # Horizon discount: weight training step k by gamma^(k-1) so the well-conditioned near-step
+                # gradient isn't swamped by far-step BPTT noise (flat-averaged long unrolls fail to optimize;
+                # see the K=8 plateau). gamma=1 -> flat mean (unchanged). Applied to TRAINING only: validation
+                # keeps the flat mean so val_pred stays a fixed, comparable metric across every K arm.
+                gamma = pred_discount if training else 1.0
+                wsum = 0.0
                 for k in range(1, K + 1):
                     z_hat = transition(z_hat)                       # unit-norm prediction, fed back in
                     with torch.no_grad():
                         z_tgt = target_encoder.encode(x[:, k])     # EMA, stop-grad; x[:,k] not decoded here
-                    pred = pred + cosine_prediction_loss(z_hat, z_tgt)
+                    step_loss = cosine_prediction_loss(z_hat, z_tgt)
+                    w = gamma ** (k - 1)
+                    pred = pred + w * step_loss
+                    wsum += w
+                    step_losses.append(step_loss)                  # RAW per-step (undiscounted) for the drift curve
                     if reward_head is not None:
                         r_hat = reward_head(z_hat)                  # reward of transition (k-1 -> k)
                         with torch.no_grad():
                             r_tgt = torch.log1p(_newly_ignited(x[:, k - 1], x[:, k], ignited_channel))
                         reward = reward + F.smooth_l1_loss(r_hat, r_tgt)
-                pred = pred / K
+                pred = pred / wsum
                 if reward_head is not None:
                     reward = reward / K
 
@@ -333,14 +345,20 @@ def run_epoch(
             tot_rec += rec.item() * n
             tot_mae += mae.item() * n
             tot_reward += reward.item() * n
+            if step_losses:
+                if per_step_sum is None:
+                    per_step_sum = [0.0] * len(step_losses)
+                for i, sl in enumerate(step_losses):
+                    per_step_sum[i] += sl.item() * n
             seen += n
             if training and log_interval and step % log_interval == 0:
                 print(f"  epoch {epoch:3d} [{tag}] step {step:5d}/{len(loader)}  "
                       f"loss {loss.item():.6f}  pred {pred.item():.6f}  rec {rec.item():.6f}")
 
     denom = max(seen, 1)
+    per_step = [s / denom for s in per_step_sum] if per_step_sum is not None else []
     return (tot / denom, tot_pred / denom, tot_rec / denom, tot_mae / denom,
-            gnorm_sum / max(gnorm_steps, 1), gnorm_max, tot_reward / denom)
+            gnorm_sum / max(gnorm_steps, 1), gnorm_max, tot_reward / denom, per_step)
 
 
 def _trained_params(model, transition, freeze_ae, reward_head=None):
@@ -369,6 +387,17 @@ def main() -> None:
     parser.add_argument("--rollout-steps", type=int, default=1,
                         help="dynamics-head unroll length K (needs window >= K+1); the head is fed its "
                              "own output for K steps and every one of the K+1 frames is reconstructed")
+    parser.add_argument("--val-rollout-steps", type=int, default=None,
+                        help="unroll length used for VALIDATION only (default: same as --rollout-steps). "
+                             "Decouple it (e.g. a fixed 8) so runs trained at different --rollout-steps K are "
+                             "compared on the SAME long-horizon rollout; needs window >= this + 1. The per-step "
+                             "cosine (val_pred_step_NN) is logged so the drift curve is visible.")
+    parser.add_argument("--horizon-discount", type=float, default=1.0,
+                        help="discount gamma for the multi-step prediction loss: training step k is weighted "
+                             "gamma^(k-1) (loss normalized by the weight sum). 1.0 = flat mean (default). "
+                             "<1 down-weights far rollout steps so the well-conditioned near-step gradient "
+                             "dominates -- fixes the flat-averaged long-unroll (large-K) optimization plateau. "
+                             "TRAINING only; validation stays a flat mean so val_pred is comparable across K.")
     parser.add_argument("--val-frac", type=float, default=0.05, help="fraction of episodes held out")
     parser.add_argument("--prewarm", action="store_true", help="stream shards into page cache first")
     # Model
@@ -385,6 +414,11 @@ def main() -> None:
     parser.add_argument("--dyn-depth", type=int, default=2, help="dynamics head hidden layers")
     parser.add_argument("--dyn-hidden", type=int, default=None,
                         help="dynamics head hidden width (default 1024)")
+    parser.add_argument("--dyn-norm", choices=("batchnorm", "layernorm", "none"), default="batchnorm",
+                        help="dynamics-head hidden-layer normalization. BatchNorm (default, historical) "
+                             "blends running stats across rollout depths when the head is unrolled "
+                             "(train/eval mismatch at K>1); LayerNorm is per-sample and depth-invariant, "
+                             "so it is the right choice for multi-step rollouts and for A/Bs that vary K.")
     parser.add_argument("--reward-weight", type=float, default=0.0,
                         help="weight on the one-step reward loss (0 = no reward head); the reward is the "
                              "newly-ignited-cell count, predicted from each rolled-out latent")
@@ -461,8 +495,13 @@ def main() -> None:
               f"python tools/normalize_dataset.py --data {args.data}")
     args._in_channels = int(dataset.meta["num_channels"])
     args._grid_size = int(dataset.meta["grid_size"])
-    if args.window < args.rollout_steps + 1:
-        raise SystemExit(f"--window ({args.window}) must be >= --rollout-steps + 1 ({args.rollout_steps + 1})")
+    # Validation may roll out a different (longer) horizon than training so runs trained at different
+    # K compare on one common long-horizon metric; the window must cover whichever is larger.
+    val_rollout_steps = args.val_rollout_steps if args.val_rollout_steps is not None else args.rollout_steps
+    max_rollout = max(args.rollout_steps, val_rollout_steps)
+    if args.window < max_rollout + 1:
+        raise SystemExit(f"--window ({args.window}) must be >= max(rollout_steps, val_rollout_steps) + 1 "
+                         f"({max_rollout + 1}); train K={args.rollout_steps}, val K={val_rollout_steps}")
     traj = TrajectoryDataset(dataset, num_envs=args.num_envs, window=args.window, step=args.step)
     train_w, val_w = split_episodes(traj, val_frac=args.val_frac, seed=args.seed)
     pin = device.type == "cuda"
@@ -491,12 +530,12 @@ def main() -> None:
             p.requires_grad_(False)
         ema_model.eval()
     transition = LatentTransition(
-        model.latent_dim, hidden_dim=args.dyn_hidden, depth=args.dyn_depth,
+        model.latent_dim, hidden_dim=args.dyn_hidden, depth=args.dyn_depth, norm=args.dyn_norm,
     ).to(device=device, dtype=weight_dtype)
     # Record the RESOLVED hidden width (transition.hidden_dim), not the raw --dyn-hidden which is
     # None when defaulted, so a rebuild reproduces the exact head even if the default later changes.
     dyn_config = {"latent_dim": model.latent_dim, "hidden_dim": transition.hidden_dim,
-                  "depth": args.dyn_depth}
+                  "depth": args.dyn_depth, "norm": transition.norm}
     n_ae = sum(p.numel() for p in model.parameters())
     n_dyn = sum(p.numel() for p in transition.parameters())
 
@@ -604,6 +643,8 @@ def main() -> None:
                 "lr": args.lr, "weight_decay": args.weight_decay, "adam_eps": args.adam_eps,
                 "max_grad_norm": args.max_grad_norm, "amp": scaler is not None,
                 "window": args.window, "step": args.step, "rollout_steps": args.rollout_steps,
+                "val_rollout_steps": val_rollout_steps,
+                "horizon_discount": args.horizon_discount,
                 "val_frac": args.val_frac,
                 "pred_weight": args.pred_weight, "rec_weight": args.rec_weight,
                 "rec_loss": args.rec_loss, "out_activation": args.out_activation,
@@ -643,10 +684,13 @@ def main() -> None:
     resuming_log = args.resume is not None and metrics_path.exists()
     metrics_file = metrics_path.open("a" if resuming_log else "w", newline="")
     metrics_writer = csv.writer(metrics_file)
+    # Per-step validation cosine columns (val_pred_step_01..NN over the val rollout horizon) expose the
+    # drift curve so runs trained at different K are compared step-by-step, not just on the mean val_pred.
+    val_step_cols = [f"val_pred_step_{i:02d}" for i in range(1, val_rollout_steps + 1)]
     if not resuming_log:
         metrics_writer.writerow(["epoch", "train_loss", "train_pred", "train_rec", "train_reward", "train_mae",
                                  "val_loss", "val_pred", "val_rec", "val_reward", "val_mae",
-                                 "grad_norm_mean", "grad_norm_max", "seconds"])
+                                 "grad_norm_mean", "grad_norm_max", "seconds"] + val_step_cols)
 
     # 3. Train ---------------------------------------------------------------
     # best.pt is selected on val_pred (the cosine next-latent loss): it's the world model's actual
@@ -655,17 +699,18 @@ def main() -> None:
     # restored from --resume.)
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_pred, tr_rec, tr_mae, gmean, gmax, tr_rew = run_epoch(
+        tr_loss, tr_pred, tr_rec, tr_mae, gmean, gmax, tr_rew, _ = run_epoch(
             model, transition, ema_model, train_loader, device, optimizer, scaler,
             rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae, args.ema_decay,
             args.max_grad_norm, epoch, "train", args.log_interval, args.out_activation,
             cov_weight=args.cov_weight, rollout_steps=args.rollout_steps,
             reward_head=reward_head, ignited_channel=ignited_channel, reward_weight=args.reward_weight,
+            pred_discount=args.horizon_discount,
         )
-        va_loss, va_pred, va_rec, va_mae, _, _, va_rew = run_epoch(
+        va_loss, va_pred, va_rec, va_mae, _, _, va_rew, va_per_step = run_epoch(
             model, transition, ema_model, val_loader, device, None, None,
             rec_loss_fn, args.pred_weight, args.rec_weight, args.freeze_ae, args.ema_decay,
-            0.0, epoch, "val", 0, args.out_activation, rollout_steps=args.rollout_steps,
+            0.0, epoch, "val", 0, args.out_activation, rollout_steps=val_rollout_steps,
             reward_head=reward_head, ignited_channel=ignited_channel, reward_weight=args.reward_weight,
         )
         dt = time.time() - t0
@@ -675,7 +720,8 @@ def main() -> None:
               f"grad(mean {gmean:.3f} max {gmax:.3f}){rew_str}  ({dt:.1f}s)")
         metrics_writer.writerow([epoch, f"{tr_loss:.6f}", f"{tr_pred:.6f}", f"{tr_rec:.6f}", f"{tr_rew:.6f}",
                                  f"{tr_mae:.6f}", f"{va_loss:.6f}", f"{va_pred:.6f}", f"{va_rec:.6f}",
-                                 f"{va_rew:.6f}", f"{va_mae:.6f}", f"{gmean:.6f}", f"{gmax:.6f}", f"{dt:.2f}"])
+                                 f"{va_rew:.6f}", f"{va_mae:.6f}", f"{gmean:.6f}", f"{gmax:.6f}", f"{dt:.2f}"]
+                                + [f"{v:.6f}" for v in va_per_step])
         metrics_file.flush()
 
         if va_pred < best_pred:
@@ -695,6 +741,7 @@ def main() -> None:
                 "train_reward": tr_rew, "val_reward": va_rew, "best_pred": best_pred,
                 "grad_norm_mean": gmean, "grad_norm_max": gmax,
                 "lr": optimizer.param_groups[0]["lr"], "epoch_seconds": dt,
+                **{col: v for col, v in zip(val_step_cols, va_per_step)},
             }, step=epoch)
 
     metrics_file.close()
