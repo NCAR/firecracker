@@ -85,18 +85,26 @@ model.load_state_dict(ckpt["model_state"])
 ## World model checkpoints
 
 World models (`src/train_world_model.py`), not autoencoders: a dynamics head that predicts the next
-latent, on top of a `conv_bottleneck_256` autoencoder (frozen in the first, trained end-to-end in the
-second). The second also carries a **reward head**.
+latent, on top of a frozen or end-to-end autoencoder. Earlier ones sit on the `conv_bottleneck_256` AE
+(frozen in the first, end-to-end in the next two, the second of which also carries a **reward head**);
+the newest sits on the frozen `pooled-deep11222` 14ch AE.
 
 | File                                            | Base AE                          | In ch | Dtype    | Source run                                          | Best epoch | Val pred (1−cos) |
 |-------------------------------------------------|----------------------------------|------:|----------|-----------------------------------------------------|-----------:|-----------------:|
 | `world_model_convbn256_16ch_best_bf16.pt`       | conv-bottleneck-256 (frozen)     |    16 | bfloat16 | `wm-frozen-convbn256-lr1e3_20260711_000856/run_14`  |         50 | 0.017485 |
 | `world_model_rollout_reward_16ch_best_bf16.pt`  | conv-bottleneck-256 (end-to-end) |    16 | bfloat16 | `wm-bnbce-rollout-reward_20260713_182122/run_00`    |         40 | 0.028538 |
 | `world_model_rollout_ln_16ch_best_bf16.pt`      | conv-bottleneck-256 (end-to-end) |    16 | bfloat16 | `wm-rollout-ln-b128_20260715_014354/run_03`         |         13 | 0.360788† |
+| `wm_dynamics_deep11222_l256_14ch_k4_best_bf16.pt` | pooled-deep11222 (frozen)      |    14 | bfloat16 | `wm-frozen-deep11222-k4_20260718_171731/run_01`     |         19 | 0.000525‡ |
+| `wm_dynamics_deep11222_l256_14ch_k8g05_best_bf16.pt` | pooled-deep11222 (frozen)    |    14 | bfloat16 | `wm-frozen-deep11222-k8-g05_20260718_231007/run_03` |         20 | 0.000524‡ |
+| `wm_ft_deep11222_l256_14ch_k4_fire1_best_bf16.pt` | pooled-deep11222 (**end-to-end**) |  14 | bfloat16 | `wm-ft-huber-k4-fire1_20260719_013718/run_03`       |         16 | 0.002717§ |
 
-† `world_model_rollout_ln`'s value is **not** a cosine-pred loss but the decode-supervised
+‡ `wm_dynamics_deep11222`'s value is the **mean cosine-pred loss over a fixed 8-step rollout**, not a
+single step, so it is not directly comparable to `world_model_convbn256`'s single-step `0.017485`
+(different horizon *and* different AE/dataset). † `world_model_rollout_ln`'s value is **not** a cosine-pred loss but the decode-supervised
 fire-weighted masked BCE over the full 9-step rollout (see its paragraph below); the two world-model
-loss columns are not comparable to each other or to the autoencoders.
+loss columns are not comparable to each other or to the autoencoders. § `wm_ft_deep11222`'s value is
+the decode-supervised fire-weighted masked **Huber** over the K=4 rollout (a regression decoder,
+`out_activation="none"` — **not** logits), so it is not comparable to any column above.
 
 The val "pred" is the cosine next-latent prediction loss `1 − cos(ẑ_{t+1}, sg(z_{t+1}))`, so it is
 **not** comparable to the autoencoders' reconstruction (huber/mse) losses above. The two world models'
@@ -141,7 +149,51 @@ the fire-weighting recipe in `loss_config` (`{w_temp 4, w_wind 3, w_ignited 6, f
 front_dilate 2, temp_pct 99}`). Its dynamics head is wider/deeper than the reward model's
 (`hidden_dim 1024, depth 4`).
 
-Beyond the autoencoder keys, all three files carry `dynamics_state`, `dynamics_config`
+`wm_dynamics_deep11222_l256_14ch_k4_best_bf16.pt` is the best replicate (`run_01`) of the **K=4** arm
+of a rollout-length A/B (`wm-frozen-deep11222-k{1,4,8}`, 8-replicate, 20-epoch, frozen
+`pooled-deep11222` 14ch AE), where the dynamics head is unrolled K steps in training but **every** arm
+is validated on a fixed **8-step** rollout so the `val_pred` is one comparable long-horizon metric.
+K=4 won at `val_pred 0.000525` — lower at every rollout step than K=1 (`0.00068`); the flat-averaged
+K=8 arm failed to optimize (plateaued ~0.0093 as the deep-BPTT far-step gradient swamped near-step
+learning) and only trains once the far steps are down-weighted by a horizon discount (`--horizon-discount`;
+γ=0.5 broke the plateau — see the separate `k8-g05` run). The head is a **LayerNorm** residual MLP
+(`dynamics_config = {latent_dim 256, hidden_dim 1024, depth 3, norm "layernorm", residual, normalize_output}`)
+predicting a unit-sphere next-latent; the frozen AE is the `pooled-deep11222` 14ch min-max model above
+(so `model_state` is that AE unchanged, only `dynamics_state` was trained), with `channel_min`/
+`channel_max`, `signed_channels`, and the 14 `channel_names` carried inline. Trained `float32` + AMP
+(so the on-disk master weights were float32 before the bf16 down-cast); no reward head.
+
+`wm_dynamics_deep11222_l256_14ch_k8g05_best_bf16.pt` is the best replicate (`run_03`, epoch 20) of the
+**K=8 + horizon-discount γ=0.5** run (`wm-frozen-deep11222-k8-g05`, `--horizon-discount 0.5`, otherwise
+identical to the K=4 arm). Background: the flat-averaged K=8 arm and a milder γ=0.8 both *plateaued* at
+val_pred ≈ 0.0093–0.010 — the long-BPTT far-step gradient swamps near-step learning — whereas γ=0.5
+(88% of the loss weight on steps 1–3) broke the plateau and converged all the way down to
+`val_pred 0.000524`. That's **17.7× below** the flat/γ=0.8 plateau and a **statistical dead heat with
+K=4** (0.000524 vs 0.000525; identical `val_pred_step_01..08` drift curves). So the discount *fully
+rescues* long-horizon training, but K=8-discounted does **not** beat the simpler K=4 sweet spot — they
+converge to the same solution. Config, geometry, and provenance are identical to the k4 checkpoint
+(frozen AE, LayerNorm depth-3/1024 unit-sphere head), differing only in `horizon_discount=0.5` and
+`train_rollout_steps=8`.
+
+`wm_ft_deep11222_l256_14ch_k4_fire1_best_bf16.pt` is the first **stage-3** checkpoint: the AE and the
+K=4 head are fine-tuned **end-to-end** (`freeze_ae=False`, `freeze_encoder=False`) in the
+decode-supervised latent-rollout regime (`src/train_world_model_rollout.py`), warm-started from the
+frozen-K=4 world model above. Unlike `world_model_rollout_ln`, the decoder is a **regression** head
+(`out_activation="none"` — `decode()` emits values in ~[0,1] directly, **no sigmoid**) trained with a
+fire-weighted masked **Huber** loss, matching the Huber-trained pooled AE. It is the best replicate
+(`run_03`, epoch 16, val_loss 0.002717) of the **fire1** arm of a fire-weighting grid — moderate
+weights `loss_config = {w_temp 4, w_wind 3, w_ignited 6, front_weight 4, front_dilate 2}`; a 4×-heavier
+**fire3** arm scored slightly *worse*. **Caveat — this model does not beat persistence.** Every
+replicate of both arms stayed at **IDENTITY** for all 20 epochs: best dynamic-channel MAE ≈ **0.0115**
+vs the copy-previous-frame baseline **0.0038** (~3× worse). It reconstructs and its static channels are
+sharp, but fire-weighting alone did not dislodge the identity collapse on these low-change trajectories.
+It is saved for **rollout-viewer inspection** (`tools/rollout_viewer.py --model
+models/wm_ft_deep11222_l256_14ch_k4_fire1_best_bf16.pt`) to see what the fine-tune actually learned, not
+as a capability win. Head geometry and inline normalization (`channel_min`/`channel_max`,
+`signed_channels`, 14 `channel_names`) match the k4 checkpoint; `model_config` also records `latent_bn`
+and `warm_started_from`.
+
+Beyond the autoencoder keys, all six files carry `dynamics_state`, `dynamics_config`
 (`{latent_dim, hidden_dim, depth, ...}`, with `hidden_dim` resolved to its actual width), and
 `freeze_ae`. `world_model_rollout_reward` additionally carries `reward_state` + `reward_config`
 (`{latent_dim, hidden_dim, depth, ignited_channel}`); `world_model_rollout_ln` has **no** reward head,
