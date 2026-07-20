@@ -256,22 +256,25 @@ heat_of_combustion     = 1.9e7   # HHV [J/kg]: resinous/waxy extractives -> ener
 stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]: lignocellulosic, same as the other fuels
 arrhenius_pre          = 8.0e7   # B [kg/(m^2*s)]: eager kinetics near the canopy's 1.0e8, above the bole's 5.0e7
 activation_energy      = 1.0e5   # E_a [J/mol]: ignites readily, same gate as grass/canopy (not the bole's higher 1.1e5)
-surface_area_to_volume = 4000.0  # sigma [1/m]: foliage + small woody stems -> below grass (12000) and just under the canopy (5000); a_s = 8
+surface_area_to_volume = 4000.0  # sigma [1/m]: foliage + small woody stems -> below both grass (12000) and the fine canopy (10000); a_s = 8
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 10.0    # k [W/(m^2*K)]: between the fine canopy (12) and the coarse bole (8)
 noise_scale            = 110.0   # spatial scale for Perlin noise: large -> shrub forms big patches rather than fine speckle
 noise_floor            = 0.35    # remap the [0,1] noise to [floor,1] so sparse shrub gaps keep a base loading rather than going bare
 spawn_density          = 0.8     # peak shrub loading [kg/m^2] (scales the [0,1] noise)
 
-# A tree is modelled as two co-located fuel types (Phase 6b): a light, high-SAV CANOPY (foliage,
-# twigs, bark) that ignites readily from a passing front and carries the flame, and a heavy, low-SAV
-# BOLE (trunk, big limbs) that holds most of the mass and burns slowly for minutes once the canopy
-# heat lights it. Both spawn from the same per-cell tree count (gen_maps), so they always share a
-# cell; the shared spatial params (noise_scale/max_trees_per_cell) are read from the first tree
-# component (tree_canopy) and must match. The per-cell tree *density* is not a fuel param any more:
-# it is set per biome in [biomes] (dense woodland, sparse grassland, slope-ramped shrubland), so trees
-# carry no slope_preference/slope_falloff/spawn_density. fuel_per_tree splits the per-tree biomass
-# between the two components (0.7 + 4.3 = 5.0 kg/m^2 per tree, same total as the old single tree type).
+# A tree is modelled as THREE co-located fuel types (Phase 6b + vertical air levels): a light,
+# high-SAV CANOPY (foliage, twigs, bark) that carries the crown flame, and the trunk split into two
+# stacked BOLE segments -- tree_bole_surface (0-5 m) and tree_bole_canopy (5-15 m) -- so fire can
+# climb the trunk from the surface into the crown (the ladder). For now both segments are identical
+# coarse wood on the single air level; the per-level air coupling (surface-bole -> level 0,
+# canopy-bole -> level 1) and the fast-up/slow-down segment conduction land in the vertical-levels
+# phases. All spawn from the same per-cell tree count (gen_maps: any fuel whose name starts with
+# "tree"), so they always share a cell; the shared spatial params (noise_scale/max_trees_per_cell)
+# are read from the first tree component (tree_canopy) and must match. The per-cell tree *density* is
+# set per biome in [biomes]. fuel_per_tree splits the per-tree biomass across the components
+# (0.7 canopy + 1.43 surface-bole + 2.87 canopy-bole = 5.0 kg/m^2 per tree, the same total as before;
+# the bole's 4.3 split 1/3 : 2/3 by segment height, the lower trunk being shorter than the crown).
 
 [fuel_types.tree_canopy]
 specific_heat          = 2300.0  # SI specific heat [J/(kg*K)] (wood)
@@ -280,25 +283,45 @@ heat_of_combustion     = 1.8e7   # HHV [J/kg]
 stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]
 arrhenius_pre          = 1.0e8   # B [kg/(m^2*s)]: eager kinetics, like grass
 activation_energy      = 1.0e5   # E_a [J/mol]: low -> ignites readily
-surface_area_to_volume = 5000.0  # sigma [1/m]: fine canopy fuel -> high surface -> fast ignite/burn (a_s = 10)
+surface_area_to_volume = 10000.0 # sigma [1/m]: fine leaf/twig fuel burns at near-grass rates (grass is 12000), so keep it close to grass parity; a_s = 20. Higher speeds the canopy flash and shortens its flaming window, so the bole catches later (~50 s vs ~28 s at 5000) but still ignites and self-sustains -- verified down to full grass parity (12000). Do not push much past 12000 without re-checking the bole catches.
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 12.0    # k [W/(m^2*K)]: well-coupled fine fuel
 noise_scale            = 150.0   # spatial scale for Perlin noise: large -> trees gather into big stands with wide gaps (tree spatial distribution; read from this first tree component)
 fuel_per_tree          = 0.7     # fine-fuel loading per tree [kg/m^2] (4 trees -> 2.8 kg/m^2)
 max_trees_per_cell     = 4       # hard cap on the per-cell tree count
 
-[fuel_types.tree_bole]
+# Surface bole segment (0-5 m): the lower trunk, co-located with the ground fuels. In the
+# vertical-levels phases it couples to the surface air (level 0) and catches from the surface fire,
+# then conducts fire up to the canopy bole. Coarse wood, same kinetics as the old single bole.
+[fuel_types.tree_bole_surface]
 specific_heat          = 2300.0  # SI specific heat [J/(kg*K)] (wood)
 ignition_threshold     = 600.0   # pyrolysis onset temperature [K]
 heat_of_combustion     = 1.8e7   # HHV [J/kg]
 stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]
 arrhenius_pre          = 5.0e7   # B [kg/(m^2*s)]: surface kinetic-flux pre-exponential
 activation_energy      = 1.1e5   # E_a [J/mol]: higher than the canopy -> ignites less readily
-surface_area_to_volume = 500.0   # sigma [1/m]: coarse branch/limb wood (a_s=1). Tuned: below ~500 the bole never catches before the canopy burns out; above ~1000 its reactive surface re-hogs the ignition deposit and re-quenches the grass front. 500 -> bole lights and burns ~slowly (~1-2 min) over its heavy load
+surface_area_to_volume = 500.0   # sigma [1/m]: coarse branch/limb wood (a_s=1). 500 -> bole lights and burns ~slowly (~1-2 min) over its heavy load
 particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
 fuel_air_transfer_rate = 8.0     # k [W/(m^2*K)]
 noise_scale            = 150.0   # must match tree_canopy (shared tree spatial distribution)
-fuel_per_tree          = 4.3     # coarse-fuel loading per tree [kg/m^2] (4 trees -> 17.2 kg/m^2)
+fuel_per_tree          = 1.43    # lower-trunk loading per tree [kg/m^2] (1/3 of the 4.3 bole; 4 trees -> 5.72 kg/m^2)
+max_trees_per_cell     = 4
+
+# Canopy bole segment (5-15 m): the upper trunk and big limbs within the crown. In the
+# vertical-levels phases it couples to the canopy air (level 1) and only catches once the surface
+# bole conducts fire up the trunk -- the mechanism that lets a crown fire form. Same coarse wood.
+[fuel_types.tree_bole_canopy]
+specific_heat          = 2300.0  # SI specific heat [J/(kg*K)] (wood)
+ignition_threshold     = 600.0   # pyrolysis onset temperature [K]
+heat_of_combustion     = 1.8e7   # HHV [J/kg]
+stoich_oxygen          = 1.4     # s [kg O2 / kg fuel]
+arrhenius_pre          = 5.0e7   # B [kg/(m^2*s)]: surface kinetic-flux pre-exponential
+activation_energy      = 1.1e5   # E_a [J/mol]: higher than the canopy -> ignites less readily
+surface_area_to_volume = 500.0   # sigma [1/m]: coarse branch/limb wood (a_s=1)
+particle_density       = 500.0   # rho_p [kg/m^3]: solid material density (a_s = sigma/rho_p)
+fuel_air_transfer_rate = 8.0     # k [W/(m^2*K)]
+noise_scale            = 150.0   # must match tree_canopy (shared tree spatial distribution)
+fuel_per_tree          = 2.87    # upper-trunk + limb loading per tree [kg/m^2] (2/3 of the 4.3 bole; 4 trees -> 11.48 kg/m^2)
 max_trees_per_cell     = 4
 
 [radiant_heat]

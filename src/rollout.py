@@ -275,13 +275,13 @@ class BatchedRollout:
 
         self._state = SimState(
             mass=mass,
-            air_temperatures=air,
+            air_temperatures=air.unsqueeze(-3),    # air level axis (-3); L = 1 in Phase 1
             ground_temperature=stack("temp_eq"),   # surface skin starts at the rest profile
             fuel_temperatures=stack("fuel_temperatures"),
             fuel=stack("fuel"),
             oxygen=stack("oxygen"),
             terrain=terrain,
-            temp_eq=stack("temp_eq"),
+            temp_eq=stack("temp_eq").unsqueeze(-3),
             oxygen_eq=stack("oxygen_eq"),
             mass_eq=stack("mass_eq"),
             x_wind_vel=x_wind,
@@ -310,7 +310,8 @@ class BatchedRollout:
         patch = (rows - r0) ** 2 + (cols - c0) ** 2 <= self._fire_radius ** 2   # (B, N, N)
 
         ign_max = float(self._sim.ignition_thresholds.max())
-        s.air_temperatures = torch.where(patch, torch.full_like(s.air_temperatures, ign_max * 2.0), s.air_temperatures)
+        patch_air = patch.unsqueeze(-3)   # broadcast over the air level axis (surface ignition)
+        s.air_temperatures = torch.where(patch_air, torch.full_like(s.air_temperatures, ign_max * 2.0), s.air_temperatures)
         for t in range(self._sim.num_fuel_types):
             ign_t = float(self._sim.ignition_thresholds[t])
             s.fuel_temperatures[:, t] = torch.where(patch, torch.full_like(s.fuel_temperatures[:, t], ign_t * 2.0), s.fuel_temperatures[:, t])

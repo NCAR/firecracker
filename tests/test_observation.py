@@ -35,7 +35,7 @@ def _obs(fuel_temperatures, fuel, terrain, wind_x=None, wind_y=None,
         n_fuel = fuel_temperatures.shape[-3]
         ignition_thresholds = torch.full((n_fuel, 1, 1), IGN_DEFAULT, dtype=fuel_temperatures.dtype)
     return Simulation.build_observation(
-        air_temperatures, fuel_temperatures, fuel, terrain, wind_x, wind_y,
+        air_temperatures.unsqueeze(-3), fuel_temperatures, fuel, terrain, wind_x, wind_y,
         ignition_thresholds,
     )
 
@@ -178,7 +178,7 @@ def test_env_observation_matches_world_model(make_env):
     assert env.observation_space.contains(obs)
     # The env observation is build_observation cropped to the observed interior, so crop expected.
     expected = env._crop(Simulation.build_observation(
-        env._air_temperatures, env._fuel_temperatures, env._fuel, env._terrain,
+        env._air_temperatures.unsqueeze(-3), env._fuel_temperatures, env._fuel, env._terrain,
         env._x_wind_fire, env._y_wind_fire, env._sim.ignition_thresholds,
         env._sim.cell_size_m,
     )).detach().cpu().numpy().astype("float32")
@@ -186,7 +186,7 @@ def test_env_observation_matches_world_model(make_env):
 
     step_obs, *_ = env.step(0)
     step_expected = env._crop(Simulation.build_observation(
-        env._air_temperatures, env._fuel_temperatures, env._fuel, env._terrain,
+        env._air_temperatures.unsqueeze(-3), env._fuel_temperatures, env._fuel, env._terrain,
         env._x_wind_fire, env._y_wind_fire, env._sim.ignition_thresholds,
         env._sim.cell_size_m,
     )).detach().cpu().numpy().astype("float32")

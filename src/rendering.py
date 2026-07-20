@@ -40,8 +40,10 @@ GREEN_CHANNEL: int = 1
 # types fall back to plain green.
 VEGETATION_COLORS: dict[str, tuple[float, float, float]] = {
     "tree":        (0.0,  1.0, 0.0),   # green
-    "tree_canopy": (0.0,  1.0, 0.0),   # green (a tree's fine fuel)
-    "tree_bole":   (0.5,  0.4, 0.3),   # brown (a tree's coarse fuel); only shown through a thin canopy
+    "tree_canopy":        (0.0,  1.0, 0.0),   # green (a tree's fine fuel)
+    "tree_bole":          (0.5,  0.4, 0.3),   # brown (a tree's coarse fuel); only shown through a thin canopy
+    "tree_bole_surface":  (0.5,  0.4, 0.3),   # brown (lower-trunk segment)
+    "tree_bole_canopy":   (0.5,  0.4, 0.3),   # brown (upper-trunk segment)
     "grass":       (0.75, 1.0, 0.0),   # yellow-green
     "shrub":       (0.5,  0.75, 0.25), # muted olive-green (woody scrub)
 }
@@ -464,7 +466,7 @@ def build_fire_surface(
     # (per-cell, not a map-wide peak). While the canopy is still fuller than that it occludes the
     # bole, so zero the bole's contribution there. Needs the map's original canopy load; without
     # it the bole just blends in normally.
-    bole_idx = [i for i, n in enumerate(fuel_type_names) if n == "tree_bole"]
+    bole_idx = [i for i, n in enumerate(fuel_type_names) if n.startswith("tree_bole")]
     canopy_idx = [i for i, n in enumerate(fuel_type_names) if n == "tree_canopy"]
     if bole_idx and canopy_idx and initial_canopy_fuel is not None:
         canopy_now = fuel[canopy_idx].sum(axis=0)                    # (H, W) current canopy load

@@ -798,13 +798,13 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
         amb_y = t([m.ambient_wind_y for m in batch]).view(-1, 1, 1)
         s = SimState(
             mass=mass,
-            air_temperatures=air,
+            air_temperatures=air.unsqueeze(-3),        # air level axis (-3); L = 1 in Phase 1
             ground_temperature=air.clone(),
             fuel_temperatures=torch.stack([t(m.fuel_temperatures) for m in batch]),
             fuel=torch.stack([t(m.fuel) for m in batch]),
             oxygen=torch.stack([t(m.oxygen) for m in batch]),
             terrain=terrain,
-            temp_eq=air.clone(),                                    # rest temperature (sponge target)
+            temp_eq=air.clone().unsqueeze(-3),                     # rest temperature (sponge target)
             oxygen_eq=torch.stack([t(m.oxygen) for m in batch]),
             mass_eq=mass.clone(),                                   # level-lid rest mass (sponge target)
             x_wind_vel=torch.zeros_like(mass) + amb_x,
@@ -826,7 +826,7 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
             sim.step_fields(s, advance_oxygen=False, advance_fire=False)
 
         dev_mass = s.mass.cpu().numpy()
-        dev_air  = s.air_temperatures.cpu().numpy()
+        dev_air  = s.air_temperatures.select(-3, 0).cpu().numpy()   # surface level -> (B, H, W)
         dev_u    = s.x_wind_vel.cpu().numpy()
         dev_v    = s.y_wind_vel.cpu().numpy()
         for i, m in enumerate(batch):

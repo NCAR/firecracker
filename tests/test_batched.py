@@ -45,10 +45,10 @@ def _batched_state(sim: Simulation, maps) -> SimState:
     u_amb_y = torch.as_tensor([m.ambient_wind_y for m in maps], dtype=sim.dtype, device=sim.device).view(-1, 1, 1)
     x_wind, y_wind = torch.zeros_like(mass) + u_amb_x, torch.zeros_like(mass) + u_amb_y
     return SimState(
-        mass=mass, air_temperatures=air, ground_temperature=stack("temp_eq"),
+        mass=mass, air_temperatures=air.unsqueeze(-3), ground_temperature=stack("temp_eq"),
         fuel_temperatures=stack("fuel_temperatures"), fuel=stack("fuel"),
         oxygen=stack("oxygen"), terrain=terrain,
-        temp_eq=stack("temp_eq"), oxygen_eq=stack("oxygen_eq"), mass_eq=mass.clone(),
+        temp_eq=stack("temp_eq").unsqueeze(-3), oxygen_eq=stack("oxygen_eq"), mass_eq=mass.clone(),
         x_wind_vel=x_wind, y_wind_vel=y_wind,
         u_amb_x=u_amb_x, u_amb_y=u_amb_y, radiant_flux=torch.zeros_like(mass),
     )
@@ -70,7 +70,7 @@ def test_batched_b1_matches_single_world(make_env):
         env.step(0)
 
     for batched, single in (
-        (s.mass, env._mass), (s.air_temperatures, env._air_temperatures),
+        (s.mass, env._mass), (s.air_temperatures.select(-3, 0), env._air_temperatures),
         (s.oxygen, env._oxygen), (s.fuel_temperatures, env._fuel_temperatures),
     ):
         np.testing.assert_allclose(to_numpy(batched)[0], to_numpy(single), rtol=1e-5, atol=1e-6)
@@ -109,14 +109,14 @@ def test_batched_conserves_mass_energy_per_world():
 
     axes = (-2, -1)   # reduce each world's H, W, leaving the batch axis
     m0 = s.mass.sum(dim=axes)
-    e0 = (s.mass * s.air_temperatures).sum(dim=axes)
+    e0 = (s.mass * s.air_temperatures.select(-3, 0)).sum(dim=axes)
     o0 = s.oxygen.sum(dim=axes)
     for _ in range(25):
         sim.step_fields(s)
 
     assert torch.isfinite(s.air_temperatures).all()
     np.testing.assert_allclose(to_numpy(s.mass.sum(dim=axes)), to_numpy(m0), rtol=1e-4)
-    np.testing.assert_allclose(to_numpy((s.mass * s.air_temperatures).sum(dim=axes)), to_numpy(e0), rtol=1e-4)
+    np.testing.assert_allclose(to_numpy((s.mass * s.air_temperatures.select(-3, 0)).sum(dim=axes)), to_numpy(e0), rtol=1e-4)
     np.testing.assert_allclose(to_numpy(s.oxygen.sum(dim=axes)), to_numpy(o0), rtol=1e-4)
 
 
@@ -134,7 +134,7 @@ def test_build_observation_shape_and_channels():
     ign = torch.tensor([500.0, 600.0]).view(len(names), 1, 1)   # per-type ignition thresholds [K]
 
     obs = Simulation.build_observation(
-        air_temps, fuel_temps, fuel, terrain, wind_x, wind_y, ign
+        air_temps.unsqueeze(-3), fuel_temps, fuel, terrain, wind_x, wind_y, ign
     )
 
     def norm(channel, raw):

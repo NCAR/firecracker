@@ -93,6 +93,25 @@ class SimState:
     y_wind_fire:       torch.Tensor | None = None
 
 
+# --- Vertical air levels (Phase 1) -------------------------------------------------------------
+# air_temperatures and temp_eq carry a level axis on -3 (mirroring the fuel stack): (..., L, H, W).
+# Level 0 is the surface air. Until the fuel stages and dynamics go per-level (Phases 2-3), every
+# stage still reads/writes only the surface level through these two helpers, so the physics is
+# unchanged for L = 1.
+def _surface_level(stack: torch.Tensor) -> torch.Tensor:
+    """The surface (level-0) (..., H, W) view of a (..., L, H, W) air/temp stack."""
+    return stack.select(-3, 0)
+
+
+def _with_surface(stack: torch.Tensor, new_surface: torch.Tensor) -> torch.Tensor:
+    """Return `stack` with its surface level replaced by `new_surface` (..., H, W)."""
+    if stack.shape[-3] == 1:
+        return new_surface.unsqueeze(-3)
+    return torch.cat(
+        [new_surface.unsqueeze(-3), stack.narrow(-3, 1, stack.shape[-3] - 1)], dim=-3
+    )
+
+
 def _resolve_device(name: str | None) -> torch.device:
     """Pick the compute device: an explicit config value wins, else CUDA if present."""
     if name:
@@ -609,12 +628,26 @@ class Simulation:
         dx, dt = self.cell_size_m, self.dt
         g_prime, C_d, nu = self.reduced_gravity, self.drag_coeff, self.viscosity
 
-        m, T = s.mass, s.air_temperatures
+        # Multi-level buoyancy, lean form (Phase 1, sub-area 2). The surface air field carries the
+        # whole modelled air temperature (advected/conserved with the full mass as before), but only
+        # the shallow combustion-plume slab of a super-ambient anomaly is *buoyant*: a fire lifts a
+        # rho*plume_mixing_depth slab, not the full ~1.5 km boundary-layer column. So the anomaly's
+        # contribution to the column thickness uses m_plume, while the rest-temperature baseline
+        # keeps the full mass -- eta = (R_d/p_ref)*(m_plume*(T - T_rest) + m_total*T_rest). This
+        # removes the ~15x fire-wind over-count (Phase 0 spike / design doc) without touching the
+        # orographic wind (uniform-T, mass-driven: T == T_rest so eta == m_total*R_d*T_rest/p_ref,
+        # unchanged) or mass/energy conservation (advection below is untouched). The 5 m/10 m level
+        # split and fully-advected per-level state land in Phase 3, where the canopy level first
+        # differs from the surface; here m_plume matches how update_fire heats the surface air.
+        m, T = s.mass, _surface_level(s.air_temperatures)
         u, v = s.x_wind_vel, s.y_wind_vel
+        T_rest  = _surface_level(s.temp_eq)
+        m_plume = pc.RHO_REF * self.plume_mixing_depth
+        eta_of  = lambda m_, T_: (m_plume * (T_ - T_rest) + m_ * T_rest) * R_d / p_ref
 
         # Substep count from the worst-case Courant number: advective speed |u| plus the
-        # gravity-wave speed c = sqrt(g'*eta).
-        eta = m * R_d * T / p_ref
+        # gravity-wave speed c = sqrt(g'*eta), eta the total column thickness.
+        eta = eta_of(m, T)
         wave = float(torch.sqrt((g_prime * eta).clamp(min=0.0)).max())
         flow = float((u.abs() + v.abs()).max())
         courant = (flow + wave) * dt / dx
@@ -622,7 +655,7 @@ class Simulation:
         dts = dt / n
 
         for _ in range(n):
-            eta = m * R_d * T / p_ref
+            eta = eta_of(m, T)
             surface = s.terrain + eta
             gx, gy = self._periodic_grad(surface, dx)
             # Forcing: -g'*grad(s) (terrain + buoyancy), weak surface friction, eddy viscosity.
@@ -649,9 +682,10 @@ class Simulation:
         u = s.u_amb_x + (u - s.u_amb_x) * decay
         v = s.u_amb_y + (v - s.u_amb_y) * decay
         m = s.mass_eq + (m - s.mass_eq) * decay
-        T = s.temp_eq + (T - s.temp_eq) * decay
+        T = _surface_level(s.temp_eq) + (T - _surface_level(s.temp_eq)) * decay
 
-        s.mass, s.air_temperatures, s.x_wind_vel, s.y_wind_vel = m, T, u, v
+        s.mass, s.x_wind_vel, s.y_wind_vel = m, u, v
+        s.air_temperatures = _with_surface(s.air_temperatures, T)
         return s
 
     def _cover_fractions(self, fuel: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1066,16 +1100,24 @@ class Simulation:
             v_fire = s.y_wind_vel * s.channel_gain
         s.x_wind_fire, s.y_wind_fire = u_fire, v_fire
 
+        # The fuel-coupling stages are still single-level (Phase 1): they read/write only the surface
+        # air level via _surface_level / _with_surface, so the physics is identical for L = 1. Phases
+        # 2-3 make them per-level. temp_eq is likewise a level stack; its surface level is the anchor.
+        temp_eq0 = _surface_level(s.temp_eq)
+
         # Surface radiative energy balance: sun warms the ground/fuel skin, longwave cools it,
         # and the ground sheds sensible heat to the air (which is transparent to radiation).
         if self.radiation_enabled:
-            s.air_temperatures, s.fuel_temperatures, s.ground_temperature = self.apply_radiation(
-                s.air_temperatures, s.ground_temperature, s.fuel_temperatures, s.fuel, s.mass, s.temp_eq
+            air0, s.fuel_temperatures, s.ground_temperature = self.apply_radiation(
+                _surface_level(s.air_temperatures), s.ground_temperature,
+                s.fuel_temperatures, s.fuel, s.mass, temp_eq0
             )
+            s.air_temperatures = _with_surface(s.air_temperatures, air0)
 
-        s.air_temperatures, s.fuel_temperatures = self.exchange_fuel_air_heat(
-            s.air_temperatures, s.fuel_temperatures, s.fuel, s.mass
+        air0, s.fuel_temperatures = self.exchange_fuel_air_heat(
+            _surface_level(s.air_temperatures), s.fuel_temperatures, s.fuel, s.mass
         )
+        s.air_temperatures = _with_surface(s.air_temperatures, air0)
 
         # Oxygen transport (advection + diffusion + replenishment). Passive -- it never feeds back
         # into mass/wind/air -- so a spin-up that only bakes those can skip it (advance_oxygen).
@@ -1087,13 +1129,14 @@ class Simulation:
                 s.oxygen = self.relax_to_equilibrium(s.oxygen, s.oxygen_eq, self.oxygen_rate)
 
         if advance_fire and self.fire_enabled:
-            s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
-                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
+            air0, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
+                _surface_level(s.air_temperatures), s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
                 u_fire, v_fire, s.terrain,
             )
+            s.air_temperatures = _with_surface(s.air_temperatures, air0)
             if self.radiant_heat_enabled:
                 s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
-                    s.fuel_temperatures, s.fuel, s.temp_eq
+                    s.fuel_temperatures, s.fuel, temp_eq0
                 )
 
         # Vent the plume air-share heat upward out of the shallow slab (the air-temperature sink):
@@ -1101,7 +1144,8 @@ class Simulation:
         # heat accumulates without bound. Gated by its own toggle (independent of fire), so the closed
         # conservation core can switch it off; one-directional, so on a quiescent world it is a no-op.
         if self.venting_enabled:
-            s.air_temperatures = self.vent_plume_heat(s.air_temperatures, s.temp_eq)
+            air0 = self.vent_plume_heat(_surface_level(s.air_temperatures), temp_eq0)
+            s.air_temperatures = _with_surface(s.air_temperatures, air0)
 
         return s
 
@@ -1149,7 +1193,7 @@ class Simulation:
         # the spread physics reads (see update_fire), so the observation exposes exactly that signal.
         slope_x, slope_y = Simulation._periodic_grad(terrain, cell_size_m)
         channels = [
-            air_temperatures,                   # air_temperature: near-surface air temperature
+            *air_temperatures.unbind(dim=-3),   # air_temperature[_<level>]: per-level air temperature
             *fuel_temperatures.unbind(dim=-3),  # fuel_temperature_<type>: per-type temperature
             *fuel.unbind(dim=-3),               # fuel_<type>: per-type vegetation mass
             slope_x,                            # slope_x: terrain slope d/dx (signed, uphill +)

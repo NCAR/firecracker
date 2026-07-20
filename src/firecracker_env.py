@@ -345,7 +345,7 @@ class FirecrackerEnv(gymnasium.Env):
         Identical to what BatchedRollout.observe collects, including the near-surface fire wind
         (prognostic wind x channeling gain) used by the spread physics."""
         obs = Simulation.build_observation(
-            self._air_temperatures, self._fuel_temperatures, self._fuel, self._terrain,
+            self._air_temperatures.unsqueeze(-3), self._fuel_temperatures, self._fuel, self._terrain,
             self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel,
             self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel,
             self._sim.ignition_thresholds, self._sim.cell_size_m,
@@ -833,13 +833,15 @@ class FirecrackerEnv(gymnasium.Env):
         """Bundle this (single-world) env's fields into a SimState for step_fields."""
         return SimState(
             mass=self._mass,
-            air_temperatures=self._air_temperatures,
+            # Add the air level axis (-3) at the SimState boundary; the env keeps surface-level
+            # (H, W) fields internally (Phase 1, L = 1).
+            air_temperatures=self._air_temperatures.unsqueeze(-3),
             ground_temperature=self._ground_temperature,
             fuel_temperatures=self._fuel_temperatures,
             fuel=self._fuel,
             oxygen=self._oxygen,
             terrain=self._terrain,
-            temp_eq=self._temp_eq,
+            temp_eq=self._temp_eq.unsqueeze(-3),
             oxygen_eq=self._oxygen_eq,
             mass_eq=self._mass_eq,
             x_wind_vel=self._x_wind_vel,
@@ -855,7 +857,7 @@ class FirecrackerEnv(gymnasium.Env):
     def _store_field_state(self, s: SimState) -> None:
         """Write a stepped SimState's mutable fields back onto the env attributes."""
         self._mass              = s.mass
-        self._air_temperatures  = s.air_temperatures
+        self._air_temperatures  = s.air_temperatures.select(-3, 0)   # drop the level axis (surface)
         self._ground_temperature = s.ground_temperature
         self._fuel_temperatures = s.fuel_temperatures
         self._fuel              = s.fuel

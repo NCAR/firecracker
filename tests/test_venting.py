@@ -95,9 +95,9 @@ def _sustained_fire_peak_air(venting: bool, grid: int = 96, half: int = 30, tick
     zero = torch.zeros((1, 1), dtype=sim.dtype, device=sim.device)
 
     s = SimState(
-        mass=t(mass), air_temperatures=t(air), ground_temperature=t(air),
+        mass=t(mass), air_temperatures=t(air).unsqueeze(-3), ground_temperature=t(air),
         fuel_temperatures=fuel_t, fuel=fuel, oxygen=t(oxygen), terrain=t(terrain),
-        temp_eq=t(air), oxygen_eq=t(oxygen), mass_eq=t(mass),
+        temp_eq=t(air).unsqueeze(-3), oxygen_eq=t(oxygen), mass_eq=t(mass),
         x_wind_vel=torch.zeros_like(t(mass)), y_wind_vel=torch.zeros_like(t(mass)),
         u_amb_x=zero, u_amb_y=zero, radiant_flux=torch.zeros_like(t(mass)),
     )
