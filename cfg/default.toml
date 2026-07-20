@@ -115,6 +115,25 @@ rate    = 0.2     # lambda [1/s]: venting rate (~ updraft / plume depth). Raised
                   # cells; 0.2 bounds the plume to a physical ~2200 K flame. Real intense fires drive
                   # stronger updrafts, so a higher sink for higher intensity is physically consistent.
 
+[air_levels]
+# Vertical air structure (see docs/vertical_air_levels_plan.md). The near-surface air resolves into
+# stacked slabs: surface (0-5 m) and canopy (5-15 m), plus the above-canopy remainder. `depths` are
+# the two resolved slab depths [m]; the third (above-canopy) level uses `above_depth`. Each fuel
+# couples only to its level's thin slab (thermal mass rho_ref*depth*cp), so a burn warms that slab
+# strongly. Heat then moves *upward* between levels by the inter-level convection (rate proportional
+# to the super-adiabatic gap, exact-exponential and self-limiting) and is finally shed by the
+# above-canopy energy-anomaly vent -- the only sink. transfer_rate must be brisk enough that surface
+# heat reaches the top vent before it accumulates (the surface level lost its own vent in the vertical
+# split; its remaining sinks are the edge sponge + this upward transfer).
+depths        = [5.0, 10.0]  # surface (0-5 m) and canopy (5-15 m) slab depths [m]
+above_depth   = 100.0        # above-canopy slab depth [m]: sets its heat capacity / vent diagnostic T
+transfer_rate = 0.5          # lambda [1/s]: inter-level upward-convection gap-relaxation rate (exact-
+                             # exp). The (T_lower-T_upper) gap decays by exp(-lambda*dt); heat splits
+                             # conservatively by slab capacity. Brisk (10x the vent rate) so surface
+                             # combustion heat is carried up to the above-canopy vent before it piles.
+                             # Stage-1 placeholder; Phase 4 re-tunes it against the ROS/crowning targets.
+enabled       = true         # if false, skip the inter-level convection stage
+
 [momentum]
 # Shallow boundary-layer orographic wind (see docs/units.md). The wind is prognostic
 # [m/s], forced by the free-surface gradient -g'*grad(s), s = terrain + eta with the layer

@@ -242,10 +242,17 @@ class Simulation:
         # depths [m]; the third level is the rest of the boundary-layer column. Level 0 is the surface.
         # Phase 1 keeps the dynamics/buoyancy and fuel coupling on the surface level; Phase 2 splits the
         # fuel<->air coupling across levels (see fuel_levels below).
+        air_levels = (cfg or {}).get("air_levels", {})
         self.air_level_depths: tuple[float, ...] = tuple(
-            float(x) for x in (cfg or {}).get("air_levels", {}).get("depths", (5.0, 10.0))
+            float(x) for x in air_levels.get("depths", (5.0, 10.0))
         )
         self.num_air_levels: int = len(self.air_level_depths) + 1
+        # Above-canopy slab depth [m] (the deep remainder that vents to space). Only fuel-free levels
+        # use it, so its exact value affects the vent's diagnostic temperature, not any fuel coupling.
+        self.air_above_depth:  float = float(air_levels.get("above_depth", 100.0))
+        # Inter-level upward convection: gap-relaxation rate lambda [1/s] and its toggle (convect_air_levels).
+        self.air_transfer_rate: float = float(air_levels.get("transfer_rate", 0.5))
+        self.air_convection_enabled: bool = bool(air_levels.get("enabled", True))
         # Convective fire spread (Phase 5.5c). Radiation preheats the fuel ahead but is too weak to
         # ignite a neighbour at realistic flame temperatures, so ignition is carried by convection: a
         # fraction of the plume's air-share heat is convected to nearby fuel to ignite it (hot plume
@@ -290,6 +297,22 @@ class Simulation:
         self.fuel_levels: list[int] = [
             1 if "canopy" in n else 0 for n in self.fuel_type_names
         ]
+        # Precompute for the per-level fuel<->air coupling (exchange_fuel_air_heat): the fuel->level
+        # map as an index tensor for index_select/index_add_, and each air level's heat capacity
+        # C = rho_ref*depth*cp_air [J/(m^2*K)] over the thin slab it represents. The surface (5 m) and
+        # canopy (10 m) slabs are ~5.83 and ~11.65 kg/m^2 -- ~300x lighter than the full ~1747 kg/m^2
+        # boundary-layer column the old single-level coupling used -- so a fuel warms *its* level's air
+        # strongly and directly; the above-canopy level holds the deep remainder and only vents.
+        self._fuel_level_index: torch.Tensor = torch.tensor(
+            self.fuel_levels, dtype=torch.long, device=self.device
+        )
+        level_depths = torch.tensor(
+            list(self.air_level_depths) + [self.air_above_depth],
+            dtype=self.dtype, device=self.device,
+        )
+        self._air_level_capacity: torch.Tensor = (
+            pc.RHO_REF * level_depths * pc.CP_AIR
+        ).view(-1, 1, 1)   # (L, 1, 1) [J/(m^2*K)]
 
         def _ft(name: str, key: str, default: float) -> float:
             return float(fuel_types_cfg.get(name, {}).get(key, default))
@@ -793,23 +816,70 @@ class Simulation:
         decay = torch.exp(-rate) if torch.is_tensor(rate) else math.exp(-rate)
         return target + (field - target) * decay
 
-    def vent_plume_heat(self, air_temperatures: torch.Tensor, temp_eq: torch.Tensor) -> torch.Tensor:
-        """Vertical venting of plume heat out of the shallow near-surface slab (the air-temp sink).
+    def convect_air_levels(self, air_temperatures: torch.Tensor) -> torch.Tensor:
+        """Upward-only inter-level heat convection (warm air rises; the reverse does not).
 
-        update_fire injects the combustion air-share heat into a shallow plume slab, but the air
-        field has no vertical export -- it is radiatively transparent and only loses heat by weak
-        ground exchange and horizontal advection -- so over a large or sustained fire that heat
-        accumulates without bound and conducts back into the fuel (a temperature runaway). A real
-        plume rises buoyantly and carries the heat up and out of the modelled slab while fresh air
-        entrains. Model that as an exact-exponential relaxation of the *super-ambient* air toward the
-        rest profile temp_eq at the plume-venting rate (~ updraft / d_plume, the inverse residence
-        time). One-directional: it only cools air hotter than temp_eq, so it is strictly a heat sink
-        (never injects energy) and is a no-op on a quiescent world (air = temp_eq). Rank-agnostic.
+        Combustion injects its air-share into the surface level and fuels warm their own levels, but
+        the vertical split gives the surface/canopy slabs no sink of their own (only the above-canopy
+        level vents). This stage carries that heat *up*: for each adjacent pair (surface->canopy, then
+        canopy->above) it runs the exact-exponential two-body relaxation of exchange_fuel_air_heat,
+        but gated on instability -- it acts only where the lower level is hotter than the one above
+        (super-adiabatic), never mixing a warm upper level down. Energy is conserved (what leaves a
+        level enters the one above, weighted by each slab's capacity), it is self-limiting (stops once
+        the gap closes), and it is a no-op on a quiescent world (all levels at rest -> no gap). Heat
+        cascades surface -> canopy -> above in one tick, where the top vent finally sheds it.
+        Rank-agnostic (single world or (B, L, H, W)).
+        """
+        L = air_temperatures.shape[-3]
+        if not self.air_convection_enabled or self.air_transfer_rate <= 0.0 or L < 2:
+            return air_temperatures
+        cap = self._air_level_capacity                       # (L, 1, 1)
+        # air_transfer_rate is the temperature-gap relaxation rate lambda [1/s]: the (T_lower-T_upper)
+        # gap decays by exp(-lambda*dt) per tick regardless of the slab capacities, so the knob is
+        # capacity-independent and reads directly as a residence time 1/lambda (much easier to tune
+        # than a raw conductance against the tiny thin-slab capacities). The heat still splits
+        # conservatively by capacity, so the pair relaxes toward its capacity-weighted mean.
+        decay = math.exp(-self.air_transfer_rate * self.dt)
+        air = air_temperatures.clone()
+        for lo in range(L - 1):
+            hi = lo + 1
+            T_l, T_u = air.select(-3, lo), air.select(-3, hi)   # views into `air`
+            C_l, C_u = cap[lo], cap[hi]                          # (1, 1) each
+            # Two-body relaxation toward the capacity-weighted mean, then keep only the upward part:
+            # where the lower level is hotter, it cools and the upper warms; elsewhere a no-op (no
+            # downward mixing through this term).
+            T_eq  = (C_l * T_l + C_u * T_u) / (C_l + C_u)
+            dT_l  = torch.where(T_l > T_u, (T_eq - T_l) * (1.0 - decay), torch.zeros_like(T_l))
+            dT_u  = -(C_l / C_u) * dT_l                          # energy-conserving back-reaction
+            T_l.add_(dT_l)
+            T_u.add_(dT_u)
+        return air
+
+    def vent_plume_heat(self, air_temperatures: torch.Tensor, temp_eq: torch.Tensor) -> torch.Tensor:
+        """Above-canopy energy-anomaly vent -- the single sink for all fire heat (the air-temp sink).
+
+        Fuels and combustion warm the near-surface levels, and convect_air_levels cascades that heat
+        upward into the deep above-canopy (top) level; the air is otherwise radiatively transparent
+        with no vertical export, so without a sink the plume heat accumulates without bound and
+        conducts back into the fuel (a temperature runaway). A real plume rises buoyantly and carries
+        the heat up and out to space while fresh air entrains. We model that as an exact-exponential
+        relaxation of the top level's *super-ambient* air toward its rest profile temp_eq at the vent
+        rate lambda (~ updraft / depth, the inverse residence time). Venting only the top level makes
+        this an energy-anomaly sink -- heat riding up from any level is shed at the same rate once it
+        reaches the top, independent of which slab held it. One-directional (only cools air hotter than
+        temp_eq -- strictly a sink, never injects energy), so a quiescent world is a no-op. Only the
+        top level changes; the surface/canopy levels are returned untouched. Rank-agnostic.
         """
         if self.plume_vent_rate <= 0.0:
             return air_temperatures
-        excess = (air_temperatures - temp_eq).clamp(min=0.0)
-        return air_temperatures - excess * (1.0 - math.exp(-self.plume_vent_rate * self.dt))
+        top = air_temperatures.shape[-3] - 1
+        T_top   = air_temperatures.select(-3, top)
+        eq_top  = temp_eq.select(-3, top)
+        excess  = (T_top - eq_top).clamp(min=0.0)
+        vented  = T_top - excess * (1.0 - math.exp(-self.plume_vent_rate * self.dt))
+        air = air_temperatures.clone()
+        air.select(-3, top).copy_(vented)
+        return air
 
     def diffuse_and_advect_oxygen(
         self,
@@ -838,24 +908,37 @@ class Simulation:
 
     def exchange_fuel_air_heat(
         self,
-        air_temperatures: torch.Tensor,   # (H, W)
+        air_temperatures: torch.Tensor,   # (L, H, W)  per-level air temperature
         fuel_temperatures: torch.Tensor,  # (N, H, W)
         fuel: torch.Tensor,               # (N, H, W)
-        air_mass: torch.Tensor,           # (H, W)
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Conductive fuel<->air heat exchange, each fuel coupled to *its own* air level.
+
+        Every fuel type trades heat only with the thin air slab at its height (fuel_levels):
+        grass/shrub/surface-bole against the surface level, canopy foliage/canopy-bole against the
+        canopy level. The air thermal mass is that level's slab capacity C = rho_ref*depth*cp_air
+        (_air_level_capacity), ~300x lighter than the old full-column coupling, so a fuel warms its
+        level's air strongly and directly. The two-body relaxation math is unchanged (exact-
+        exponential, conserving each pair's energy); only the air side is now per-level: each fuel
+        reads its level's temperature and its level's capacity, and the back-reaction is scattered
+        back into the level it came from so total air+fuel energy is conserved level by level.
+        Rank-agnostic (single world or (B, L/N, H, W)).
+        """
         cp_fuel = self.fuel_specific_heat  # (N, 1, 1)  [J/(kg*K)]
         k       = self.fuel_transfer_rates # (N, 1, 1)  [W/(m^2*K)]
+        idx     = self._fuel_level_index   # (N,) long: each fuel's air-level index
 
         C_fuel = cp_fuel * fuel                                # (N, H, W) fuel thermal mass [J/(m^2*K)]
-        # Air thermal mass is the column heat capacity m*c_p_air [J/(m^2*K)]: a dense/high-
-        # pressure column changes temperature less for the same heat, a thin column more.
-        # unsqueeze(-3) inserts the fuel-type axis whether or not a batch dim is present.
-        C_air  = (air_mass.clamp(min=1e-6) * pc.CP_AIR).unsqueeze(-3)  # (1, H, W) / (B, 1, H, W)
+        # Gather each fuel's air level: its temperature (from the (..., L, H, W) stack) and its slab
+        # heat capacity (from the (L, 1, 1) per-level capacity). Both index on the level axis by the
+        # fuel->level map, yielding one air partner per fuel type.
+        air_f  = air_temperatures.index_select(-3, idx)       # (N, H, W) each fuel's level air temp
+        C_air  = self._air_level_capacity.index_select(0, idx)  # (N, 1, 1) each fuel's slab capacity
         total  = C_air + C_fuel                                # >= C_air > 0, always safe
 
         # Mass-weighted equilibrium temperature of each air/fuel pair (the conserved
         # mean the pair relaxes toward).
-        T_eq = (C_air * air_temperatures.unsqueeze(-3) + C_fuel * fuel_temperatures) / total
+        T_eq = (C_air * air_f + C_fuel * fuel_temperatures) / total
 
         # Exact two-body relaxation over one tick: the air/fuel gap decays by
         # exp(-k / C_red), where C_red = C_air*C_fuel/total is the reduced heat capacity.
@@ -871,11 +954,14 @@ class Simulation:
 
         dT_fuel = (T_eq - fuel_temperatures) * (1.0 - decay)  # (N, H, W)
 
-        # Air loses exactly the energy each fuel type gained (summed over types, divided
-        # by the air's own thermal mass), so total air+fuel energy is conserved.
-        dT_air = -((C_fuel * dT_fuel).sum(dim=-3) / C_air.squeeze(-3))
+        # Air loses exactly the energy each fuel type gained; scatter that energy back into the
+        # level each fuel drew it from (fuels sharing a level sum), then divide each level by its
+        # own capacity to get its temperature change -- so air+fuel energy is conserved per level.
+        air_energy_gain = torch.zeros_like(air_temperatures)          # (..., L, H, W) [J/m^2]
+        air_energy_gain.index_add_(-3, idx, -(C_fuel * dT_fuel))
+        air_new = air_temperatures + air_energy_gain / self._air_level_capacity
 
-        return air_temperatures + dT_air, fuel_temperatures + dT_fuel
+        return air_new, fuel_temperatures + dT_fuel
 
     def update_fire(
         self,
@@ -1122,9 +1208,11 @@ class Simulation:
             v_fire = s.y_wind_vel * s.channel_gain
         s.x_wind_fire, s.y_wind_fire = u_fire, v_fire
 
-        # The fuel-coupling stages are still single-level (Phase 1): they read/write only the surface
-        # air level via _surface_level / _with_surface, so the physics is identical for L = 1. Phases
-        # 2-3 make them per-level. temp_eq is likewise a level stack; its surface level is the anchor.
+        # Fuel<->air coupling. exchange_fuel_air_heat is now per-level (Stage 1): each fuel trades heat
+        # with its own air level. apply_radiation and update_fire remain surface-level (level 0) for now
+        # -- the ground sensible flux and combustion air-share inject into the surface, and the new
+        # inter-level convection carries that heat up (per-level combustion routing lands in Stage 2).
+        # temp_eq is a level stack; its surface level anchors the surface stages, its top level the vent.
         temp_eq0 = _surface_level(s.temp_eq)
 
         # Surface radiative energy balance: sun warms the ground/fuel skin, longwave cools it,
@@ -1136,10 +1224,11 @@ class Simulation:
             )
             s.air_temperatures = _with_surface(s.air_temperatures, air0)
 
-        air0, s.fuel_temperatures = self.exchange_fuel_air_heat(
-            _surface_level(s.air_temperatures), s.fuel_temperatures, s.fuel, s.mass
+        # Conductive fuel<->air heat: each fuel couples to its own air level (surface fuels to the
+        # surface level, canopy fuels to the canopy level) against that level's thin-slab capacity.
+        s.air_temperatures, s.fuel_temperatures = self.exchange_fuel_air_heat(
+            s.air_temperatures, s.fuel_temperatures, s.fuel
         )
-        s.air_temperatures = _with_surface(s.air_temperatures, air0)
 
         # Oxygen transport (advection + diffusion + replenishment). Passive -- it never feeds back
         # into mass/wind/air -- so a spin-up that only bakes those can skip it (advance_oxygen).
@@ -1161,13 +1250,18 @@ class Simulation:
                     s.fuel_temperatures, s.fuel, temp_eq0
                 )
 
-        # Vent the plume air-share heat upward out of the shallow slab (the air-temperature sink):
+        # Inter-level convection: carry heat *upward* through the air stack (surface -> canopy ->
+        # above), gated on instability. This is what gives the surface/canopy slabs a sink -- the heat
+        # they take from fuel and combustion cascades up to the above-canopy level, where the vent
+        # sheds it. No-op on a quiescent world and for a single-level stack.
+        s.air_temperatures = self.convect_air_levels(s.air_temperatures)
+
+        # Vent the plume heat out of the top (above-canopy) level -- the single air-temperature sink:
         # without it the radiatively-transparent air has no vertical escape and a large fire's plume
         # heat accumulates without bound. Gated by its own toggle (independent of fire), so the closed
         # conservation core can switch it off; one-directional, so on a quiescent world it is a no-op.
         if self.venting_enabled:
-            air0 = self.vent_plume_heat(_surface_level(s.air_temperatures), temp_eq0)
-            s.air_temperatures = _with_surface(s.air_temperatures, air0)
+            s.air_temperatures = self.vent_plume_heat(s.air_temperatures, s.temp_eq)
 
         return s
 

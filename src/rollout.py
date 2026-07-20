@@ -68,7 +68,7 @@ import torch
 from torch.utils.data import Dataset
 
 from config import load_config, boundary_pad
-from simulation import Simulation, SimState, obs_channel_names
+from simulation import Simulation, SimState, obs_channel_names, lift_air_levels
 from map_loader import load_map, resolve_map, list_maps, validate_against_config
 
 DEFAULT_GRID_SIZE = 256
@@ -275,13 +275,13 @@ class BatchedRollout:
 
         self._state = SimState(
             mass=mass,
-            air_temperatures=air.unsqueeze(-3),    # air level axis (-3); L = 1 in Phase 1
+            air_temperatures=lift_air_levels(air, self._sim.num_air_levels),   # (L, H, W) air stack
             ground_temperature=stack("temp_eq"),   # surface skin starts at the rest profile
             fuel_temperatures=stack("fuel_temperatures"),
             fuel=stack("fuel"),
             oxygen=stack("oxygen"),
             terrain=terrain,
-            temp_eq=stack("temp_eq").unsqueeze(-3),
+            temp_eq=lift_air_levels(stack("temp_eq"), self._sim.num_air_levels),
             oxygen_eq=stack("oxygen_eq"),
             mass_eq=stack("mass_eq"),
             x_wind_vel=x_wind,
@@ -310,8 +310,10 @@ class BatchedRollout:
         patch = (rows - r0) ** 2 + (cols - c0) ** 2 <= self._fire_radius ** 2   # (B, N, N)
 
         ign_max = float(self._sim.ignition_thresholds.max())
-        patch_air = patch.unsqueeze(-3)   # broadcast over the air level axis (surface ignition)
-        s.air_temperatures = torch.where(patch_air, torch.full_like(s.air_temperatures, ign_max * 2.0), s.air_temperatures)
+        # Ground ignition: heat only the surface air level (level 0). The canopy level catches only
+        # once the ladder carries fire up, so a spawn must not warm the elevated levels directly.
+        surf_air = s.air_temperatures[:, 0]   # (B, H, W) surface level view
+        s.air_temperatures[:, 0] = torch.where(patch, torch.full_like(surf_air, ign_max * 2.0), surf_air)
         for t in range(self._sim.num_fuel_types):
             ign_t = float(self._sim.ignition_thresholds[t])
             s.fuel_temperatures[:, t] = torch.where(patch, torch.full_like(s.fuel_temperatures[:, t], ign_t * 2.0), s.fuel_temperatures[:, t])

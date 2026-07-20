@@ -782,7 +782,7 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
         return
     # Simulation is imported here (not at module load) so the engine dependency stays confined
     # to the spin-up; the rest-state build only needs the lightweight torch Perlin kernel.
-    from simulation import Simulation, SimState
+    from simulation import Simulation, SimState, lift_air_levels
 
     sim = Simulation(cfg)
 
@@ -798,13 +798,13 @@ def spin_up_maps(maps: list[MapData], cfg: dict | None, steps: int, chunk: int =
         amb_y = t([m.ambient_wind_y for m in batch]).view(-1, 1, 1)
         s = SimState(
             mass=mass,
-            air_temperatures=air.unsqueeze(-3),        # air level axis (-3); L = 1 in Phase 1
+            air_temperatures=lift_air_levels(air, sim.num_air_levels),   # (B, L, H, W) air stack
             ground_temperature=air.clone(),
             fuel_temperatures=torch.stack([t(m.fuel_temperatures) for m in batch]),
             fuel=torch.stack([t(m.fuel) for m in batch]),
             oxygen=torch.stack([t(m.oxygen) for m in batch]),
             terrain=terrain,
-            temp_eq=air.clone().unsqueeze(-3),                     # rest temperature (sponge target)
+            temp_eq=lift_air_levels(air.clone(), sim.num_air_levels),    # rest temperature (sponge target)
             oxygen_eq=torch.stack([t(m.oxygen) for m in batch]),
             mass_eq=mass.clone(),                                   # level-lid rest mass (sponge target)
             x_wind_vel=torch.zeros_like(mass) + amb_x,

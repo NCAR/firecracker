@@ -19,7 +19,7 @@ import torch
 
 import physics_constants as pc
 from conftest import make_config
-from simulation import Simulation, SimState
+from simulation import Simulation, SimState, lift_air_levels
 from gen_maps import MapGenerator
 
 GRID = 64
@@ -44,9 +44,11 @@ def _state(sim: Simulation, ambient=(0.0, 0.0), ignite=True, terrain=None) -> Si
     ax = torch.tensor(float(ambient[0]), dtype=sim.dtype, device=sim.device).view(1, 1)
     ay = torch.tensor(float(ambient[1]), dtype=sim.dtype, device=sim.device).view(1, 1)
     return SimState(
-        mass=mass_t, air_temperatures=air_t.unsqueeze(-3), ground_temperature=air_t.clone(),
+        mass=mass_t, air_temperatures=lift_air_levels(air_t, sim.num_air_levels),
+        ground_temperature=air_t.clone(),
         fuel_temperatures=fuel_t, fuel=fuel, oxygen=oxy_t, terrain=terr_t,
-        temp_eq=air_t.clone().unsqueeze(-3), oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
+        temp_eq=lift_air_levels(air_t.clone(), sim.num_air_levels),
+        oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
         x_wind_vel=torch.zeros_like(mass_t) + ax, y_wind_vel=torch.zeros_like(mass_t) + ay,
         u_amb_x=ax, u_amb_y=ay, radiant_flux=torch.zeros_like(mass_t),
     )

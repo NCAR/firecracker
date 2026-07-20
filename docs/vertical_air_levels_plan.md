@@ -1,11 +1,57 @@
 # Vertical Air Levels — Design Doc
 
-Status: **Phase 1 done + committed; Phase 2 Step A done + committed; combined Phase 2+3 (per-level
-thermodynamics) is the current in-progress work.** Physics decisions resolved through the design
-review below. Phase 0 validated the multi-level dynamics in isolation (`tools/vertical_levels/
-phase0_dynamics_spike.py`): the advection scheme is stable, the old fire-wind amplifier is ~15×
-(not 89×) and is an energy-over-count, and the ~15× weaker energy-correct fire-wind is **accepted**
-(no `reduced_gravity` retune).
+Status: **Phase 1 done + committed; Phase 2 Step A done + committed; Phase 2+3 Stage 1 (heat budget)
+done — physics tests green, ready to commit. Stage 2 (ladder) is the next in-progress work.** Physics
+decisions resolved through the design review below. Phase 0 validated the multi-level dynamics in
+isolation (`tools/vertical_levels/phase0_dynamics_spike.py`): the advection scheme is stable, the old
+fire-wind amplifier is ~15× (not 89×) and is an energy-over-count, and the ~15× weaker energy-correct
+fire-wind is **accepted** (no `reduced_gravity` retune).
+
+## ✅ STAGE 1 (heat budget) — DONE
+
+Per-level fuel↔air coupling + upward convection + top-only vent, all landed and green (138 physics
+tests pass; the 13 `test_world_model.py` failures are a pre-existing `run_epoch` signature drift,
+unrelated). What shipped:
+- **`exchange_fuel_air_heat`** rewritten: each fuel couples to *its* level's thin slab
+  (`_air_level_capacity = ρ_ref·depth·cp`, surface 5854 / canopy 11708 / above 117082 J/(m²·K)); drops
+  the `air_mass` arg; `index_select` the level temp + capacity, scatter the back-reaction with
+  `index_add_`. Precomputes `_fuel_level_index (N,)` + `_air_level_capacity (L,1,1)` added in `__init__`.
+- **`convect_air_levels`** (new stage): upward-only, gated exact-exp two-body relaxation surface→canopy
+  →above. **`transfer_rate` is now a gap-relaxation RATE λ [1/s]** (not a conductance — the raw
+  conductance was ~0% per tick against the thin slabs at dt=0.1 s); the (T_lower−T_upper) gap decays by
+  `exp(-λ·dt)`, heat splits conservatively by capacity. Default **0.5/s** (10× the vent rate) — a
+  Stage-1 placeholder, Phase 4 re-tunes.
+- **`vent_plume_heat`** now vents the **top (above-canopy) level only** (energy-anomaly ≡ temp-excess
+  relaxation on a single fixed-capacity level). Surface/canopy levels have no direct vent; their sink is
+  the upward convection → top vent.
+- **`step_fields`** wiring: full-stack exchange (no surface wrap/mass), new convection stage after
+  `update_fire`, top-level vent. `update_fire`/`apply_radiation` **stay surface-level** (per-level
+  combustion routing is Stage 2).
+- **Constructors** `rollout.py` + `gen_maps.py` aligned to L=3 via `lift_air_levels`; rollout ignition
+  fixed to the **surface level only** (was broadcasting to all levels). New `[air_levels]` config block
+  (`depths`, `above_depth=100`, `transfer_rate=0.5`, `enabled`).
+
+**Rebaselines surfaced + accepted:**
+- `test_heat_exchange` / `test_venting` operator tests: mechanical updates to the new signature/model
+  (air is an (L,H,W) stack; per-level capacity; vent on top level).
+- `test_spread`, `test_combustion`, `test_equilibrium`: **passed unchanged.**
+- `make_config` gained an `air_convection` toggle (default OFF, like `venting`): with the upper levels
+  not yet advected (Stage 1), convection would bleed the surface anomaly into the frozen upper levels,
+  breaking the closed-core conservation test — so the isolation config disables it, opt in explicitly.
+- `test_venting_bounds_sustained_fire_air_temperature`: horizon extended 100→**800 ticks** and thresholds
+  rebaselined (vented surface ~3000 K < 4000; unvented ~5100 K, sep ~2100). The vertical split routes
+  fire heat through the deep above-canopy reservoir, which must fill before the missing sink bites, so
+  the runaway manifests later than the old single-slab model.
+
+**Stage 1 scope boundary / known deferrals** (NOT bugs — Stage 2 / Phase 3 work):
+- **Upper air levels (1,2) are not horizontally advected** — `step_dynamics` still advects only the
+  surface level (`:664`, `:707`). They exchange heat vertically (convection) and vent but don't move
+  with the wind. Full per-level advection (mass floor + thin-slab substep) is Phase 3.
+- **`update_fire` still injects the air-share into a 100 m `C_plume`** (not the 5 m surface slab) — the
+  per-level combustion air-share routing is Stage 2. This is the double-capacity inconsistency Stage 2
+  resolves; harmless in Stage 1 (stable, bounded).
+- The ladder is not yet emergent (canopy air can warm via convection); Stage 2 adds per-level combustion
+  routing, per-level ignition deposit, and bole-segment conduction to make it emergent.
 
 ## ⏸ RESUMPTION STATE (context handoff)
 

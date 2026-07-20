@@ -17,7 +17,7 @@ import torch
 
 import physics_constants as pc
 from conftest import to_numpy
-from simulation import Simulation, SimState, obs_channel_names
+from simulation import Simulation, SimState, obs_channel_names, lift_air_levels
 from map_loader import save_map
 from config import boundary_pad
 from rollout import (
@@ -45,10 +45,12 @@ def _batched_state(sim: Simulation, maps) -> SimState:
     u_amb_y = torch.as_tensor([m.ambient_wind_y for m in maps], dtype=sim.dtype, device=sim.device).view(-1, 1, 1)
     x_wind, y_wind = torch.zeros_like(mass) + u_amb_x, torch.zeros_like(mass) + u_amb_y
     return SimState(
-        mass=mass, air_temperatures=air.unsqueeze(-3), ground_temperature=stack("temp_eq"),
+        mass=mass, air_temperatures=lift_air_levels(air, sim.num_air_levels),
+        ground_temperature=stack("temp_eq"),
         fuel_temperatures=stack("fuel_temperatures"), fuel=stack("fuel"),
         oxygen=stack("oxygen"), terrain=terrain,
-        temp_eq=stack("temp_eq").unsqueeze(-3), oxygen_eq=stack("oxygen_eq"), mass_eq=mass.clone(),
+        temp_eq=lift_air_levels(stack("temp_eq"), sim.num_air_levels),
+        oxygen_eq=stack("oxygen_eq"), mass_eq=mass.clone(),
         x_wind_vel=x_wind, y_wind_vel=y_wind,
         u_amb_x=u_amb_x, u_amb_y=u_amb_y, radiant_flux=torch.zeros_like(mass),
     )
