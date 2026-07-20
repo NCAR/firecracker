@@ -25,7 +25,7 @@ CLOSED = {"sponge_strength": 0.0, "drag_coeff": 0.0}   # no edge sponge, no fric
 
 def _totals(env):
     m = env._mass
-    return (float(m.sum()), float((m * CP * env._air_temperatures).sum()), float(env._oxygen.sum()))
+    return (float(m.sum()), float((m * CP * env._air_temperatures.select(-3, 0)).sum()), float(env._oxygen.sum()))
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ def _hot_blob_flat(grid, ambient, col):
 
 def _thermal_anomaly(env):
     """Heat held above the flat rest profile: sum(m * c_p * (T - T_REF)) [J/m^2 * cells]."""
-    return float((env._mass * CP * (env._air_temperatures - pc.T_REF)).sum())
+    return float((env._mass * CP * (env._air_temperatures.select(-3, 0) - pc.T_REF)).sum())
 
 
 def test_open_domain_flushes_anomaly_while_closed_conserves_it(make_env):
@@ -106,7 +106,7 @@ def test_open_domain_carries_anomaly_downwind(make_env):
     def centroid_col(env):
         # Centroid over the observed interior (crop the padded sponge ring), matching `cols`.
         mass = to_numpy(env._crop(env._mass))
-        air = to_numpy(env._crop(env._air_temperatures))
+        air = to_numpy(env._crop(env._air_temperatures.select(-3, 0)))
         w = np.clip(mass * (air - pc.T_REF), 0.0, None)
         return float((w.sum(axis=0) * cols).sum() / w.sum())
 

@@ -112,6 +112,13 @@ def _with_surface(stack: torch.Tensor, new_surface: torch.Tensor) -> torch.Tenso
     )
 
 
+def lift_air_levels(field: torch.Tensor, n_levels: int) -> torch.Tensor:
+    """Replicate a single (..., H, W) air/temperature field across `n_levels` levels on axis -3
+    (uniform init, no lapse yet): returns (..., L, H, W). Used to seed the multi-level air state
+    from a single stored/loaded field."""
+    return torch.stack([field] * n_levels, dim=-3)
+
+
 def _resolve_device(name: str | None) -> torch.device:
     """Pick the compute device: an explicit config value wins, else CUDA if present."""
     if name:
@@ -230,6 +237,15 @@ class Simulation:
         # air-share heat is injected into (rather than the full ~1 km column), so the burn raises
         # a strong, advectable air-temperature signal that lifts eta and drives the indraft.
         self.plume_mixing_depth:          float = float(fire.get("plume_mixing_depth",        100.0))
+        # Vertical air levels: the near-surface air resolves into stacked slabs -- surface (0-5 m) and
+        # canopy (5-15 m), plus the above-canopy remainder. air_level_depths are the two resolved slab
+        # depths [m]; the third level is the rest of the boundary-layer column. Level 0 is the surface.
+        # Phase 1 keeps the dynamics/buoyancy and fuel coupling on the surface level; Phase 2 splits the
+        # fuel<->air coupling across levels (see fuel_levels below).
+        self.air_level_depths: tuple[float, ...] = tuple(
+            float(x) for x in (cfg or {}).get("air_levels", {}).get("depths", (5.0, 10.0))
+        )
+        self.num_air_levels: int = len(self.air_level_depths) + 1
         # Convective fire spread (Phase 5.5c). Radiation preheats the fuel ahead but is too weak to
         # ignite a neighbour at realistic flame temperatures, so ignition is carried by convection: a
         # fraction of the plume's air-share heat is convected to nearby fuel to ignite it (hot plume
@@ -268,6 +284,12 @@ class Simulation:
         fuel_types_cfg = (cfg or {}).get("fuel_types", {})
         self.fuel_type_names: list[str] = list(fuel_types_cfg.keys())
         self.num_fuel_types:  int       = len(self.fuel_type_names)
+        # Fuel -> air-level index (Phase 2 coupling): canopy-height fuels coupled to the canopy air
+        # (level 1), everything else to the surface air (level 0). A tree's foliage and its upper
+        # (canopy) bole segment sit in the crown; grass, shrub and the lower bole are at the surface.
+        self.fuel_levels: list[int] = [
+            1 if "canopy" in n else 0 for n in self.fuel_type_names
+        ]
 
         def _ft(name: str, key: str, default: float) -> float:
             return float(fuel_types_cfg.get(name, {}).get(key, default))
@@ -1193,7 +1215,8 @@ class Simulation:
         # the spread physics reads (see update_fire), so the observation exposes exactly that signal.
         slope_x, slope_y = Simulation._periodic_grad(terrain, cell_size_m)
         channels = [
-            *air_temperatures.unbind(dim=-3),   # air_temperature[_<level>]: per-level air temperature
+            air_temperatures.select(-3, 0),     # air_temperature: surface-level air (canopy/above
+                                                # levels are added to the obs once they carry signal)
             *fuel_temperatures.unbind(dim=-3),  # fuel_temperature_<type>: per-type temperature
             *fuel.unbind(dim=-3),               # fuel_<type>: per-type vegetation mass
             slope_x,                            # slope_x: terrain slope d/dx (signed, uphill +)

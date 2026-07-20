@@ -70,7 +70,7 @@ def test_batched_b1_matches_single_world(make_env):
         env.step(0)
 
     for batched, single in (
-        (s.mass, env._mass), (s.air_temperatures.select(-3, 0), env._air_temperatures),
+        (s.mass, env._mass), (s.air_temperatures.select(-3, 0), env._air_temperatures.select(-3, 0)),
         (s.oxygen, env._oxygen), (s.fuel_temperatures, env._fuel_temperatures),
     ):
         np.testing.assert_allclose(to_numpy(batched)[0], to_numpy(single), rtol=1e-5, atol=1e-6)

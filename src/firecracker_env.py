@@ -21,7 +21,7 @@ import pygame
 import gymnasium
 from gymnasium import spaces
 
-from simulation import Simulation, SimState, obs_channel_names
+from simulation import Simulation, SimState, obs_channel_names, lift_air_levels
 from config import boundary_pad
 from gen_maps import MapGenerator
 from map_loader import load_map, resolve_map, validate_against_config
@@ -345,7 +345,7 @@ class FirecrackerEnv(gymnasium.Env):
         Identical to what BatchedRollout.observe collects, including the near-surface fire wind
         (prognostic wind x channeling gain) used by the spread physics."""
         obs = Simulation.build_observation(
-            self._air_temperatures.unsqueeze(-3), self._fuel_temperatures, self._fuel, self._terrain,
+            self._air_temperatures, self._fuel_temperatures, self._fuel, self._terrain,
             self._x_wind_fire if self._x_wind_fire is not None else self._x_wind_vel,
             self._y_wind_fire if self._y_wind_fire is not None else self._y_wind_vel,
             self._sim.ignition_thresholds, self._sim.cell_size_m,
@@ -373,8 +373,10 @@ class FirecrackerEnv(gymnasium.Env):
         # onto the simulation device so the per-step physics stays GPU-resident.
         self._terrain           = self._to_tensor(m.terrain)
         self._sunlight          = self._to_tensor(m.sunlight)   # static solar exposure (SUNLIGHT view)
-        self._air_temperatures  = self._to_tensor(m.air_temperatures)
-        self._temp_eq           = self._to_tensor(m.temp_eq)
+        # Air and its rest profile carry the vertical level axis (-3); seed every level from the
+        # single stored field (canopy/above levels stay inert until the Phase 2 per-level coupling).
+        self._air_temperatures  = lift_air_levels(self._to_tensor(m.air_temperatures), self._sim.num_air_levels)
+        self._temp_eq           = lift_air_levels(self._to_tensor(m.temp_eq), self._sim.num_air_levels)
         self._oxygen            = self._to_tensor(m.oxygen)
         self._oxygen_eq         = self._to_tensor(m.oxygen_eq)
         self._mass              = self._to_tensor(m.mass)      # developed (spun-up) initial mass
@@ -388,7 +390,7 @@ class FirecrackerEnv(gymnasium.Env):
         )
         self._fuel_temperatures = self._to_tensor(m.fuel_temperatures)
         # Surface skin starts at the rest temperature profile (radiative-equilibrium target).
-        self._ground_temperature = self._temp_eq.clone()
+        self._ground_temperature = self._temp_eq.select(-3, 0).clone()   # surface skin (single level)
 
         # Per-map synoptic ambient wind: the momentum drag relaxes toward it. The prognostic wind
         # is initialised to the map's developed (spun-up) orographic field, so the world starts in
@@ -419,7 +421,7 @@ class FirecrackerEnv(gymnasium.Env):
         # generator classified at bake time (temp_eq is the pre-spin-up surface temperature, so this
         # reproduces the biomes that placed the fuel). classify_biomes returns three exclusive masks.
         woodland, grassland, shrubland = self._biome_gen.classify_biomes(
-            _to_numpy(terr_obs), _to_numpy(self._crop(self._temp_eq))
+            _to_numpy(terr_obs), _to_numpy(self._crop(self._temp_eq.select(-3, 0)))
         )
         self._biome_labels = np.where(woodland, 0, np.where(grassland, 1, 2)).astype(np.int64)
 
@@ -739,7 +741,7 @@ class FirecrackerEnv(gymnasium.Env):
         # The surface builders are CPU/pygame numpy code, so pull the state to the host once here --
         # the numpy/tensor boundary lives at the render edge. Every spatial field is cropped to the
         # observed interior first (drop the sponge ring), so what's drawn is exactly the observation.
-        temp = _to_numpy(self._crop(self._air_temperatures))
+        temp = _to_numpy(self._crop(self._air_temperatures.select(-3, 0)))
         # The WIND view shows the near-surface wind the fire/oxygen actually read: the prognostic
         # wind sped up through gaps by the terrain-channeling gain (so the Venturi is visible).
         # Falls back to the prognostic wind when channeling produced no fire-wind field.
@@ -750,7 +752,7 @@ class FirecrackerEnv(gymnasium.Env):
         fuel = _to_numpy(self._crop(self._fuel))
         oxygen = _to_numpy(self._crop(self._oxygen))
         column_height = _to_numpy(self._crop(
-            self._sim.column_height(self._mass, self._terrain, self._air_temperatures)
+            self._sim.column_height(self._mass, self._terrain, self._air_temperatures.select(-3, 0))
         ))
         ignition_thresholds = _to_numpy(self._sim.ignition_thresholds).reshape(-1)
         terrain = _to_numpy(self._crop(self._terrain))
@@ -835,13 +837,13 @@ class FirecrackerEnv(gymnasium.Env):
             mass=self._mass,
             # Add the air level axis (-3) at the SimState boundary; the env keeps surface-level
             # (H, W) fields internally (Phase 1, L = 1).
-            air_temperatures=self._air_temperatures.unsqueeze(-3),
+            air_temperatures=self._air_temperatures,
             ground_temperature=self._ground_temperature,
             fuel_temperatures=self._fuel_temperatures,
             fuel=self._fuel,
             oxygen=self._oxygen,
             terrain=self._terrain,
-            temp_eq=self._temp_eq.unsqueeze(-3),
+            temp_eq=self._temp_eq,
             oxygen_eq=self._oxygen_eq,
             mass_eq=self._mass_eq,
             x_wind_vel=self._x_wind_vel,
@@ -857,7 +859,7 @@ class FirecrackerEnv(gymnasium.Env):
     def _store_field_state(self, s: SimState) -> None:
         """Write a stepped SimState's mutable fields back onto the env attributes."""
         self._mass              = s.mass
-        self._air_temperatures  = s.air_temperatures.select(-3, 0)   # drop the level axis (surface)
+        self._air_temperatures  = s.air_temperatures   # full (L, H, W) air state persists across steps
         self._ground_temperature = s.ground_temperature
         self._fuel_temperatures = s.fuel_temperatures
         self._fuel              = s.fuel
@@ -875,7 +877,7 @@ class FirecrackerEnv(gymnasium.Env):
         rows_idx = torch.arange(self._sim_size, device=self._sim.device).view(-1, 1)
         cols_idx = torch.arange(self._sim_size, device=self._sim.device).view(1, -1)
         patch = (rows_idx - row) ** 2 + (cols_idx - col) ** 2 <= self._fire_spawn_radius ** 2
-        self._air_temperatures[patch] = float(self._sim.ignition_thresholds.max()) * 2.0
+        self._air_temperatures[0][patch] = float(self._sim.ignition_thresholds.max()) * 2.0   # surface air
         for n in range(self._sim.num_fuel_types):
             self._fuel_temperatures[n][patch] = float(self._sim.ignition_thresholds[n]) * 2.0
             self._fuel[n][patch] = 1.0
@@ -936,7 +938,7 @@ class FirecrackerEnv(gymnasium.Env):
 
     def _build_info(self) -> dict:
         # Metrics describe the observed world, so reduce over the interior (drop the sponge ring).
-        air     = self._crop(self._air_temperatures)
+        air     = self._crop(self._air_temperatures.select(-3, 0))
         oxygen  = self._crop(self._oxygen)
         fuel     = self._crop(self._fuel)
         ftemps   = self._crop(self._fuel_temperatures)
