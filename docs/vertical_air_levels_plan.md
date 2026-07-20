@@ -1,10 +1,64 @@
 # Vertical Air Levels — Design Doc
 
-Status: **Phase 0 done (spike); Phase 1 sub-areas 1–2 done; Phases 3–4 pending.** Physics decisions
-resolved through the design review below. Phase 0 validated the multi-level dynamics in isolation
-(`scratchpad/phase0_dynamics_spike.py`): the advection scheme is stable, the old fire-wind amplifier
-is ~15× (not 89×) and is an energy-over-count, and the ~15× weaker energy-correct fire-wind is
-**accepted** (no `reduced_gravity` retune).
+Status: **Phase 1 done + committed; Phase 2 Step A done + committed; combined Phase 2+3 (per-level
+thermodynamics) is the current in-progress work.** Physics decisions resolved through the design
+review below. Phase 0 validated the multi-level dynamics in isolation (`tools/vertical_levels/
+phase0_dynamics_spike.py`): the advection scheme is stable, the old fire-wind amplifier is ~15×
+(not 89×) and is an energy-over-count, and the ~15× weaker energy-correct fire-wind is **accepted**
+(no `reduced_gravity` retune).
+
+## ⏸ RESUMPTION STATE (context handoff)
+
+**Git:** clean at commit `17c4aa6` (base `f3c69db`). History: `9244cf6` = Phase 1 (air level axis
+L=1, lean buoyancy, `tree_bole` split N=5, canopy SAV 5000→10000); `17c4aa6` = Phase 2 Step A
+(materialized L=3 env-persisted air state, behavior-preserving).
+
+**Next task — the user chose (a): combine Phase 2 + Phase 3** into one per-level-thermodynamics change
+(a gentler temperature-only Step B was rejected because the thin canopy slab has no heat sink until
+the Phase 3 transfer/vent, so Step B alone can't be verified). Implement in two verifiable stages:
+
+- **Stage 1 — heat budget** (do first): (i) rewrite `exchange_fuel_air_heat` to couple each fuel to
+  *its level's* air using thin-slab thermal mass `ρ·depth·cp` (surface 5.83, canopy 11.65 kg/m² — vs
+  today's full-column ~1747, a ~300× change); (ii) new inter-level **upward** convection stage
+  (surface→canopy→above, rate ∝ `(T_lower−T_upper)₊`, exact-exponential like `exchange_fuel_air_heat`
+  at `:~825`); (iii) **energy-anomaly vent on the above-canopy (top) level only** (repurpose
+  `vent_plume_heat`); (iv) **align `rollout.py` and `gen_maps.py` constructors to L=3** via
+  `lift_air_levels` — REQUIRED, because `exchange` will `index_select` level 1 and an L=1 air tensor
+  will crash. Then run the suite and rebaseline (expect shifts in `test_heat_exchange`, `test_spread`,
+  `test_combustion`, `test_equilibrium`) — surface each rebaseline to the user, don't silently adjust.
+- **Stage 2 — ladder**: per-level combustion **air-share** routing in `update_fire` (each fuel's
+  air-share → its level); **per-level convective ignition deposit** (a burning cell's level-L plume
+  ignites only neighbours' level-L fuels); **bole-segment vertical conduction** (fast-up/slow-down
+  two-body relaxation between `tree_bole_surface` and `tree_bole_canopy`). Verify with
+  `tools/vertical_levels/forest_ladder_test.py` (grass must not ignite the canopy without the bole).
+
+**Key facts / decisions to preserve:**
+- **Buoyancy stays LEAN** (sub-area 2 form: surface-anomaly × `m_plume = ρ·plume_mixing_depth ≈ 116.5`).
+  Per-level *masses* remain deferred; `SimState.mass` stays a single total `(H,W)`. Per-level air
+  *temperatures* drive fuel/ladder behavior, NOT the wind. Don't reopen the buoyancy in 2+3.
+- `Simulation` already has: `air_level_depths=(5,10)`, `num_air_levels=3`, `fuel_levels`
+  (`= [1 if "canopy" in name else 0 for name in fuel_type_names]` → grass/shrub/tree_bole_surface→0,
+  tree_canopy/tree_bole_canopy→1), and module fn `lift_air_levels(field, n)`. Helpers
+  `_surface_level`/`_with_surface` do the axis −3 boundary conversion.
+- **Planned precompute** (add in `__init__` right after `fuel_levels`): `_fuel_level_index` `(N,)` long
+  tensor; `_air_level_capacity` `(L,1,1) = ρ_ref·depth·cp` (above-canopy depth ≈ a config value ~100 m,
+  its exact value only affects the vent's diagnostic T since no fuel couples there). Add an
+  `[air_levels]` config block (depths, `transfer_rate`, `vent_rate`) or Simulation defaults.
+- `exchange` rewrite sketch: `air_f = air.index_select(-3, lvl)`; `C_air_f =
+  _air_level_capacity.index_select(0, lvl)`; two-body exact-exp relaxation; scatter the air
+  back-reaction with `air_gain.index_add_(-3, lvl, -(C_fuel*dT_fuel))` then `air += air_gain /
+  _air_level_capacity`. Remove the `air_mass`/`s.mass` argument. Update the `step_fields` call to pass
+  the full `(L,H,W)` air (drop the `_surface_level`/`_with_surface` wrap for exchange).
+- **Heat-budget sink logic:** surface level (0) already has a sink (the `step_dynamics` edge sponge);
+  canopy/above levels get their sink ONLY from the new inter-level transfer + top vent — that's why
+  Stage 1 must include them or the canopy air runs away during fire.
+- `apply_radiation` can stay surface-level for now (ground→surface air); its per-level split is minor.
+
+**Open follow-ups (unchanged):** `maps/*.npz` still 4-type (app viewer broken until regenerated —
+deferred to cluster); canopy SAV 10000 is committed but contested (the ladder will properly gate
+crowning, which is the justification); `tools/vertical_levels/` holds the preserved Phase-0/ROS/regime/
+ladder harnesses (were scratchpad-only; copied into the repo so they survive — Phase 4 re-measures
+with `ros_test.py` / `forest_regime_test.py` / `forest_ladder_test.py`).
 
 **Phase 1 progress (production code, all physics tests green):**
 - *Sub-area 1 — data model (L = 1):* `air_temperatures`/`temp_eq` carry a level axis (−3); every stage
