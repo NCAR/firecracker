@@ -1,12 +1,43 @@
 # Vertical Air Levels — Design Doc
 
-Status: **Phase 1, Phase 2 Step A, Phase 2+3 Stage 1 (heat budget), and Phase 2+3 Stage 2 (ladder) all
-done + committed — 138 physics tests green. The remaining vertical-levels work is Phase 3 (full
-per-level advection) and Phase 4 (re-tune / re-measure).** Physics decisions resolved through the
-design review below. Phase 0 validated the multi-level dynamics in isolation
-(`tools/vertical_levels/phase0_dynamics_spike.py`): the advection scheme is stable, the old fire-wind
-amplifier is ~15× (not 89×) and is an energy-over-count, and the ~15× weaker energy-correct fire-wind
-is **accepted** (no `reduced_gravity` retune).
+Status: **Phase 1, Phase 2 Step A, Stage 1 (heat budget), Stage 2 (ladder), and Phase 3 (per-level
+advection, lean) all done + committed — 138 physics tests green. The remaining vertical-levels work is
+Phase 4 (re-tune / re-measure).** Physics decisions resolved through the design review below. Phase 0
+validated the multi-level dynamics in isolation (`tools/vertical_levels/phase0_dynamics_spike.py`): the
+advection scheme is stable, the old fire-wind amplifier is ~15× (not 89×) and is an energy-over-count,
+and the ~15× weaker energy-correct fire-wind is **accepted** (no `reduced_gravity` retune).
+
+## ⏳ PHASE 4 (re-tune / re-measure) — IN PROGRESS
+
+Baseline-first, then tune (all harnesses first repaired to the 5-type/L=3 API + given env hooks).
+Done so far:
+- **ROS calibrated ✓** — `convective_fraction` 0.24→0.03 (the dominant ROS knob; wind-bias unchanged
+  at 1.0 so wind directionality is preserved). Head fire now at literature fractions of a 10 m/s wind:
+  **grass 19%, shrub 9%, forest surface 7%** (was 100/66/81%), ordering preserved.
+- **Crowning ✓ (intensity-gated, per the chosen gate)** — the ROS cut left the deposit far too weak to
+  ignite the coarse bole (structural: the fuel↔air exchange runs *before* combustion so the bole only
+  sees already-cooled air; the deposit is negligible at cf=0.03 even at 10× bole SAV). Added a
+  **dedicated bole-preheat term** (`bole.preheat_fraction`, 0.6): a fraction of the surface combustion
+  air-share conducts straight into the co-located surface bole (energy-conserving), so the crown
+  transition is gated by fire **duration** — decoupled from cf. Measured: grass 0.3 → 0% crown even at
+  20 m/s; grass 1.5 → 29%, shrub 0.8 → 15% (crown and spread). Single-fuel tests unchanged (no-op
+  without a split bole); 138 green.
+
+**Still open in Phase 4:** fire-wind is weak (**0.15 m/s** peak) — `reduced_gravity` is now on the table
+(user opened it) if we want fires to drive more wind; and a final regime/fuel-ordering re-measurement.
+
+## ✅ PHASE 3 (per-level advection) — DONE (lean)
+
+`step_dynamics` advected only the surface level, so the canopy/above-canopy plumes sat pinned. Now
+every level's energy `E_i = m·cp·T_i` is advected conservatively by the **shared** mass + wind (the
+energy stack takes a level axis on the displacement; rank-agnostic for batched), and the sponge relaxes
+every level toward its own `temp_eq`. **Deliberately the lean version** (respects the frozen decisions):
+buoyancy still reads only the surface level, and **per-level masses stay deferred — `s.mass` is one
+shared boundary-layer mass carrying every level**. Full per-level masses + per-level-η buoyancy + map
+regeneration are a later, Phase-4-coupled step, *not* this change. Because the surface advection is
+identical to before, the surface result is **byte-identical → 138 tests pass, zero rebaselines**;
+verified a canopy-only hot spot now drifts downwind (centroid 23.5→25.9 / 30 ticks) with the surface
+untouched. This closes the "upper levels not advected" Stage-1/2 deferral.
 
 ## ✅ STAGE 2 (ladder) — DONE
 
