@@ -679,12 +679,13 @@ class Simulation:
         return gain.reshape(*lead, h, w)
 
     def step_dynamics(self, s: SimState) -> SimState:
-        """Advance the prognostic wind, boundary-layer mass and air energy one tick.
+        """Advance the prognostic wind, boundary-layer mass and per-level air energy one tick.
 
         Shallow boundary-layer atmosphere over terrain: the wind is forced by the free-surface
-        gradient (s = terrain + eta, eta = m*R_d*T/p_ref) and smoothed by viscosity, with only
-        weak interior surface friction; mass, energy (E = m*c_p*T) and momentum are advected
-        conservatively by that wind. Because the layer is shallow, terrain squeezes it, so
+        gradient (s = terrain + eta, eta = m*R_d*T/p_ref, surface level) and smoothed by viscosity,
+        with only weak interior surface friction; mass, momentum, and EVERY air level's energy
+        (E_i = m*c_p*T_i) are advected conservatively by that shared wind, so the canopy/above plumes
+        drift downwind with the surface (Phase 3). Because the layer is shallow, terrain squeezes it, so
         continuity speeds the wind over crests and channels it through gaps. A boundary sponge
         relaxes the edges toward the per-map synoptic wind and the rest-state mass, making the
         domain open (inflow upwind, outflow downwind). CFL-substepped on the advective +
@@ -694,26 +695,28 @@ class Simulation:
         dx, dt = self.cell_size_m, self.dt
         g_prime, C_d, nu = self.reduced_gravity, self.drag_coeff, self.viscosity
 
-        # Multi-level buoyancy, lean form (Phase 1, sub-area 2). The surface air field carries the
-        # whole modelled air temperature (advected/conserved with the full mass as before), but only
-        # the shallow combustion-plume slab of a super-ambient anomaly is *buoyant*: a fire lifts a
+        # Multi-level buoyancy, lean form (Phase 1, sub-area 2). Every air level is advected/conserved
+        # with the shared mass and wind (Phase 3, below), but only the SURFACE level's shallow
+        # combustion-plume slab of a super-ambient anomaly is *buoyant*: a fire lifts a
         # rho*plume_mixing_depth slab, not the full ~1.5 km boundary-layer column. So the anomaly's
         # contribution to the column thickness uses m_plume, while the rest-temperature baseline
         # keeps the full mass -- eta = (R_d/p_ref)*(m_plume*(T - T_rest) + m_total*T_rest). This
         # removes the ~15x fire-wind over-count (Phase 0 spike / design doc) without touching the
         # orographic wind (uniform-T, mass-driven: T == T_rest so eta == m_total*R_d*T_rest/p_ref,
-        # unchanged) or mass/energy conservation (advection below is untouched). The 5 m/10 m level
-        # split and fully-advected per-level state land in Phase 3, where the canopy level first
-        # differs from the surface; here m_plume matches how update_fire heats the surface air.
-        m, T = s.mass, _surface_level(s.air_temperatures)
+        # unchanged) or mass/energy conservation. The per-level temperatures drive fuel/ladder behavior,
+        # not the wind: buoyancy reads only the surface level (a deliberate lean choice), and per-level
+        # masses stay deferred -- s.mass is one shared boundary-layer mass carrying every level.
+        m   = s.mass
+        air = s.air_temperatures                       # (L, H, W) full per-level stack
         u, v = s.x_wind_vel, s.y_wind_vel
-        T_rest  = _surface_level(s.temp_eq)
+        T_rest_all = s.temp_eq                          # (L, H, W) per-level rest profile
+        T_rest  = _surface_level(T_rest_all)            # surface rest, the buoyancy baseline
         m_plume = pc.RHO_REF * self.plume_mixing_depth
         eta_of  = lambda m_, T_: (m_plume * (T_ - T_rest) + m_ * T_rest) * R_d / p_ref
 
         # Substep count from the worst-case Courant number: advective speed |u| plus the
-        # gravity-wave speed c = sqrt(g'*eta), eta the total column thickness.
-        eta = eta_of(m, T)
+        # gravity-wave speed c = sqrt(g'*eta), eta the total column thickness (surface-level buoyancy).
+        eta = eta_of(m, _surface_level(air))
         wave = float(torch.sqrt((g_prime * eta).clamp(min=0.0)).max())
         flow = float((u.abs() + v.abs()).max())
         courant = (flow + wave) * dt / dx
@@ -721,37 +724,45 @@ class Simulation:
         dts = dt / n
 
         for _ in range(n):
-            eta = eta_of(m, T)
+            eta = eta_of(m, _surface_level(air))
             surface = s.terrain + eta
             gx, gy = self._periodic_grad(surface, dx)
             # Forcing: -g'*grad(s) (terrain + buoyancy), weak surface friction, eddy viscosity.
             u = u + dts * (-g_prime * gx - C_d * u + nu * self._periodic_laplacian(u, dx))
             v = v + dts * (-g_prime * gy - C_d * v + nu * self._periodic_laplacian(v, dx))
 
-            # Conservative transport of mass, energy and momentum by the updated wind.
+            # Conservative transport of mass, momentum and every air level's energy by the updated
+            # wind. Each level's energy E_i = m*c_p*T_i rides the shared mass/wind (Phase 3): one wind
+            # moves all levels identically, so per-level advection just carries the vertical temperature
+            # structure with the flow (the canopy/above plumes tilt downwind like the surface). The
+            # energy stack takes a level axis on the displacement so the same (H,W) shift applies to
+            # every level (rank-agnostic for a batched stack too). Sum_i m*c_p*T_i is conserved to
+            # round-off, so the closed-core conservation is unaffected.
             dispx, dispy = u * dts / dx, v * dts / dx
-            energy = m * cp * T
+            m_lvl = m.unsqueeze(-3)
+            energy = m_lvl * cp * air                             # (L, H, W) each level's energy
             mom_x, mom_y = m * u, m * v
             m      = self._advect_periodic(m,      dispx, dispy)
-            energy = self._advect_periodic(energy, dispx, dispy)
+            energy = self._advect_periodic(energy, dispx.unsqueeze(-3), dispy.unsqueeze(-3))
             mom_x  = self._advect_periodic(mom_x,  dispx, dispy)
             mom_y  = self._advect_periodic(mom_y,  dispx, dispy)
 
             m_safe = m.clamp(min=1e-9)
             u, v = mom_x / m_safe, mom_y / m_safe
-            T = energy / (cp * m_safe)
+            air = energy / (cp * m_safe.unsqueeze(-3))            # recover each level's temperature
 
         # Open-boundary sponge: relax the edge belt toward the free-stream (synoptic wind and
         # rest-state mass/temperature) so the wind enters upwind and leaves downwind without
-        # piling or reflecting. Exact-exponential, so stable for any sponge strength.
+        # piling or reflecting. Exact-exponential, so stable for any sponge strength. Every air level
+        # relaxes toward its own rest profile (the temp_eq stack).
         decay = torch.exp(-self._sponge_rate(m.shape[-2:]) * dt)
         u = s.u_amb_x + (u - s.u_amb_x) * decay
         v = s.u_amb_y + (v - s.u_amb_y) * decay
         m = s.mass_eq + (m - s.mass_eq) * decay
-        T = _surface_level(s.temp_eq) + (T - _surface_level(s.temp_eq)) * decay
+        air = T_rest_all + (air - T_rest_all) * decay
 
         s.mass, s.x_wind_vel, s.y_wind_vel = m, u, v
-        s.air_temperatures = _with_surface(s.air_temperatures, T)
+        s.air_temperatures = air
         return s
 
     def _cover_fractions(self, fuel: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
