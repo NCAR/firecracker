@@ -260,6 +260,12 @@ class Simulation:
         bole = (cfg or {}).get("bole", {})
         self.bole_conduction_up:   float = float(bole.get("conduction_up",   1.0))
         self.bole_conduction_down: float = float(bole.get("conduction_down", 0.1))
+        # Crown-initiation preheat: a fraction of the surface combustion air-share conducts straight
+        # into the co-located surface bole (the trunk base basking in the surface flames) instead of
+        # warming the surface air. Decoupled from convective_fraction (which sets ROS), so a heavy
+        # trunk crosses ignition only under a SUSTAINED surface fire -- crowning is intensity-gated by
+        # fire duration. See the bole-preheat term in update_fire.
+        self.bole_preheat_fraction: float = float(bole.get("preheat_fraction", 0.6))
         # Convective fire spread (Phase 5.5c). Radiation preheats the fuel ahead but is too weak to
         # ignite a neighbour at realistic flame temperatures, so ignition is carried by convection: a
         # fraction of the plume's air-share heat is convected to nearby fuel to ignite it (hot plume
@@ -1135,6 +1141,30 @@ class Simulation:
         air_share_type = burn_heat_per_type * (1.0 - f)      # (N, H, W) [J/m^2] each type's air share
         air_share = torch.zeros_like(air_temperatures)       # (L, H, W)
         air_share.index_add_(-3, self._fuel_level_index, air_share_type)   # sum each level's shares
+
+        # Crown-initiation preheat (Phase 4): the trunk base basks in the surface fire. A fraction of
+        # the surface-level combustion air-share conducts straight into the co-located surface bole
+        # instead of warming the surface air (energy-conserving: it is removed from that level's air
+        # share). It is decoupled from convective_fraction -- which is calibrated low for realistic ROS
+        # and so cannot itself ignite the heavy, coarse bole -- so the crown transition is gated by fire
+        # DURATION: a brief light grass fire deposits too little to cross the bole's ignition, while a
+        # sustained or heavier surface fire accumulates enough to torch the trunk and start the climb.
+        # Only into a present, sub-flaming bole (a flaming bole is combustion-controlled). No-op without
+        # a split bole (single-fuel test worlds).
+        si = self._bole_surface_idx
+        if si is not None and self.bole_preheat_fraction > 0.0:
+            lvl_s = self.fuel_levels[si]                              # the surface bole's air level (0)
+            surf_share = air_share.select(-3, lvl_s)                 # (H, W) surface air-share
+            bole_gate = (fuel.select(-3, si) > self.fuel_burnt_threshold) & \
+                        (fuel_temperatures.select(-3, si) < self.flame_gate_temperature)
+            C_bole = (cp_fuel[si] * fuel.select(-3, si)).clamp(min=1e-9)   # (H, W) bole thermal mass
+            deposited = torch.where(bole_gate, self.bole_preheat_fraction * surf_share,
+                                    torch.zeros_like(surf_share))     # (H, W) energy into the bole
+            fuel_temperatures = fuel_temperatures.clone()
+            fuel_temperatures[..., si, :, :] = (
+                fuel_temperatures[..., si, :, :] + deposited / C_bole
+            ).clamp(min=0.0)
+            air_share[..., lvl_s, :, :] = air_share[..., lvl_s, :, :] - deposited   # conserve energy
 
         # Convective ignition (Phase 5.5c): radiation preheats the fuel ahead but can't ignite a
         # neighbour at a realistic flame temperature, so a fraction of the fresh air-share heat is

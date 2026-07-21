@@ -144,6 +144,15 @@ enabled       = true         # if false, skip the inter-level convection stage
 # relaxation lambda [1/s] (gap decays by exp(-lambda*dt)); Phase-4-tunable placeholders.
 conduction_up   = 1.0        # k_up [1/s]: surface bole hotter -> fire climbs (fast)
 conduction_down = 0.1        # k_down [1/s]: canopy bole hotter -> fire descends (slow), k_down << k_up
+# Crown-initiation preheat (Phase 4): fraction of the surface combustion air-share conducted straight
+# into the co-located surface bole (the trunk basking in the surface flames) instead of warming the
+# surface air. Decoupled from convective_fraction (which is calibrated low for realistic ROS and so
+# cannot ignite the heavy coarse bole), it makes the crown transition intensity-gated by fire duration:
+# a brief light grass fire deposits too little to torch the trunk, a sustained/heavier surface fire does.
+preheat_fraction = 0.6       # in [0,1]; 0 disables the crown transition (surface fire never climbs).
+                             # Phase-4 calibration: 0.6 gates crowning so a light grass understory
+                             # (0.3 kg/m^2) never crowns, while a moderate grass (~1.5) or shrub (~0.8)
+                             # understory at ~10 m/s does.
 
 [momentum]
 # Shallow boundary-layer orographic wind (see docs/units.md). The wind is prognostic
