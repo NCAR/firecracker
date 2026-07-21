@@ -215,7 +215,11 @@ burn_heat_fuel_fraction  = 0.05   # fraction of burn heat deposited into fuel (s
 combustion_mixing_depth  = 30.0   # d_mix [m]: depth of the near-surface layer the fire draws O2 from
 surface_mass_transfer    = 0.02   # h [kg/(m^2*s)]: O2 film-transport flux to a fuel surface (the hot-burn cap)
 plume_mixing_depth       = 100.0  # d_plume [m]: shallow plume the air-share burn heat is injected into
-convective_fraction      = 0.24   # share of the air-share heat convected to nearby fuel (spread driver)
+convective_fraction      = 0.03   # share of the air-share heat convected to nearby fuel (spread driver).
+                                  # Phase-4 ROS calibration (2026-07): dropped from 0.24 -> 0.03 to bring
+                                  # head-fire rate of spread into realistic fractions of the wind at
+                                  # 10 m/s -- grass ~18%, shrub ~9%, forest surface ~6% (was 100/66/81%);
+                                  # ordering (grass fastest) preserved. See tools/vertical_levels/ros_test.py.
 flame_gate_temperature   = 700.0  # K: convection ignites only fuel below this (flaming fuel is combustion-set)
 convective_radius_m      = 10.0   # reach [m] of the convective ignition onto neighbouring fuel
 convective_wind_bias     = 1.0    # downwind skew of the convective ignition (concentration on wind/u_ref)

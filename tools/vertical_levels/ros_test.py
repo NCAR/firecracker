@@ -35,6 +35,12 @@ def measure(fuel_loads: dict, carrier: str) -> dict:
     cfg.setdefault("units", {})["seconds_per_tick"] = DT
     if "CANOPY_SAV" in os.environ:
         cfg["fuel_types"]["tree_canopy"]["surface_area_to_volume"] = float(os.environ["CANOPY_SAV"])
+    # Tuning hooks (Phase 4): override the convective-spread knobs from the environment so a sweep
+    # can search for realistic ROS/wind fractions without editing the config.
+    for env, key in (("CF", "convective_fraction"), ("WBIAS", "convective_wind_bias"),
+                     ("WREF", "convective_wind_ref"), ("CRAD", "convective_radius_m")):
+        if env in os.environ:
+            cfg.setdefault("fire", {})[key] = float(os.environ[env])
     sim = Simulation(cfg)
     names = sim.fuel_type_names
     idx = {n: names.index(n) for n in names}
