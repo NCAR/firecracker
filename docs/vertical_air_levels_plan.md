@@ -7,6 +7,36 @@ validated the multi-level dynamics in isolation (`tools/vertical_levels/phase0_d
 advection scheme is stable, the old fire-wind amplifier is ~15× (not 89×) and is an energy-over-count,
 and the ~15× weaker energy-correct fire-wind is **accepted** (no `reduced_gravity` retune).
 
+## ✅ IGNITION REALISM (single cell, no fuel pile, measured temps) — DONE
+
+**Asks:** (1) make ignition a *single cell* (an ember / dropped cigarette); (2) the ignition point
+burned far too long; (3) measure the ignition temperature — if it burns hotter than everything else it
+skews the NN's per-frame min-max normalisation.
+
+**What was wrong:** both ignition sites (`firecracker_env._spawn_fire_patch`, `rollout._ignite`) lit a
+radius-5 **disc** and, worse, **overwrote every fuel type to 1.0 kg/m²** at each patch cell. That piled a
+slow-burning bole stack (a_s=1, slow Arrhenius) onto the cell: measured, the piled `tree_bole_*` at the
+ignition cell **smouldered for the entire 150 s run (still going, ~974 K)**, while grass burnt out in
+9.6 s. After the front passed, burnt-over cells cooled to ~305 K but the ignition cell stayed ~1000+ K —
+**a lone persistent hot point that is exactly the per-frame min-max outlier the user worried about.**
+
+**Temperature measurement (grass bed, 10 m/s):** steady flame peak **~1270 K**, mean of burning cells
+~1100 K. Ignition seed = `threshold × 2` = **1146 K** — *cooler* than a steady flame, so the seed itself
+is **not** a normalisation outlier (combustion sets the ceiling either way). The outlier was the pile's
+persistence, not the seed temperature.
+
+**Fix:** ignition now heats the surface air + only the **fine surface fuel already present** (grass,
+shrub — new `Simulation.surface_ignitable_indices`, excludes the coarse bole), **piles on no fuel**, over
+a **single cell** (`spawn_radius` 5→**0**). Seed is `ignition_seed_multiplier` (config, default 2.0). The
+trunk/canopy catch only via the ladder. After the fix: the ignition cell burns **7.6 s** (grass) and
+cools to ambient like every burnt cell — **within the field distribution, no outlier** (verified). A cell
+with no fine fuel simply doesn't light (realistic). 138 physics tests green.
+
+**Single-cell establishment is marginal (open):** on the low-wind map (5.8 m/s) a single grass cell
+establishes **~75%** of the time (nf=0.05); failures are the sparsest/gappiest cells. Higher wind does
+better. Open question for the user: accept this as realistic ember behaviour, or push reliability up
+(bump `near_field_fraction`, at some head-ROS cost; or bias the random spawn onto receptive grass).
+
 ## ✅ POINT-IGNITION FIX (near-field ignition term) — DONE
 
 **Bug (found running the interactive sim):** a real fire "never spread beyond a few meters" from the

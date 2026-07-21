@@ -877,10 +877,16 @@ class FirecrackerEnv(gymnasium.Env):
         rows_idx = torch.arange(self._sim_size, device=self._sim.device).view(-1, 1)
         cols_idx = torch.arange(self._sim_size, device=self._sim.device).view(1, -1)
         patch = (rows_idx - row) ** 2 + (cols_idx - col) ** 2 <= self._fire_spawn_radius ** 2
-        self._air_temperatures[0][patch] = float(self._sim.ignition_thresholds.max()) * 2.0   # surface air
-        for n in range(self._sim.num_fuel_types):
-            self._fuel_temperatures[n][patch] = float(self._sim.ignition_thresholds[n]) * 2.0
-            self._fuel[n][patch] = 1.0
+        # Ground ignition (an ember / dropped cigarette): heat the surface air and only the fine
+        # surface fuel already present (grass, shrub). We do NOT pile on fuel -- the old code set every
+        # type to 1.0 kg/m^2, dropping a slow bole stack on the cell that smouldered for ~150 s (a lone
+        # persistent hot point that skews per-frame min-max normalisation) -- and we do NOT torch the
+        # trunk/canopy, which catch only when the fire climbs the ladder. A cell with no fine fuel just
+        # doesn't light (realistic); a healthy model spreads one hot grass cell downwind on its own.
+        seed = self._sim.ignition_seed_multiplier
+        self._air_temperatures[0][patch] = float(self._sim.ignition_thresholds.max()) * seed   # surface air
+        for n in self._sim.surface_ignitable_indices:
+            self._fuel_temperatures[n][patch] = float(self._sim.ignition_thresholds[n]) * seed
 
     def _handle_events(self) -> tuple[bool, ViewMode, tuple[int, int] | None]:
         running = self._running

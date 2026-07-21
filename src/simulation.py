@@ -306,6 +306,12 @@ class Simulation:
         # a realistic point/disc ignition close its perimeter and establish; being isotropic and
         # short-range it barely moves the steady head ROS, so the two knobs decouple ignitability from
         # the calibrated head rate. Default 0 -> the term is inert (byte-identical to before).
+        # Ignition seed temperature as a multiple of a fuel's ignition threshold: a spawn/click sets
+        # the lit cell's fine-fuel (and surface-air) temperature to threshold*this, just hot enough for
+        # combustion to take over. It is NOT an outlier for normalisation -- a steady flame self-heats
+        # hotter than the seed (measured ~1270 K peak vs a 1146 K seed for grass), so the seed never
+        # sets the field maximum.
+        self.ignition_seed_multiplier:    float = float(fire.get("ignition_seed_multiplier",    2.0))
         self.near_field_fraction:         float = float(fire.get("near_field_fraction",         0.0))
         nf_radius_m                             = float(fire.get("near_field_radius_m", self.cell_size_m))
         self.near_field_radius:           int   = max(1, round(nf_radius_m / self.cell_size_m))
@@ -353,6 +359,15 @@ class Simulation:
             self.fuel_type_names.index("tree_bole_canopy")
             if "tree_bole_canopy" in self.fuel_type_names else None
         )
+        # Fuels a small ground ignition (an ember, a dropped cigarette) can light directly: the fine
+        # surface fuels -- surface-level (level 0) fuels that are not the coarse bole. Grass and shrub
+        # flash from an ember; the tree bole and canopy are lit only once the fire climbs the ladder,
+        # never by the initial seed. Used by the ignition helpers in rollout.py / firecracker_env.py so
+        # a spawn heats existing fine fuel in place (it does NOT pile on fuel or torch the trunk).
+        self.surface_ignitable_indices: list[int] = [
+            i for i, lvl in enumerate(self.fuel_levels)
+            if lvl == 0 and i not in (self._bole_surface_idx,)
+        ]
 
         def _ft(name: str, key: str, default: float) -> float:
             return float(fuel_types_cfg.get(name, {}).get(key, default))

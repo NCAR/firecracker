@@ -244,7 +244,11 @@ convective_wind_bias     = 1.0    # downwind skew of the convective ignition (co
 convective_wind_ref      = 10.0   # u_ref [m/s]: wind speed at which the wind bias matches the old unit form
 convective_slope_bias    = 2.5    # upslope skew of the convective ignition (concentration on tan^2(slope))
 spawn_fire               = false  # if true, a random fire spawns at reset; if false, left-click to ignite
-spawn_radius             = 5      # radius (in grid cells) of the circular ignition patch
+spawn_radius             = 0      # radius (grid cells) of the ignition patch; 0 = a single cell (an ember /
+                                  # dropped cigarette). A healthy model spreads one hot grass cell downwind.
+ignition_seed_multiplier = 2.0    # a spawn heats the lit cell's fine fuel + surface air to threshold*this,
+                                  # just enough for combustion to take over. NOT a normalisation outlier: a
+                                  # steady flame self-heats hotter (~1270 K) than the seed (~1146 K for grass).
 
 [biomes]
 # Non-overlapping vegetation biomes. Every cell is labelled exactly one biome from its elevation

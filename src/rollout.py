@@ -310,14 +310,20 @@ class BatchedRollout:
         patch = (rows - r0) ** 2 + (cols - c0) ** 2 <= self._fire_radius ** 2   # (B, N, N)
 
         ign_max = float(self._sim.ignition_thresholds.max())
-        # Ground ignition: heat only the surface air level (level 0). The canopy level catches only
-        # once the ladder carries fire up, so a spawn must not warm the elevated levels directly.
+        # Ground ignition (an ember / dropped cigarette): heat only the surface air level (level 0)
+        # and the fine surface fuel that is already there -- grass and shrub, the flashy fuels an ember
+        # lights. We do NOT pile on fuel (the old code overwrote every type to 1.0 kg/m^2, which dropped
+        # a slow-burning bole stack on the cell that then smouldered for 150 s -- a lone persistent hot
+        # point that wrecks per-frame min-max normalisation) and we do NOT torch the trunk or canopy:
+        # those catch only once the fire climbs the ladder. A cell with no fine fuel simply doesn't
+        # light, which is realistic. If the physics is healthy, one hot cell of grass spreads downwind.
         surf_air = s.air_temperatures[:, 0]   # (B, H, W) surface level view
-        s.air_temperatures[:, 0] = torch.where(patch, torch.full_like(surf_air, ign_max * 2.0), surf_air)
-        for t in range(self._sim.num_fuel_types):
+        s.air_temperatures[:, 0] = torch.where(patch, torch.full_like(surf_air, ign_max * self._sim.ignition_seed_multiplier), surf_air)
+        for t in self._sim.surface_ignitable_indices:
             ign_t = float(self._sim.ignition_thresholds[t])
-            s.fuel_temperatures[:, t] = torch.where(patch, torch.full_like(s.fuel_temperatures[:, t], ign_t * 2.0), s.fuel_temperatures[:, t])
-            s.fuel[:, t] = torch.where(patch, torch.ones_like(s.fuel[:, t]), s.fuel[:, t])
+            s.fuel_temperatures[:, t] = torch.where(
+                patch, torch.full_like(s.fuel_temperatures[:, t], ign_t * self._sim.ignition_seed_multiplier), s.fuel_temperatures[:, t]
+            )
 
     # -----------------------------------------------------------------------
     # Collection / sampling
