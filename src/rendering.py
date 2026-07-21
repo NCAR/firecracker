@@ -42,8 +42,12 @@ VEGETATION_COLORS: dict[str, tuple[float, float, float]] = {
     "tree":        (0.0,  1.0, 0.0),   # green
     "tree_canopy":        (0.0,  1.0, 0.0),   # green (a tree's fine fuel)
     "tree_bole":          (0.5,  0.4, 0.3),   # brown (a tree's coarse fuel); only shown through a thin canopy
-    "tree_bole_surface":  (0.5,  0.4, 0.3),   # brown (lower-trunk segment)
-    "tree_bole_canopy":   (0.5,  0.4, 0.3),   # brown (upper-trunk segment)
+    # The trunk is split into two co-located segments for the vertical-air-levels physics, but it is
+    # ONE trunk visually. The vegetation blend is additive, so each carries HALF the trunk brown and
+    # the two sum back to the single-trunk (0.5, 0.4, 0.3); giving each the full brown would double it
+    # to (1.0, 0.8, 0.6) and render an exposed trunk peachy-white instead of brown.
+    "tree_bole_surface":  (0.25, 0.2, 0.15),  # half-brown (lower-trunk segment; pairs with the upper)
+    "tree_bole_canopy":   (0.25, 0.2, 0.15),  # half-brown (upper-trunk segment; pairs with the lower)
     "grass":       (0.75, 1.0, 0.0),   # yellow-green
     "shrub":       (0.5,  0.75, 0.25), # muted olive-green (woody scrub)
 }
