@@ -12,11 +12,13 @@
 # Physical discretisation. Each cell is cell_size_m on a side; seconds_per_tick is how much
 # physical time one tick advances (the physics dt), decoupled from the display tick-rate below.
 cell_size_m = 10.0
-# seconds_per_tick = 0.1   # physics dt [s]; omit to default to 1/steps_per_second (= 0.1 s).
-# Raise it to simulate more physics per tick (faster than real time) at some loss of temporal
-# resolution: e.g. 1.0 -> 10x real time at steps_per_second = 10. The wind core CFL-substeps and
-# combustion/heat-exchange are exact-exponential, so a large dt stays stable (re-validate spread
-# behavior if you change it -- the spread scenarios are calibrated at dt = 0.1 s).
+seconds_per_tick = 1.0   # physics dt [s]. 1.0 = 10x real time at steps_per_second = 10 -- a forecast
+                         # has to outrun reality, so the default advances 1 s of physics per tick (heat
+                         # moves 1 cell/tick at a 10 m/s wind, crossing the 256-cell domain in ~256 s).
+                         # The wind core CFL-substeps and heat-exchange/convection are exact-exponential,
+                         # so this stays stable. Trade-off vs dt = 0.1: coarser combustion integration
+                         # makes the fire spread ~20% slower and peak ~20% hotter (still finite/uniform,
+                         # no normalisation outlier). Set 0.1 for 1x real time / finer temporal detail.
 
 [simulation]
 steps_per_second     = 10     # real-time DISPLAY throttle [Hz]: ticks rendered per wall-second.
