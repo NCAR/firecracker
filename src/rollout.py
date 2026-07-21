@@ -73,6 +73,11 @@ from map_loader import load_map, resolve_map, list_maps, validate_against_config
 
 DEFAULT_GRID_SIZE = 256
 
+# Minimum fine-fuel load [kg/m^2] for a random auto-spawn to treat a cell as receptive (worth
+# igniting), so training ignitions land on grass/shrub rather than bare ground. Mirrors the same
+# constant in firecracker_env (kept local -- rollout stays decoupled from the pygame env).
+_RECEPTIVE_FUEL_MIN: float = 0.3
+
 # Filenames used by build_dataset / FireDataset for an on-disk sharded dataset.
 _META_NAME = "meta.json"
 _SHARD_GLOB = "shard_*.npy"
@@ -304,7 +309,21 @@ class BatchedRollout:
         dev = self._sim.device
         rows = torch.arange(n, device=dev).view(1, -1, 1)
         cols = torch.arange(n, device=dev).view(1, 1, -1)
-        centres = self._np_rng.integers(0, self.grid_size, size=(2, self.num_envs)) + self._pad
+        # Bias each world's ignition onto a cell that carries fine surface fuel (grass/shrub) the ember
+        # can light, so a training auto-spawn doesn't waste itself on bare ground (see _pick_receptive
+        # in firecracker_env). Per world: draw uniformly among that world's receptive interior cells.
+        centres = np.empty((2, self.num_envs), dtype=np.int64)
+        interior = slice(self._pad, self._pad + self.grid_size)
+        fine = s.fuel[:, self._sim.surface_ignitable_indices, interior, interior].sum(dim=1)  # (B, g, g)
+        receptive = fine > _RECEPTIVE_FUEL_MIN
+        for b in range(self.num_envs):
+            cells = torch.nonzero(receptive[b], as_tuple=False)   # observed coords
+            if cells.shape[0] > 0:
+                r, c = cells[int(self._np_rng.integers(0, cells.shape[0]))].tolist()
+            else:
+                r, c = int(self._np_rng.integers(0, self.grid_size)), int(self._np_rng.integers(0, self.grid_size))
+            centres[0, b], centres[1, b] = r, c
+        centres = centres + self._pad
         r0 = torch.as_tensor(centres[0], device=dev).view(-1, 1, 1)
         c0 = torch.as_tensor(centres[1], device=dev).view(-1, 1, 1)
         patch = (rows - r0) ** 2 + (cols - c0) ** 2 <= self._fire_radius ** 2   # (B, N, N)

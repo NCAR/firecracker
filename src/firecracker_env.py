@@ -87,6 +87,9 @@ WINDOW_TITLE: str = "Firecracker"
 TARGET_FPS: int = 60
 
 FIRE_SPAWN_RADIUS: int = 5
+# Minimum fine-fuel load [kg/m^2] for a random auto-spawn to consider a cell "receptive" (worth
+# igniting). Keeps auto-spawns off bare ground / bare tree cells; manual clicks ignore this.
+_RECEPTIVE_FUEL_MIN: float = 0.3
 
 # Alpha of the white rectangle blended over the action-cell under the mouse (0-255):
 # subtle enough that the underlying view still reads clearly.
@@ -429,8 +432,7 @@ class FirecrackerEnv(gymnasium.Env):
         # runtime concern applied on top. The patch is placed in the observed interior (coords are
         # offset into the padded grid by _spawn_fire_patch), so a spawned fire is always on-screen.
         if self._spawn_fire:
-            r = int(self.np_random.integers(0, self.grid_size))
-            c = int(self.np_random.integers(0, self.grid_size))
+            r, c = self._pick_receptive_cell()
             self._spawn_fire_patch(r, c)
 
         # Radiant-flux buffer lives on the physics grid (it travels in SimState through the engine).
@@ -869,6 +871,22 @@ class FirecrackerEnv(gymnasium.Env):
         self._x_wind_fire       = s.x_wind_fire
         self._y_wind_fire       = s.y_wind_fire
         self._last_radiant_flux = s.radiant_flux
+
+    def _pick_receptive_cell(self) -> tuple[int, int]:
+        """Random observed-interior cell that carries fine surface fuel (grass/shrub) an ember can
+        light, so a random auto-spawn doesn't waste itself on bare ground or a bare tree cell (a lone
+        ember there realistically fizzles -- fine for a deliberate manual click, not for an auto-spawn
+        whose job is to start a fire). Falls back to any cell if the map has no fine fuel at all."""
+        idx = self._sim.surface_ignitable_indices
+        interior = slice(self._pad, self._pad + self.grid_size)
+        fine = self._fuel[idx, interior, interior].sum(dim=0)          # (grid, grid) fine-fuel load
+        receptive = torch.nonzero(fine > _RECEPTIVE_FUEL_MIN, as_tuple=False)   # observed coords
+        if receptive.numel() == 0:
+            return (int(self.np_random.integers(0, self.grid_size)),
+                    int(self.np_random.integers(0, self.grid_size)))
+        pick = int(self.np_random.integers(0, receptive.shape[0]))
+        r, c = receptive[pick].tolist()
+        return int(r), int(c)
 
     def _spawn_fire_patch(self, row: int, col: int) -> None:
         # (row, col) are observed-grid coordinates (from a click or a random pick); offset by _pad

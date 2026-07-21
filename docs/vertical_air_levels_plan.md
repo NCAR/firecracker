@@ -32,10 +32,14 @@ trunk/canopy catch only via the ladder. After the fix: the ignition cell burns *
 cools to ambient like every burnt cell — **within the field distribution, no outlier** (verified). A cell
 with no fine fuel simply doesn't light (realistic). 138 physics tests green.
 
-**Single-cell establishment is marginal (open):** on the low-wind map (5.8 m/s) a single grass cell
-establishes **~75%** of the time (nf=0.05); failures are the sparsest/gappiest cells. Higher wind does
-better. Open question for the user: accept this as realistic ember behaviour, or push reliability up
-(bump `near_field_fraction`, at some head-ROS cost; or bias the random spawn onto receptive grass).
+**Single-cell establishment is marginal — resolved by biasing the spawn (user's choice):** on the
+low-wind map (5.8 m/s) a single grass cell establishes **~75%** of the time (nf=0.05); failures are the
+sparsest/gappiest cells (higher wind does better). Rather than push nf up (would re-inflate head ROS), a
+random **auto-spawn** now lands on a *receptive* cell — fine-fuel load > `_RECEPTIVE_FUEL_MIN` (0.3
+kg/m²) — via `firecracker_env._pick_receptive_cell` and the per-world pick in `rollout._ignite`, so
+training/demo ignitions don't waste on bare ground. **Manual clicks are unchanged** (a deliberate ember
+on bare ground realistically fizzles). The physics/nf are untouched; a lone ember on marginal fuel can
+still take ~50 s to catch at low wind before it runs.
 
 ## ✅ POINT-IGNITION FIX (near-field ignition term) — DONE
 
