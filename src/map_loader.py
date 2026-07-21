@@ -59,7 +59,10 @@ MAP_SUFFIX = ".npz"
 #         thinning). Grass grows on the grassland (and, more thinly, the woodland), shrub only on the
 #         shrubland, and trees at a per-biome density (dense woodland, sparse grassland, modest
 #         shrubland). v9 fuel maps differ, so they are rejected (regenerate).
-UNITS_VERSION = 10
+#   v11 = the tree bole is split into two vertically-stacked fuels (tree_bole_surface,
+#         tree_bole_canopy) for the vertical-air-levels ladder, so the fuel stack is now (5, H, W)
+#         instead of (4, H, W). v10 maps have a 4-fuel stack, so they are rejected (regenerate).
+UNITS_VERSION = 11
 
 # Maps live at <repo_root>/maps by default (alongside cfg/), same convention as
 # config.py. A relative maps dir is anchored here so the app finds its maps
