@@ -12,14 +12,15 @@ import numpy as np
 import torch
 
 from config import load_config
-from simulation import Simulation, SimState
+from simulation import Simulation, SimState, lift_air_levels
 from gen_maps import MapGenerator
 import physics_constants as pc
 
 GRID = 48
 TICKS = 4000            # 0.1 s/tick -> 400 s of sim time
 CANOPY = 2.8           # max canopy load (4 trees)
-BOLE = 17.2            # max bole load (4 trees)
+SURFACE_BOLE = 5.72    # tree_bole_surface load (~1/3 of the old 17.2 single bole)
+CANOPY_BOLE = 11.48    # tree_bole_canopy load  (~2/3) -- co-located with the ignited canopy
 GRASS = 0.3            # woodland understorey grass
 
 
@@ -28,7 +29,10 @@ def run(canopy_sav: float) -> dict:
     cfg["fuel_types"]["tree_canopy"]["surface_area_to_volume"] = float(canopy_sav)
     sim = Simulation(cfg)
     names = sim.fuel_type_names
-    gi, si, ci, bi = (names.index(n) for n in ("grass", "shrub", "tree_canopy", "tree_bole"))
+    gi, ci = names.index("grass"), names.index("tree_canopy")
+    bsi, bci = names.index("tree_bole_surface"), names.index("tree_bole_canopy")
+    # The ignited canopy is level 1, co-located with the canopy bole -- track that segment's catch.
+    bi = bci
     bole_ign = float(sim.ignition_thresholds[bi])
 
     terrain = np.zeros((GRID, GRID), dtype=np.float64)
@@ -37,12 +41,14 @@ def run(canopy_sav: float) -> dict:
     mass = gen.boundary_layer_mass(terrain)
     oxygen = gen.oxygen_profile(terrain, air)
     t = lambda a: torch.as_tensor(a, dtype=sim.dtype, device=sim.device)
-    air_t, mass_t, oxy_t, terr_t = t(air), t(mass), t(oxygen), t(terrain)
+    air2d, mass_t, oxy_t, terr_t = t(air), t(mass), t(oxygen), t(terrain)
+    air_t = lift_air_levels(air2d, sim.num_air_levels)   # (L, H, W) per-level air stack
 
     fuel = torch.zeros((len(names), GRID, GRID), dtype=sim.dtype, device=sim.device)
     fuel[gi] = GRASS
     fuel[ci] = CANOPY
-    fuel[bi] = BOLE
+    fuel[bsi] = SURFACE_BOLE
+    fuel[bci] = CANOPY_BOLE
     ftemp = torch.full((len(names), GRID, GRID), pc.T_REF, dtype=sim.dtype, device=sim.device)
 
     # Ignite a central 3-cell-radius patch via the FINE fuels + air only. The bole is left
@@ -52,15 +58,16 @@ def run(canopy_sav: float) -> dict:
     cc = torch.arange(GRID).view(1, -1)
     patch = (rr - c) ** 2 + (cc - c) ** 2 <= 3 ** 2
     hot = float(sim.ignition_thresholds[ci]) * 2.0
-    air_t[patch] = hot
+    air_t[0][patch] = hot          # surface air (grass)
+    air_t[1][patch] = hot          # canopy air (canopy foliage)
     ftemp[gi][patch] = hot
     ftemp[ci][patch] = hot
-    # bole temperature deliberately NOT set
+    # bole temperatures deliberately NOT set -- they must catch on their own from the fire
 
     z = torch.zeros_like(mass_t)
     ax = torch.zeros((1, 1), dtype=sim.dtype)
     s = SimState(
-        mass=mass_t, air_temperatures=air_t, ground_temperature=air_t.clone(),
+        mass=mass_t, air_temperatures=air_t, ground_temperature=air2d.clone(),
         fuel_temperatures=ftemp, fuel=fuel, oxygen=oxy_t, terrain=terr_t,
         temp_eq=air_t.clone(), oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
         x_wind_vel=z.clone(), y_wind_vel=z.clone(), u_amb_x=ax, u_amb_y=ax.clone(),

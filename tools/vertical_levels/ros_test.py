@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from config import load_config
-from simulation import Simulation, SimState
+from simulation import Simulation, SimState, lift_air_levels
 from gen_maps import MapGenerator
 import physics_constants as pc
 
@@ -24,7 +24,7 @@ SAMPLE = 10            # record the front every SAMPLE ticks
 
 # (name, {fuel_type: load}, fine-fuel carrier used to track the front)
 SCENARIOS = [
-    ("forest",    {"tree_canopy": 2.8, "tree_bole": 17.2}, "tree_canopy"),
+    ("forest",    {"tree_canopy": 2.8, "tree_bole_surface": 5.72, "tree_bole_canopy": 11.48}, "tree_canopy"),
     ("grass",     {"grass": 1.0},                          "grass"),
     ("shrubland", {"shrub": 0.8},                          "shrub"),
 ]
@@ -46,7 +46,8 @@ def measure(fuel_loads: dict, carrier: str) -> dict:
     mass = gen.boundary_layer_mass(terrain)
     oxygen = gen.oxygen_profile(terrain, air)
     t = lambda a: torch.as_tensor(a, dtype=sim.dtype, device=sim.device)
-    air_t, mass_t, oxy_t, terr_t = t(air), t(mass), t(oxygen), t(terrain)
+    air2d, mass_t, oxy_t, terr_t = t(air), t(mass), t(oxygen), t(terrain)
+    air_t = lift_air_levels(air2d, sim.num_air_levels)   # (L, H, W) per-level air stack
 
     fuel = torch.zeros((len(names), HY, WX), dtype=sim.dtype, device=sim.device)
     for n, load in fuel_loads.items():
@@ -58,7 +59,7 @@ def measure(fuel_loads: dict, carrier: str) -> dict:
     # Planar line-ignition: columns 4..8, full height, fine fuel + air hot.
     ign_cols = slice(4, 9)
     hot = float(sim.ignition_thresholds.max()) * 2.0
-    air_t[:, ign_cols] = hot
+    air_t[0, :, ign_cols] = hot                          # surface-level ignition strip
     ftemp[ci][:, ign_cols] = hot
 
     wx = torch.full((HY, WX), WIND, dtype=sim.dtype, device=sim.device)
@@ -66,7 +67,7 @@ def measure(fuel_loads: dict, carrier: str) -> dict:
     ax = torch.tensor(WIND, dtype=sim.dtype).view(1, 1)
     ay = torch.zeros((1, 1), dtype=sim.dtype)
     s = SimState(
-        mass=mass_t, air_temperatures=air_t, ground_temperature=air_t.clone(),
+        mass=mass_t, air_temperatures=air_t, ground_temperature=air2d.clone(),
         fuel_temperatures=ftemp, fuel=fuel, oxygen=oxy_t, terrain=terr_t,
         temp_eq=air_t.clone(), oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
         x_wind_vel=wx, y_wind_vel=wy, u_amb_x=ax, u_amb_y=ay, radiant_flux=wy.clone(),

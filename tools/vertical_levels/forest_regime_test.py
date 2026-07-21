@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from config import load_config
-from simulation import Simulation, SimState
+from simulation import Simulation, SimState, lift_air_levels
 from gen_maps import MapGenerator
 import physics_constants as pc
 
@@ -22,7 +22,8 @@ TICKS = 1000
 WIND = float(os.environ.get("WIND","10.0"))
 SAMPLE = 10
 GRASS_UNDER = 0.3      # woodland understory grass
-BOLE = 17.2
+SURFACE_BOLE = 5.72    # tree_bole_surface load (~1/3 of the old 17.2 single bole)
+CANOPY_BOLE = 11.48    # tree_bole_canopy load  (~2/3)
 
 
 def front_ros(consumed_series, ts, dx):
@@ -45,7 +46,8 @@ def run(canopy_load: float, canopy_sav: float | None, label: str) -> dict:
     names = sim.fuel_type_names
     idx = {n: names.index(n) for n in names}
     dx = sim.cell_size_m
-    gi, ci, bi = idx["grass"], idx["tree_canopy"], idx["tree_bole"]
+    gi, ci = idx["grass"], idx["tree_canopy"]
+    bsi, bci = idx["tree_bole_surface"], idx["tree_bole_canopy"]   # track the surface bole (catches first)
 
     terrain = np.zeros((HY, WX), dtype=np.float64)
     gen = MapGenerator(cfg)
@@ -57,14 +59,15 @@ def run(canopy_load: float, canopy_sav: float | None, label: str) -> dict:
     fuel = torch.zeros((len(names), HY, WX), dtype=sim.dtype)
     fuel[gi] = GRASS_UNDER
     fuel[ci] = canopy_load
-    fuel[bi] = BOLE
+    fuel[bsi] = SURFACE_BOLE
+    fuel[bci] = CANOPY_BOLE
     canopy0 = float(fuel[ci].sum()) or 1.0
-    bole0 = float(fuel[bi].sum())
+    bole0 = float(fuel[bsi].sum())
 
     ftemp = torch.full((len(names), HY, WX), pc.T_REF, dtype=sim.dtype)
-    air_t = t(air)
-    # SURFACE ignition: understory grass + air only. Canopy and bole start at ambient.
-    air_t[:, 4:9] = float(sim.ignition_thresholds.max()) * 2.0
+    air_t = lift_air_levels(t(air), sim.num_air_levels)   # (L, H, W) per-level air stack
+    # SURFACE ignition: understory grass + surface air only. Canopy and bole start at ambient.
+    air_t[0, :, 4:9] = float(sim.ignition_thresholds.max()) * 2.0
     ftemp[gi][:, 4:9] = float(sim.ignition_thresholds[gi]) * 2.0
 
     wx = torch.full((HY, WX), WIND, dtype=sim.dtype)
@@ -74,7 +77,7 @@ def run(canopy_load: float, canopy_sav: float | None, label: str) -> dict:
     s = SimState(
         mass=t(mass), air_temperatures=air_t, ground_temperature=t(air).clone(),
         fuel_temperatures=ftemp, fuel=fuel, oxygen=t(oxygen), terrain=t(terrain),
-        temp_eq=t(air).clone(), oxygen_eq=t(oxygen).clone(), mass_eq=t(mass).clone(),
+        temp_eq=lift_air_levels(t(air), sim.num_air_levels), oxygen_eq=t(oxygen).clone(), mass_eq=t(mass).clone(),
         x_wind_vel=wx, y_wind_vel=wy, u_amb_x=ax, u_amb_y=ay, radiant_flux=wy.clone(),
     )
 
@@ -95,7 +98,7 @@ def run(canopy_load: float, canopy_sav: float | None, label: str) -> dict:
             cfront.append(lead(s.fuel[ci] < 0.5 * (canopy_load or 1e9)))
 
     canopy_burned = 100.0 * (canopy0 - float(s.fuel[ci].sum())) / canopy0
-    bole_burned = 100.0 * (bole0 - float(s.fuel[bi].sum())) / bole0
+    bole_burned = 100.0 * (bole0 - float(s.fuel[bsi].sum())) / bole0   # surface-bole consumption
     return {
         "label": label,
         "surface_ros": front_ros(gfront, ts, dx),
@@ -106,7 +109,7 @@ def run(canopy_load: float, canopy_sav: float | None, label: str) -> dict:
 
 
 if __name__ == "__main__":
-    print(f"woodland bed: grass understory {GRASS_UNDER} + canopy + bole {BOLE}, SURFACE ignition")
+    print(f"woodland bed: grass understory {GRASS_UNDER} + canopy + bole {SURFACE_BOLE}/{CANOPY_BOLE}, SURFACE ignition")
     print(f"wind {WIND} m/s, dt={DT}s, {TICKS} ticks = {TICKS*DT:.0f}s  (shrub ref ROS ~6.9 m/s)\n")
     print("{:>28} {:>13} {:>11} {:>13} {:>11}".format(
         "scenario", "surface ROS", "crown ROS", "canopy burnt", "bole burnt"))
