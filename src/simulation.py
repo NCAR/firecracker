@@ -296,6 +296,19 @@ class Simulation:
         # (no saturation). convective_concentration_max caps |b| only to keep exp() from overflowing
         # at the spurious terrain-wrap gradient -- a numerical guard, not a physical limit.
         self._conv_concentration_max:     float = float(fire.get("convective_concentration_max", 12.0))
+        # Near-field ignition (Rothermel's no-wind baseline R0): an isotropic, short-range share of
+        # each fuel's plume heat that reaches the immediate neighbours regardless of wind direction
+        # (buoyant flame contact, not the wind-tilted plume). convective_fraction sets the wind-driven
+        # HEAD rate of spread; on its own it is directional, so a small point ignition throws nearly
+        # all its heat downwind and the flanks/back starve -- the nascent fire cannot consolidate its
+        # perimeter and self-extinguishes, even though an established line front at the same
+        # convective_fraction spreads fine. near_field_fraction is the wind-independent term that lets
+        # a realistic point/disc ignition close its perimeter and establish; being isotropic and
+        # short-range it barely moves the steady head ROS, so the two knobs decouple ignitability from
+        # the calibrated head rate. Default 0 -> the term is inert (byte-identical to before).
+        self.near_field_fraction:         float = float(fire.get("near_field_fraction",         0.0))
+        nf_radius_m                             = float(fire.get("near_field_radius_m", self.cell_size_m))
+        self.near_field_radius:           int   = max(1, round(nf_radius_m / self.cell_size_m))
 
         # ---------------------------------------------------------------------------
         # Fuel types — parsed in config order; add subtables to expand.
@@ -391,6 +404,8 @@ class Simulation:
         # Neighbour-offset table for the convective-ignition deposit (von Mises angular kernel,
         # Phase 5.5c/d): a Gaussian-weighted neighbourhood skewed per-cell by the wind+slope bias.
         self._conv_offsets = self._build_convective_offsets(self.convective_radius)
+        # Isotropic near-field offsets (drow, dcol, weight) for the wind-independent ignition term.
+        self._nf_offsets = self._build_isotropic_offsets(self.near_field_radius)
         # Fixed 5-point Laplacian stencil for explicit diffusion (1,1,3,3) on-device.
         self._laplace_kernel = torch.tensor(
             [[[[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]]],
@@ -500,6 +515,39 @@ class Simulation:
         out = torch.zeros_like(source)
         for (drow, dcol, k0w, _, _), e in zip(self._conv_offsets, exps):
             out = out + k0w * self._shift_zero(g * e, drow, dcol)
+        return out
+
+    def _build_isotropic_offsets(self, radius: int) -> list[tuple[int, int, float]]:
+        """Neighbour-offset table for the isotropic near-field deposit: (drow, dcol, weight).
+
+        Same Gaussian neighbourhood as _build_convective_offsets but direction-free -- the weights
+        sum to 1 and carry no angular bias, so the deposit spreads a source's near-field ignition
+        heat equally in every direction (Rothermel's no-wind baseline). Centre excluded.
+        """
+        size = 2 * radius + 1
+        coords = torch.arange(size, dtype=self.dtype, device=self.device) - radius
+        rows, cols = torch.meshgrid(coords, coords, indexing="ij")
+        r_sq = rows ** 2 + cols ** 2
+        k0 = torch.where(r_sq > 0, torch.exp(-r_sq / (2.0 * (radius / 1.5) ** 2)), torch.zeros_like(r_sq))
+        k0 = k0 / k0.sum()
+        offsets: list[tuple[int, int, float]] = []
+        for i in range(size):
+            for j in range(size):
+                if float(r_sq[i, j]) > 0:
+                    offsets.append((int(rows[i, j]), int(cols[i, j]), float(k0[i, j])))
+        return offsets
+
+    def _isotropic_deposit(self, source: torch.Tensor) -> torch.Tensor:
+        """Spread `source` [.., H, W] to its near-field neighbours with no directional bias.
+
+        The wind-independent counterpart of _convective_deposit: the weights sum to 1, so each source
+        cell sheds its heat equally to the surrounding ring (minus whatever crosses the domain edge,
+        which leaves via the zero-fill shift). This is the term that lets a small ignition consolidate
+        its perimeter and establish, without skewing the wind-driven head rate of spread.
+        """
+        out = torch.zeros_like(source)
+        for (drow, dcol, w) in self._nf_offsets:
+            out = out + w * self._shift_zero(source, drow, dcol)
         return out
 
     @staticmethod
@@ -1197,15 +1245,19 @@ class Simulation:
         smag = torch.sqrt(sgx ** 2 + sgy ** 2)                      # tan(slope)
         bx = self.convective_wind_bias * (x_wind_vel / u_ref) + self.convective_slope_bias * sgx * smag
         by = self.convective_wind_bias * (y_wind_vel / u_ref) + self.convective_slope_bias * sgy * smag
-        # Per-level convective deposit: spread each level's plume heat by the kernel (a spatial
+        # Per-level ignition deposit: spread each level's plume heat by the kernel (a spatial
         # convolution, so run once per fuel-bearing level), then let each fuel receive only from ITS
         # level. This is the ladder DURING spread -- a grass front's surface-level plume ignites
-        # neighbours' surface fuels but deposits nothing into their canopy level.
+        # neighbours' surface fuels but deposits nothing into their canopy level. Two components sum
+        # into `delivered`: the wind-biased convective share (cf, sets the head ROS) and the isotropic
+        # near-field share (nf, Rothermel's no-wind baseline that lets a point ignition establish).
+        nf = self.near_field_fraction
         delivered = torch.zeros_like(air_temperatures)       # (L, H, W) [J/m^2]
         for lvl in self._levels_with_fuel:
-            delivered.select(-3, lvl).copy_(
-                self._convective_deposit(cf * air_share.select(-3, lvl), bx, by).clamp(min=0.0)
-            )
+            share = air_share.select(-3, lvl)
+            biased = self._convective_deposit(cf * share, bx, by)
+            near   = self._isotropic_deposit(nf * share) if nf > 0.0 else 0.0
+            delivered.select(-3, lvl).copy_((biased + near).clamp(min=0.0))
         delivered_f = delivered.index_select(-3, self._fuel_level_index)  # (N,H,W) each fuel's level deposit
 
         C_floor    = (cp_fuel * 10.0 * self.fuel_burnt_threshold).expand_as(C_fuel)  # ~burnt-mass floor
@@ -1231,11 +1283,11 @@ class Simulation:
         absorbed.index_add_(-3, self._fuel_level_index, C_fuel * dT_conv)
         fuel_temperatures = (fuel_temperatures + dT_conv).clamp(min=0.0)
 
-        # Per-level air bookkeeping (conserved, off-grid edge loss aside): each level keeps the
-        # non-convected share (1-cf)*air_share; each receiver's leftover convected heat its fuel did
-        # not take up (delivered - absorbed) warms that level's plume air.
+        # Per-level air bookkeeping (conserved, off-grid edge loss aside): each level keeps the share
+        # that was not convected out, (1-cf-nf)*air_share; each receiver's leftover ignition heat its
+        # fuel did not take up (delivered - absorbed) warms that level's plume air.
         air_temperatures = (
-            air_temperatures + ((1.0 - cf) * air_share + (delivered - absorbed)) / C_plume
+            air_temperatures + ((1.0 - cf - nf) * air_share + (delivered - absorbed)) / C_plume
         ).clamp(min=0.0)
 
         return air_temperatures, fuel_temperatures, fuel, oxygen.clamp(min=0.0)

@@ -7,6 +7,33 @@ validated the multi-level dynamics in isolation (`tools/vertical_levels/phase0_d
 advection scheme is stable, the old fire-wind amplifier is ~15× (not 89×) and is an energy-over-count,
 and the ~15× weaker energy-correct fire-wind is **accepted** (no `reduced_gravity` retune).
 
+## ✅ POINT-IGNITION FIX (near-field ignition term) — DONE
+
+**Bug (found running the interactive sim):** a real fire "never spread beyond a few meters" from the
+ignition site. Root cause: `convective_fraction` was calibrated on the **line-ignition** ROS harness
+(an already-established front), but the interactive sim ignites a small **disc** (`spawn_radius`). The
+convective deposit is *directional* (wind-biased), so a small point fire throws nearly all its heat
+downwind and its flanks/back starve — it cannot consolidate its perimeter and self-extinguishes, even
+though a line front at the same cf spreads fine. Confirmed by isolation: homogeneous grass 0.4, wind
+10 m/s, cf=0.03 — **line** ignition spreads 604 m; **disc r=5** burns ~100 m then dies. Fuel load was a
+red herring (load 0.4 vs 1.0 barely differ in the line harness). Reproduced across wind speeds: on the
+low-wind map (5.8 m/s) the disc is stone dead at cf=0.03/nf=0.
+
+**Fix (user chose "decouple the two knobs"):** added a **near-field ignition term** — Rothermel's
+no-wind baseline R0. `near_field_fraction` (nf, default **0.05**) is an *isotropic, short-range* share
+of each level's plume air-share, deposited to the immediate neighbours with no wind bias
+(`_isotropic_deposit` / `_build_isotropic_offsets`, `near_field_radius_m`). It lets a nascent fire close
+its perimeter and establish; `convective_fraction` (kept at **0.03**) still sets the wind-driven head.
+Energy split is now `(1-cf-nf)` stays in the plume; nf=0 → byte-identical (all physics tests green).
+
+**Decoupling is partial** (an isotropic term unavoidably adds to the head too): with cf=0.03/nf=0.05 the
+established-front ROS rises to **grass 38%, shrub 18%, forest 19%** of a 10 m/s wind (was 18/9/6% —
+above the Phase-4 literature bands, the disclosed cost). **Directionality preserved:** on real maps the
+burnt footprint still runs 1.8–2.5× farther downwind than upwind (stronger at low wind — correct R0
+behaviour). Validated: disc ignitions now establish and spread on both high- (13.6 m/s) and low-wind
+(5.8 m/s) maps. **Open for the user:** whether to claw grass ROS back toward the literature band (would
+mean lowering cf, at some cost to directionality / low-wind establishment robustness).
+
 ## ⏳ PHASE 4 (re-tune / re-measure) — IN PROGRESS
 
 Baseline-first, then tune (all harnesses first repaired to the 5-type/L=3 API + given env hooks).

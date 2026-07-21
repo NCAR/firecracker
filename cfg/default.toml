@@ -229,6 +229,15 @@ convective_fraction      = 0.03   # share of the air-share heat convected to nea
                                   # head-fire rate of spread into realistic fractions of the wind at
                                   # 10 m/s -- grass ~18%, shrub ~9%, forest surface ~6% (was 100/66/81%);
                                   # ordering (grass fastest) preserved. See tools/vertical_levels/ros_test.py.
+near_field_fraction      = 0.05   # isotropic, wind-independent share of the air-share convected to the
+                                  # immediate neighbours (Rothermel's no-wind baseline R0). convective_fraction
+                                  # is directional, so on its own a small point ignition throws nearly all its
+                                  # heat downwind and the flanks starve -- the fire cannot consolidate and dies
+                                  # (an established line front spreads fine at the same cf, which is why the
+                                  # line-ignition ROS harness never saw it). This term lets a realistic disc
+                                  # ignition close its perimeter and establish; being isotropic + short-range it
+                                  # barely moves the calibrated head ROS. 0 -> inert. See tools/vertical_levels.
+near_field_radius_m      = 10.0   # reach [m] of the isotropic near-field ignition (one cell by default)
 flame_gate_temperature   = 700.0  # K: convection ignites only fuel below this (flaming fuel is combustion-set)
 convective_radius_m      = 10.0   # reach [m] of the convective ignition onto neighbouring fuel
 convective_wind_bias     = 1.0    # downwind skew of the convective ignition (concentration on wind/u_ref)
