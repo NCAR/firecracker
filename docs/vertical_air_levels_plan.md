@@ -1,11 +1,45 @@
 # Vertical Air Levels — Design Doc
 
-Status: **Phase 1 done + committed; Phase 2 Step A done + committed; Phase 2+3 Stage 1 (heat budget)
-done — physics tests green, ready to commit. Stage 2 (ladder) is the next in-progress work.** Physics
-decisions resolved through the design review below. Phase 0 validated the multi-level dynamics in
-isolation (`tools/vertical_levels/phase0_dynamics_spike.py`): the advection scheme is stable, the old
-fire-wind amplifier is ~15× (not 89×) and is an energy-over-count, and the ~15× weaker energy-correct
-fire-wind is **accepted** (no `reduced_gravity` retune).
+Status: **Phase 1, Phase 2 Step A, Phase 2+3 Stage 1 (heat budget), and Phase 2+3 Stage 2 (ladder) all
+done + committed — 138 physics tests green. The remaining vertical-levels work is Phase 3 (full
+per-level advection) and Phase 4 (re-tune / re-measure).** Physics decisions resolved through the
+design review below. Phase 0 validated the multi-level dynamics in isolation
+(`tools/vertical_levels/phase0_dynamics_spike.py`): the advection scheme is stable, the old fire-wind
+amplifier is ~15× (not 89×) and is an energy-over-count, and the ~15× weaker energy-correct fire-wind
+is **accepted** (no `reduced_gravity` retune).
+
+## ✅ STAGE 2 (ladder) — DONE
+
+Per-level combustion routing + bole conduction, landed and green. **Air-share capacity: Option A** was
+chosen (analyzed all three; A is lowest-risk and keeps fire-wind/buoyancy frozen). What shipped:
+- **`update_fire` is per-level:** takes the full `(L,H,W)` air; routes each fuel's combustion air-share
+  to *its* level (`index_add_` over `_fuel_level_index`); runs the convective ignition **deposit per
+  fuel-bearing level** (`_levels_with_fuel`), with the surface-area split normalized **within** each
+  level — so a grass front's surface-level plume ignites neighbours' surface fuels but **never** their
+  canopy. **Option A:** the plume slab stays `ρ_L·plume_mixing_depth·cp` for every level, so the
+  surface level's plume mass still matches `step_dynamics`' lean buoyancy slab (`m_plume`) → fire-wind
+  unchanged, buoyancy untouched. Single-fuel worlds are **byte-identical** to Stage 1.
+- **`conduct_bole_segments`** (new stage): anisotropic exact-exp two-body relaxation between
+  `tree_bole_surface`↔`tree_bole_canopy` fuel temps, `k_up ≫ k_down` (`[bole]` config, defaults 1.0/0.1
+  /s) — fire climbs the trunk fast, descends slow. Energy-conserving; no-op where either segment burnt
+  away or when the config has no split bole. Wired into the fire block after `apply_radiant_heat`.
+- Precomputes `_levels_with_fuel`, `_bole_surface_idx`, `_bole_canopy_idx`; `[bole]` config block.
+
+**Verification (`tools/vertical_levels/forest_ladder_test.py`, rewritten for the 5-type split + L=3):**
+1. **grass alone never ignites the canopy** (0% burned) — the per-level deposit + routing gate the
+   ladder. ✓
+2. the **trunk up-chain works**: with the surface bole lit at the source, bole conduction climbs fire
+   into the canopy bole and the **canopy crowns (99.7% burned)**. ✓
+3. **Phase-4 gap (expected):** a grass-only ignition does **not** heat the heavy, coarse surface bole
+   enough to light it (it stays ~322 K while the grass front passes), so the *end-to-end* grass→bole→
+   crown chain doesn't complete yet. This is the intensity-gated-crowning calibration the plan defers
+   to Phase 4 (re-tune air-share / transfer rate / bole ignitability against the ROS/regime harnesses).
+
+**Rebaselines:** only `test_combustion` needed changes (mechanical — its direct `update_fire` calls now
+build an `(L,H,W)` air stack and read the surface level back); everything else passed unchanged.
+
+**Stage-2 scope boundary / still deferred:** upper air levels remain non-advected (Phase 3); the
+surface-bole ignitability + crowning calibration is Phase 4.
 
 ## ✅ STAGE 1 (heat budget) — DONE
 

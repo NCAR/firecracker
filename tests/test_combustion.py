@@ -23,7 +23,7 @@ import torch
 
 import physics_constants as pc
 from conftest import make_config
-from simulation import Simulation
+from simulation import Simulation, lift_air_levels
 
 
 def _sim() -> Simulation:
@@ -55,10 +55,18 @@ def _f(sim, value, shape=(8, 8)) -> torch.Tensor:
     return torch.full(shape, float(value), dtype=sim.dtype, device=sim.device)
 
 
+def _air(sim, value=pc.T_REF, shape=(8, 8)) -> torch.Tensor:
+    """A uniform (L, H, W) air stack -- update_fire now takes the full per-level air."""
+    return lift_air_levels(_f(sim, value, shape), sim.num_air_levels)
+
+
 def _burn(sim, *, temp, oxygen, fuel=1.0, mass=1500.0):
-    """Run one update_fire from a uniform state; return (air, fuel_t, fuel, oxygen) tensors."""
-    shape = (8, 8)
-    air = _f(sim, pc.T_REF)
+    """Run one update_fire from a uniform state; return (air, fuel_t, fuel, oxygen) tensors.
+
+    The returned air is the (L, H, W) stack; single-fuel grass couples to the surface level (0), so
+    tests read air.select(-3, 0) for the surface-air response.
+    """
+    air = _air(sim)
     fuel_t = _f(sim, temp).unsqueeze(0)
     fuel_a = _f(sim, fuel).unsqueeze(0)
     oxy = _f(sim, oxygen)
@@ -69,7 +77,7 @@ def _burn(sim, *, temp, oxygen, fuel=1.0, mass=1500.0):
 def test_cold_fuel_is_inert():
     """At ambient temperature the Arrhenius rate underflows, so fuel barely burns over a long run."""
     sim = _sim()
-    air = _f(sim, pc.T_REF)
+    air = _air(sim)
     fuel_t = _f(sim, pc.T_REF).unsqueeze(0)
     fuel = _f(sim, 1.0).unsqueeze(0)
     oxy = _f(sim, pc.O2_DENSITY_REF)
@@ -164,7 +172,7 @@ def test_hhv_energy_split():
     # pre-step air temperature (T_REF here). So C_plume*dT_air = (1-f)*HHV*Dfuel.
     rho = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * pc.T_REF)
     C_plume = rho * sim.plume_mixing_depth * pc.CP_AIR
-    air_energy = C_plume * (float(air.mean()) - pc.T_REF)
+    air_energy = C_plume * (float(air.select(-3, 0).mean()) - pc.T_REF)   # grass -> surface level (0)
     np.testing.assert_allclose(air_energy, (1.0 - f) * hhv * fuel_burned, rtol=1e-6)
 
     # Fuel share: c_p_fuel*fuel_new*dT_fuel = f*HHV*Dfuel.
@@ -204,8 +212,7 @@ def test_burn_is_not_one_tick_and_lasts_a_residence_time():
     assert float(fuel1.mean()) > 0.9
 
     # Burn down with the temperature held at the flame value; count ticks to consume ~90%.
-    shape = (8, 8)
-    air = _f(sim, pc.T_REF)
+    air = _air(sim)
     fuel = _f(sim, 1.0).unsqueeze(0)
     oxy = _f(sim, pc.O2_DENSITY_REF)
     mass = _f(sim, 1500.0)
@@ -257,7 +264,7 @@ def test_plume_concentrates_combustion_heat():
     hhv = float(sim.heat_of_combustion[0])
     air_share = (1.0 - f) * hhv * fuel_burned                       # [J/m^2]
 
-    dT_air = float(air.mean()) - pc.T_REF
+    dT_air = float(air.select(-3, 0).mean()) - pc.T_REF            # grass -> surface level (0)
     rho = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * pc.T_REF)
     C_plume = rho * sim.plume_mixing_depth * pc.CP_AIR
 

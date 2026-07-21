@@ -134,6 +134,17 @@ transfer_rate = 0.5          # lambda [1/s]: inter-level upward-convection gap-r
                              # Stage-1 placeholder; Phase 4 re-tunes it against the ROS/crowning targets.
 enabled       = true         # if false, skip the inter-level convection stage
 
+[bole]
+# Bole-segment vertical conduction (Stage 2, see conduct_bole_segments). The tree bole is two stacked
+# fuel types -- tree_bole_surface (0-5 m) and tree_bole_canopy (5-15 m); the trunk carries fire between
+# them by an exact-exponential two-body relaxation of their fuel temperatures, energy-conserving over
+# their thermal masses. The rate is anisotropic: fire climbs the trunk fast (surface segment hotter)
+# and descends slow (canopy hotter), so once the bole base catches, fire runs UP into the crown but a
+# crown fire does not readily run back down -- the intensity gate for crowning. Rates are the gap-
+# relaxation lambda [1/s] (gap decays by exp(-lambda*dt)); Phase-4-tunable placeholders.
+conduction_up   = 1.0        # k_up [1/s]: surface bole hotter -> fire climbs (fast)
+conduction_down = 0.1        # k_down [1/s]: canopy bole hotter -> fire descends (slow), k_down << k_up
+
 [momentum]
 # Shallow boundary-layer orographic wind (see docs/units.md). The wind is prognostic
 # [m/s], forced by the free-surface gradient -g'*grad(s), s = terrain + eta with the layer

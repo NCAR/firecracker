@@ -253,6 +253,13 @@ class Simulation:
         # Inter-level upward convection: gap-relaxation rate lambda [1/s] and its toggle (convect_air_levels).
         self.air_transfer_rate: float = float(air_levels.get("transfer_rate", 0.5))
         self.air_convection_enabled: bool = bool(air_levels.get("enabled", True))
+        # Bole-segment vertical conduction (conduct_bole_segments): the trunk carries fire between its
+        # stacked segments (tree_bole_surface <-> tree_bole_canopy). Anisotropic gap-relaxation rates
+        # [1/s]: k_up (surface segment hotter -> fire climbs the trunk) >> k_down (canopy hotter -> fire
+        # reluctant to descend). Phase-4-tunable placeholders.
+        bole = (cfg or {}).get("bole", {})
+        self.bole_conduction_up:   float = float(bole.get("conduction_up",   1.0))
+        self.bole_conduction_down: float = float(bole.get("conduction_down", 0.1))
         # Convective fire spread (Phase 5.5c). Radiation preheats the fuel ahead but is too weak to
         # ignite a neighbour at realistic flame temperatures, so ignition is carried by convection: a
         # fraction of the plume's air-share heat is convected to nearby fuel to ignite it (hot plume
@@ -313,6 +320,20 @@ class Simulation:
         self._air_level_capacity: torch.Tensor = (
             pc.RHO_REF * level_depths * pc.CP_AIR
         ).view(-1, 1, 1)   # (L, 1, 1) [J/(m^2*K)]
+        # The distinct air levels that actually carry fuel (Stage 2 per-level combustion): the
+        # convective-ignition deposit runs once per such level so a burning cell's level-L plume ignites
+        # only neighbours' level-L fuels (the ladder during spread). Above-canopy (fuel-free) is skipped.
+        self._levels_with_fuel: list[int] = sorted(set(self.fuel_levels))
+        # Bole-segment indices for conduct_bole_segments (None when a config has no split trunk, e.g.
+        # the single-fuel test worlds -> the stage is then a no-op).
+        self._bole_surface_idx: int | None = (
+            self.fuel_type_names.index("tree_bole_surface")
+            if "tree_bole_surface" in self.fuel_type_names else None
+        )
+        self._bole_canopy_idx: int | None = (
+            self.fuel_type_names.index("tree_bole_canopy")
+            if "tree_bole_canopy" in self.fuel_type_names else None
+        )
 
         def _ft(name: str, key: str, default: float) -> float:
             return float(fuel_types_cfg.get(name, {}).get(key, default))
@@ -855,6 +876,46 @@ class Simulation:
             T_u.add_(dT_u)
         return air
 
+    def conduct_bole_segments(
+        self, fuel_temperatures: torch.Tensor, fuel: torch.Tensor
+    ) -> torch.Tensor:
+        """Anisotropic vertical conduction along the trunk, between its two stacked bole segments.
+
+        The tree bole is split into co-located fuel types -- tree_bole_surface (0-5 m) and
+        tree_bole_canopy (5-15 m) -- on the surface and canopy air levels. This term is the trunk
+        itself carrying fire between them: an exact-exponential two-body relaxation of the two
+        segments' *fuel temperatures*, energy-conserving over their thermal masses fuel*cp, with a
+        **direction-dependent rate** -- k_up (fast) when the surface segment is hotter, so fire climbs
+        the trunk into the crown, and k_down (slow) when the canopy segment is hotter, so a crown fire
+        does not readily run back down. This is the ladder's dedicated conduit: once the surface bole
+        catches from the ground fire, fire runs up it and ignites the canopy bole, which then lights the
+        crown. A no-op where either segment has burnt away (no trunk mass to conduct) and when the
+        config has no split bole (the single-fuel test worlds). Rank-agnostic.
+        """
+        si, ci = self._bole_surface_idx, self._bole_canopy_idx
+        if si is None or ci is None:
+            return fuel_temperatures
+        cp = self.fuel_specific_heat                            # (N, 1, 1)
+        Ts, Tc = fuel_temperatures.select(-3, si), fuel_temperatures.select(-3, ci)   # (..., H, W)
+        Cs = cp[si] * fuel.select(-3, si)                       # (..., H, W) surface-segment thermal mass
+        Cc = cp[ci] * fuel.select(-3, ci)                       # (..., H, W) canopy-segment thermal mass
+        # Only conduct where BOTH segments carry mass; otherwise there is no trunk to carry fire (and the
+        # capacity-weighted mean / back-reaction would divide by ~zero).
+        active = (fuel.select(-3, si) > self.fuel_burnt_threshold) & (fuel.select(-3, ci) > self.fuel_burnt_threshold)
+        # Gap-relaxation rate [1/s], anisotropic by the sign of the gradient: fire climbs fast, descends
+        # slow (k_up >> k_down). Same exact-exponential gap decay as convect_air_levels.
+        rate  = torch.where(Ts > Tc, torch.full_like(Ts, self.bole_conduction_up),
+                            torch.full_like(Ts, self.bole_conduction_down))
+        decay = torch.exp(-rate * self.dt)
+        denom = (Cs + Cc).clamp(min=1e-12)
+        T_eq  = (Cs * Ts + Cc * Tc) / denom
+        dTs   = torch.where(active, (T_eq - Ts) * (1.0 - decay), torch.zeros_like(Ts))
+        dTc   = -(Cs / Cc.clamp(min=1e-12)) * dTs              # energy-conserving back-reaction
+        ft = fuel_temperatures.clone()
+        ft.select(-3, si).add_(dTs)
+        ft.select(-3, ci).add_(dTc)
+        return ft
+
     def vent_plume_heat(self, air_temperatures: torch.Tensor, temp_eq: torch.Tensor) -> torch.Tensor:
         """Above-canopy energy-anomaly vent -- the single sink for all fire heat (the air-temp sink).
 
@@ -965,7 +1026,7 @@ class Simulation:
 
     def update_fire(
         self,
-        air_temperatures: torch.Tensor,   # (H, W)        air column temperature T_a [K]
+        air_temperatures: torch.Tensor,   # (L, H, W)     per-level air temperature T_a [K]
         fuel_temperatures: torch.Tensor,  # (N, H, W)     per-type fuel temperature T_f [K]
         fuel: torch.Tensor,               # (N, H, W)     per-type biomass [kg/m^2]
         oxygen: torch.Tensor,             # (H, W)        O2 partial density [kg/m^3]
@@ -988,13 +1049,17 @@ class Simulation:
         Oxygen is a partial density [kg/m^3] while the burn is areal [kg/m^2], so they also couple
         through the shallow combustion mixing depth d_mix (the near-surface air the fire entrains),
         giving a whole-cell inventory backstop on top of the per-surface film transport. The air
-        share of the heat is deposited into a shallow plume slab of depth plume_mixing_depth
+        share of each fuel's heat is deposited into a shallow plume slab of depth plume_mixing_depth
         (Phase 5.5b), not the full column, so a burn warms the air strongly enough to drive a
-        convective signal. A fraction of that air share (convective_fraction) is convected to nearby
-        fuel to ignite it (Phase 5.5c) -- the spread driver, since radiation preheats the fuel ahead
-        but is too weak to ignite it alone; skewed by a von Mises angular kernel whose bias blends the
-        wind (lee bias) with the upslope terrain gradient (faster spread uphill, Phase 5.5d). All rates
-        use pre-step temperatures.
+        convective signal. **The air-share and its convective ignition deposit are routed per air
+        level (Stage 2):** each fuel warms its own level's plume, and a burning cell's level-L plume
+        ignites only neighbours' level-L fuels -- so a ground grass fire deposits into neighbours'
+        surface fuels (grass, shrub, surface bole) but never directly into their elevated canopy (the
+        ladder, emergent during spread). A fraction of the air share (convective_fraction) is convected
+        to nearby fuel to ignite it (Phase 5.5c) -- the spread driver, since radiation preheats the fuel
+        ahead but is too weak to ignite it alone; skewed by a von Mises angular kernel whose bias blends
+        the wind (lee bias) with the upslope terrain gradient (faster spread uphill, Phase 5.5d). All
+        rates use pre-step temperatures.
         """
         R, cp_air = pc.UNIVERSAL_GAS_CONSTANT, pc.CP_AIR
         dt, d_mix = self.dt, self.combustion_mixing_depth
@@ -1002,6 +1067,7 @@ class Simulation:
         a_s, h = self.fuel_specific_surface, self.surface_mass_transfer
         hhv, s = self.heat_of_combustion, self.stoich_oxygen
         present = fuel > self.fuel_burnt_threshold
+        air0 = air_temperatures.select(-3, 0)   # surface-level (..., H, W) view, for (H, W) shape refs
 
         # Surface mass flux psi [kg/(m^2_surface*s)]: kinetic chemistry in series with O2 film
         # diffusion. The kinetic flux underflows to ~0 at ambient T (cold fuel inert); the diffusive
@@ -1034,7 +1100,6 @@ class Simulation:
 
         # Heat released per type [J/m^2], split between air and fuel.
         burn_heat_per_type = hhv * fuel_consumed              # (N, H, W)
-        total_burn_heat    = burn_heat_per_type.sum(dim=-3)   # (H, W)
         f = self.burn_heat_fuel_fraction
 
         # Fuel self-heat: each type warms by its share f*HHV*Dfuel over its thermal mass fuel*c_p.
@@ -1046,13 +1111,19 @@ class Simulation:
         fuel_temperatures = (fuel_temperatures + dT_self).clamp(min=0.0)
 
         # Air share (1-f) rises in a shallow buoyant plume of depth d_plume (Phase 5.5b), not the
-        # full ~1 km column, using the local near-surface density rho = p_ref/(R_d*T_a) (= m/eta at
+        # full ~1 km column, using each level's near-surface density rho = p_ref/(R_d*T_a) (= m/eta at
         # reference pressure): C_plume = rho*d_plume*c_p_air, ~30x less mass than the column, so a
         # burn warms the air strongly (a sub-grid plume scale, mirroring oxygen's d_mix). Hotter air
-        # is lighter -> smaller capacity -> slightly more responsive, bounded by the T^4 sink.
-        rho_local = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures.clamp(min=1.0))  # (H, W)
-        C_plume   = rho_local * self.plume_mixing_depth * cp_air                            # (H, W)
-        air_share = total_burn_heat * (1.0 - f)              # (H, W) [J/m^2] into the plume
+        # is lighter -> smaller capacity -> slightly more responsive, bounded by the T^4 sink. Stage 2:
+        # each fuel's air-share is routed to ITS air level (index_add over fuel_level_index), so canopy
+        # combustion warms the canopy air and surface combustion the surface air. The plume depth stays
+        # plume_mixing_depth for every level (Option A) -- the surface level's plume mass therefore still
+        # matches step_dynamics' lean buoyancy slab (m_plume), so fire-wind is unchanged.
+        rho_level = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * air_temperatures.clamp(min=1.0))  # (L, H, W)
+        C_plume   = rho_level * self.plume_mixing_depth * cp_air                            # (L, H, W)
+        air_share_type = burn_heat_per_type * (1.0 - f)      # (N, H, W) [J/m^2] each type's air share
+        air_share = torch.zeros_like(air_temperatures)       # (L, H, W)
+        air_share.index_add_(-3, self._fuel_level_index, air_share_type)   # sum each level's shares
 
         # Convective ignition (Phase 5.5c): radiation preheats the fuel ahead but can't ignite a
         # neighbour at a realistic flame temperature, so a fraction of the fresh air-share heat is
@@ -1063,11 +1134,11 @@ class Simulation:
         # so near-burnt cells do not superheat, and clamped so one tick cannot drive fuel past the
         # gate; whatever the fuel does not absorb stays in the plume air, so energy is conserved.
         if x_wind_vel is None:
-            x_wind_vel = torch.zeros_like(air_temperatures)
+            x_wind_vel = torch.zeros_like(air0)
         if y_wind_vel is None:
-            y_wind_vel = torch.zeros_like(air_temperatures)
+            y_wind_vel = torch.zeros_like(air0)
         if terrain is None:
-            terrain = torch.zeros_like(air_temperatures)
+            terrain = torch.zeros_like(air0)
         cf = self.convective_fraction
 
         # Bias vector for the convective deposit (the directional skew). Blend the wind (lee bias,
@@ -1085,29 +1156,43 @@ class Simulation:
         smag = torch.sqrt(sgx ** 2 + sgy ** 2)                      # tan(slope)
         bx = self.convective_wind_bias * (x_wind_vel / u_ref) + self.convective_slope_bias * sgx * smag
         by = self.convective_wind_bias * (y_wind_vel / u_ref) + self.convective_slope_bias * sgy * smag
-        delivered = self._convective_deposit(cf * air_share, bx, by).clamp(min=0.0)  # (H,W) [J/m^2]
+        # Per-level convective deposit: spread each level's plume heat by the kernel (a spatial
+        # convolution, so run once per fuel-bearing level), then let each fuel receive only from ITS
+        # level. This is the ladder DURING spread -- a grass front's surface-level plume ignites
+        # neighbours' surface fuels but deposits nothing into their canopy level.
+        delivered = torch.zeros_like(air_temperatures)       # (L, H, W) [J/m^2]
+        for lvl in self._levels_with_fuel:
+            delivered.select(-3, lvl).copy_(
+                self._convective_deposit(cf * air_share.select(-3, lvl), bx, by).clamp(min=0.0)
+            )
+        delivered_f = delivered.index_select(-3, self._fuel_level_index)  # (N,H,W) each fuel's level deposit
 
         C_floor    = (cp_fuel * 10.0 * self.fuel_burnt_threshold).expand_as(C_fuel)  # ~burnt-mass floor
         C_dep      = torch.maximum(C_fuel, C_floor)
         # Split the convected ignition heat between the cell's fuel types by reactive surface area
         # (a_s*fuel), not bulk mass: the flame heat is intercepted at the fuel surface, so fine
-        # high-SAV fuel (grass) takes a share set by its exposed area rather than its weight. The old
-        # `fuel/total` mass split gave a co-located heavy low-SAV tree most of the heat and divided
-        # every type's rise by the cell's *total* fuel, so one tree sharing a grass cell starved the
-        # grass's own ignition and quenched the front.
-        surface    = a_s * fuel
-        surf_frac  = surface / surface.sum(dim=-3).clamp(min=1e-30).unsqueeze(-3)
+        # high-SAV fuel (grass) takes a share set by its exposed area rather than its weight. The split
+        # is normalised WITHIN each air level (Stage 2), so the level-L plume heat is shared only among
+        # level-L fuels -- one tree's canopy sharing a grass cell no longer draws the grass's surface
+        # plume, and the ladder holds cell by cell.
+        surface    = a_s * fuel                                          # (N, H, W)
+        surf_level = torch.zeros_like(air_temperatures)                  # (L, H, W)
+        surf_level.index_add_(-3, self._fuel_level_index, surface)
+        surf_denom = surf_level.index_select(-3, self._fuel_level_index).clamp(min=1e-30)  # (N,H,W)
+        surf_frac  = surface / surf_denom
         gate       = present & (fuel_temperatures < self.flame_gate_temperature)
-        dT_conv    = torch.where(gate, delivered.unsqueeze(-3) * surf_frac / C_dep, torch.zeros_like(C_fuel))
+        dT_conv    = torch.where(gate, delivered_f * surf_frac / C_dep, torch.zeros_like(C_fuel))
         capped     = torch.minimum(fuel_temperatures + dT_conv,
                                    torch.full_like(fuel_temperatures, self.flame_gate_temperature))
         dT_conv    = (capped - fuel_temperatures).clamp(min=0.0)
-        absorbed   = (C_fuel * dT_conv).sum(dim=-3)           # (H, W) [J/m^2] the fuel took up (<= delivered)
+        # Energy each level's fuel took up, scattered back to that level (fuels sharing a level sum).
+        absorbed   = torch.zeros_like(air_temperatures)      # (L, H, W) [J/m^2]
+        absorbed.index_add_(-3, self._fuel_level_index, C_fuel * dT_conv)
         fuel_temperatures = (fuel_temperatures + dT_conv).clamp(min=0.0)
 
-        # Energy bookkeeping (conserved, off-grid edge loss aside): the source plume keeps the
-        # non-convected share (1-cf)*air_share; each receiver's leftover convected heat that its
-        # fuel did not take up (delivered - absorbed) warms that cell's own plume air.
+        # Per-level air bookkeeping (conserved, off-grid edge loss aside): each level keeps the
+        # non-convected share (1-cf)*air_share; each receiver's leftover convected heat its fuel did
+        # not take up (delivered - absorbed) warms that level's plume air.
         air_temperatures = (
             air_temperatures + ((1.0 - cf) * air_share + (delivered - absorbed)) / C_plume
         ).clamp(min=0.0)
@@ -1208,10 +1293,10 @@ class Simulation:
             v_fire = s.y_wind_vel * s.channel_gain
         s.x_wind_fire, s.y_wind_fire = u_fire, v_fire
 
-        # Fuel<->air coupling. exchange_fuel_air_heat is now per-level (Stage 1): each fuel trades heat
-        # with its own air level. apply_radiation and update_fire remain surface-level (level 0) for now
-        # -- the ground sensible flux and combustion air-share inject into the surface, and the new
-        # inter-level convection carries that heat up (per-level combustion routing lands in Stage 2).
+        # Fuel<->air coupling is per-level: exchange_fuel_air_heat (Stage 1) and update_fire's air-share
+        # + convective deposit (Stage 2) both route heat to each fuel's own level. apply_radiation stays
+        # surface-level (the ground sensible flux warms level 0 only). The inter-level convection then
+        # carries the near-surface heat up, and the bole-segment conduction climbs fire up the trunk.
         # temp_eq is a level stack; its surface level anchors the surface stages, its top level the vent.
         temp_eq0 = _surface_level(s.temp_eq)
 
@@ -1240,15 +1325,17 @@ class Simulation:
                 s.oxygen = self.relax_to_equilibrium(s.oxygen, s.oxygen_eq, self.oxygen_rate)
 
         if advance_fire and self.fire_enabled:
-            air0, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
-                _surface_level(s.air_temperatures), s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
+            s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen = self.update_fire(
+                s.air_temperatures, s.fuel_temperatures, s.fuel, s.oxygen, s.mass,
                 u_fire, v_fire, s.terrain,
             )
-            s.air_temperatures = _with_surface(s.air_temperatures, air0)
             if self.radiant_heat_enabled:
                 s.fuel_temperatures, s.radiant_flux = self.apply_radiant_heat(
                     s.fuel_temperatures, s.fuel, temp_eq0
                 )
+            # Bole-segment conduction: the trunk climbs fire from the surface bole up to the canopy
+            # bole (fast up, slow down) -- the ladder's dedicated conduit. No-op without a split bole.
+            s.fuel_temperatures = self.conduct_bole_segments(s.fuel_temperatures, s.fuel)
 
         # Inter-level convection: carry heat *upward* through the air stack (surface -> canopy ->
         # above), gated on instability. This is what gives the surface/canopy slabs a sink -- the heat

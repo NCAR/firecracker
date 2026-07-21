@@ -49,7 +49,7 @@ import torch        # noqa: E402
 
 import physics_constants as pc            # noqa: E402
 from config import load_config            # noqa: E402
-from simulation import Simulation, SimState  # noqa: E402
+from simulation import Simulation, SimState, lift_air_levels  # noqa: E402
 from gen_maps import MapGenerator         # noqa: E402
 
 
@@ -74,10 +74,11 @@ def _uniform_state(sim: Simulation, grid: int, fuel_load: float, fuel_temp_k: fl
     fuel = torch.full((n, grid, grid), fuel_load, dtype=sim.dtype, device=sim.device)
     fuel_tt = torch.full((n, grid, grid), fuel_temp_k, dtype=sim.dtype, device=sim.device)
     z = torch.zeros((1, 1), dtype=sim.dtype, device=sim.device)
+    air3 = lift_air_levels(air_t, sim.num_air_levels)   # (L, H, W) per-level air stack
     return SimState(
-        mass=mass_t, air_temperatures=air_t, ground_temperature=air_t.clone(),
+        mass=mass_t, air_temperatures=air3, ground_temperature=air_t.clone(),
         fuel_temperatures=fuel_tt, fuel=fuel, oxygen=oxy_t, terrain=terr_t,
-        temp_eq=air_t.clone(), oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
+        temp_eq=air3.clone(), oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
         x_wind_vel=torch.zeros_like(mass_t), y_wind_vel=torch.zeros_like(mass_t),
         u_amb_x=z, u_amb_y=z, radiant_flux=torch.zeros_like(mass_t),
     )
@@ -98,17 +99,21 @@ def _budget_terms(sim: Simulation, fuel_load: float, temp_k: float) -> dict:
 
     # Each subsystem is run independently on the *same* pre-step state (clones guard against
     # any in-place writes), so the four terms are directly comparable contributions for one tick.
+    # air_temperatures / temp_eq are (L, H, W) stacks; update_fire and exchange take the full stack,
+    # while apply_radiation and apply_radiant_heat are surface-level (level 0).
+    air0 = s.air_temperatures.select(-3, 0)
+    temp_eq0 = s.temp_eq.select(-3, 0)
     _, ft_fire, _, _ = sim.update_fire(
         s.air_temperatures.clone(), f0.clone(), s.fuel.clone(), s.oxygen.clone(), s.mass.clone(),
         s.x_wind_vel.clone(), s.y_wind_vel.clone(), s.terrain.clone(),
     )
     _, ft_rad, _ = sim.apply_radiation(
-        s.air_temperatures.clone(), s.ground_temperature.clone(), f0.clone(),
-        s.fuel.clone(), s.mass.clone(), s.temp_eq.clone(),
+        air0.clone(), s.ground_temperature.clone(), f0.clone(),
+        s.fuel.clone(), s.mass.clone(), temp_eq0.clone(),
     )
-    ft_rback, _ = sim.apply_radiant_heat(f0.clone(), s.fuel.clone(), s.temp_eq.clone())
+    ft_rback, _ = sim.apply_radiant_heat(f0.clone(), s.fuel.clone(), temp_eq0.clone())
     _, ft_cond = sim.exchange_fuel_air_heat(
-        s.air_temperatures.clone(), f0.clone(), s.fuel.clone(), s.mass.clone(),
+        s.air_temperatures.clone(), f0.clone(), s.fuel.clone(),
     )
 
     gain, rad, rback, cond = dmean(ft_fire), dmean(ft_rad), dmean(ft_rback), dmean(ft_cond)
@@ -289,10 +294,11 @@ def _mixed_state(sim: Simulation, grid: int, grass_load: float, loads: dict[str,
     c = grid // 2
     fuel_tt[gi, c, c] = 1200.0   # ignite the grass at the centre only
     z = torch.zeros((1, 1), dtype=sim.dtype, device=sim.device)
+    air3 = lift_air_levels(air_t, sim.num_air_levels)   # (L, H, W) per-level air stack
     return SimState(
-        mass=mass_t, air_temperatures=air_t, ground_temperature=air_t.clone(),
+        mass=mass_t, air_temperatures=air3, ground_temperature=air_t.clone(),
         fuel_temperatures=fuel_tt, fuel=fuel, oxygen=oxy_t, terrain=terr_t,
-        temp_eq=air_t.clone(), oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
+        temp_eq=air3.clone(), oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
         x_wind_vel=torch.zeros_like(mass_t), y_wind_vel=torch.zeros_like(mass_t),
         u_amb_x=z, u_amb_y=z, radiant_flux=torch.zeros_like(mass_t),
     )
@@ -309,7 +315,9 @@ def probe_tree_ignition(grid: int = 64, grass_load: float = 1.5, ticks: int = 15
     tree_names = [n for n in names if n.startswith("tree")]
     per_tree = {n: float(cfg["fuel_types"][n].get("fuel_per_tree", 0.0)) for n in tree_names}
     cii = names.index("tree_canopy") if "tree_canopy" in names else None
-    bii = names.index("tree_bole") if "tree_bole" in names else None
+    # Track the SURFACE bole segment (the trunk base that catches from the ground fire); the tree bole
+    # is now split into tree_bole_surface + tree_bole_canopy (Phase 1).
+    bii = names.index("tree_bole_surface") if "tree_bole_surface" in names else None
     max_trees = int(cfg["fuel_types"][tree_names[0]].get("max_trees_per_cell", 4))
     a_s = {n: float(sim0.fuel_specific_surface.flatten()[names.index(n)]) for n in tree_names}
 
@@ -342,7 +350,7 @@ def probe_tree_ignition(grid: int = 64, grass_load: float = 1.5, ticks: int = 15
         frac = lambda mask: (mask & grass_burnt).sum() / n_burnt if n_burnt else 0.0
         canopy_lit = frac(canopy_peak.cpu().numpy() > gate)
         bole_lit = frac(bole_peak.cpu().numpy() > gate)
-        bole_load = loads.get("tree_bole", 0.0)
+        bole_load = loads.get("tree_bole_surface", 0.0)
         if bii is not None and bole_load > 0 and n_burnt:
             bole = s.fuel[bii].cpu().numpy()
             bole_burned = (bole_load - bole[grass_burnt]).sum() / (bole_load * n_burnt)
@@ -367,8 +375,9 @@ def main() -> None:
     p.add_argument("--ticks", type=int, default=1500, help="tick cap for probes B/C (default: 1500)")
     args = p.parse_args()
 
-    # Representative full-cover (4-tree) loads per type for the sustain budget.
-    fuel_loads = {"grass": 1.5, "tree_canopy": 2.8, "tree_bole": 17.2}
+    # Representative full-cover (4-tree) loads per type for the sustain budget (the bole is now two
+    # stacked segments: ~1/3 surface, ~2/3 canopy of the old 17.2 kg/m^2).
+    fuel_loads = {"grass": 1.5, "tree_canopy": 2.8, "tree_bole_surface": 5.72, "tree_bole_canopy": 11.48}
 
     if args.probe in ("A", "both", "all"):
         probe_tree_sustain(fuel_loads)
