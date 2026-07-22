@@ -131,6 +131,19 @@ LEGEND_BG:     tuple[int, int, int] = (0, 0, 0)
 LEGEND_BORDER: tuple[int, int, int] = (90, 90, 90)
 LEGEND_TEXT:   tuple[int, int, int] = (220, 220, 220)
 
+# ---------------------------------------------------------------------------
+# Top status bar
+# ---------------------------------------------------------------------------
+
+# A fixed-height bar spanning the full window width above the sim + legend, showing the name of
+# the view mode currently on screen. The window is permanently this much taller than the sim.
+TOP_BAR_HEIGHT:    int = 34
+TOP_BAR_FONT_SIZE: int = 27
+TOP_BAR_BG:        tuple[int, int, int] = (24, 24, 28)
+TOP_BAR_BORDER:    tuple[int, int, int] = (90, 90, 90)
+TOP_BAR_TEXT:      tuple[int, int, int] = (235, 235, 235)
+TOP_BAR_PAD_LEFT:  int = 12   # left inset of the label text
+
 # Kelvin -> Celsius offset, for temperature tick labels.
 KELVIN_TO_CELSIUS: float = 273.15
 

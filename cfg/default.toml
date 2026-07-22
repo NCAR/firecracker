@@ -460,6 +460,7 @@ grid_size = 32   # action-grid cells per side (256 sim cells / 32 -> 8x8 cells e
 # available, else cpu — the same code path runs on both.
 # device           = "cuda"
 grid_size          = 256      # simulation grid cells (N x N)
-window_size        = 512      # display window size in pixels (square)
+window_size        = 512      # sim display size in pixels (square); the window adds a legend
+                              # panel on the right and a view-mode bar on top of this
 max_steps          = 10_000   # episode length before truncation
 print_episode_info = true     # print variable state at the start and end of each episode

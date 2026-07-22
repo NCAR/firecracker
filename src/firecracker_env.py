@@ -37,6 +37,12 @@ from rendering import (
     LEGEND_PANEL_WIDTH,
     LEGEND_FONT_SIZE,
     LEGEND_TITLE_FONT_SIZE,
+    TOP_BAR_HEIGHT,
+    TOP_BAR_FONT_SIZE,
+    TOP_BAR_BG,
+    TOP_BAR_BORDER,
+    TOP_BAR_TEXT,
+    TOP_BAR_PAD_LEFT,
     DISPLAY_OXYGEN_FLOOR,
     DISPLAY_OXYGEN_CEILING,
     ColorbarSpec,
@@ -128,6 +134,22 @@ MODE_KEYS: dict[int, ViewMode] = {
 }
 MODE_KEYS[pygame.K_s] = ViewMode.SUNLIGHT
 MODE_KEYS[pygame.K_b] = ViewMode.BIOME
+
+# Human-readable names for the top status bar, one per view mode.
+MODE_LABELS: dict[ViewMode, str] = {
+    ViewMode.WIND_SPEED:       "Wind Speed",
+    ViewMode.TEMPERATURE:      "Air Temperature",
+    ViewMode.WIND:             "Wind",
+    ViewMode.FIRE:             "Fire",
+    ViewMode.OXYGEN:           "Oxygen",
+    ViewMode.PRESSURE:         "Mass / Pressure",
+    ViewMode.FUEL_TEMPERATURE: "Fuel Temperature",
+    ViewMode.RADIANT_HEAT:     "Radiant Heat",
+    ViewMode.TERRAIN:          "Terrain",
+    ViewMode.COLUMN_HEIGHT:    "Column Height",
+    ViewMode.SUNLIGHT:         "Sunlight",
+    ViewMode.BIOME:            "Biome",
+}
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -288,10 +310,14 @@ class FirecrackerEnv(gymnasium.Env):
 
         # Rendering state
         self._screen: pygame.Surface | None = None
+        # The sim + legend draw into this subsurface, offset below the top bar, so all their
+        # blit coordinates stay bar-relative (origin at the top-left of the sim, not the window).
+        self._scene: pygame.Surface | None = None
         self._clock: pygame.time.Clock | None = None
         # Legend fonts: created only in human render mode (None otherwise -> no legend drawn).
         self._legend_font: pygame.font.Font | None = None
         self._legend_title_font: pygame.font.Font | None = None
+        self._top_bar_font: pygame.font.Font | None = None
         self._color_surface: pygame.Surface | None = None
         self._wind_surface: pygame.Surface | None = None
         self._wind_speed_surface: pygame.Surface | None = None
@@ -325,12 +351,18 @@ class FirecrackerEnv(gymnasium.Env):
             pygame.font.init()
             pygame.display.set_caption(WINDOW_TITLE)
             sim_px = self.grid_size * self._pixel_scale
-            # Reserve a fixed legend panel on the right, so the window is permanently wider than
-            # the simulation and the colorbar never overlaps the field.
-            self._screen = pygame.display.set_mode((sim_px + LEGEND_PANEL_WIDTH, sim_px))
+            # Reserve a fixed legend panel on the right and a status bar on top, so the window is
+            # permanently wider and taller than the simulation: the colorbar never overlaps the
+            # field, and the view-mode label sits clear above both.
+            win_w = sim_px + LEGEND_PANEL_WIDTH
+            self._screen = pygame.display.set_mode((win_w, sim_px + TOP_BAR_HEIGHT))
+            # Everything below the bar draws into this subsurface, so the sim/legend/overlay code
+            # keeps using bar-relative coordinates (y=0 at the top of the sim).
+            self._scene = self._screen.subsurface((0, TOP_BAR_HEIGHT, win_w, sim_px))
             self._clock = pygame.time.Clock()
             self._legend_font = pygame.font.Font(None, LEGEND_FONT_SIZE)
             self._legend_title_font = pygame.font.Font(None, LEGEND_TITLE_FONT_SIZE)
+            self._top_bar_font = pygame.font.Font(None, TOP_BAR_FONT_SIZE)
 
     def _crop(self, field):
         """The observed inner window of a padded (..., H, W) field: drops the _pad-cell sponge
@@ -540,11 +572,12 @@ class FirecrackerEnv(gymnasium.Env):
                 self._rebuild_surfaces_if_dirty()
             surface = self._surface_for_mode()
             self._screen.fill((0, 0, 0))
-            self._screen.blit(surface, (0, 0))
+            self._draw_top_bar()
+            self._scene.blit(surface, (0, 0))
             # The wind surface is transparent (black colorkey) except for the arrows, so it
             # overlays any view. Skip WIND, where the arrows are already the primary view.
             if self._show_wind_overlay and self._current_mode is not ViewMode.WIND:
-                self._screen.blit(self._wind_surface, (0, 0))
+                self._scene.blit(self._wind_surface, (0, 0))
             if self._current_mode in (ViewMode.WIND, ViewMode.WIND_SPEED):
                 self._blit_cursor_wind_vector()
             self._blit_action_highlight()
@@ -568,6 +601,7 @@ class FirecrackerEnv(gymnasium.Env):
         if self._screen is not None:
             pygame.quit()
             self._screen = None
+            self._scene = None
             self._clock = None
 
     # ---------------------------------------------------------------------------
@@ -602,11 +636,11 @@ class FirecrackerEnv(gymnasium.Env):
         win = self.grid_size * self._pixel_scale
         if self._pending_action_row is None:
             # Row phase: a click commits the hovered row, so band the whole row.
-            self._screen.blit(self._alpha_rect(win, side), (0, arow * side))
+            self._scene.blit(self._alpha_rect(win, side), (0, arow * side))
         else:
             # Column phase: the row is locked; band it plus the hovered column (overlap = the cell).
-            self._screen.blit(self._alpha_rect(win, side), (0, self._pending_action_row * side))
-            self._screen.blit(self._alpha_rect(side, win), (acol * side, 0))
+            self._scene.blit(self._alpha_rect(win, side), (0, self._pending_action_row * side))
+            self._scene.blit(self._alpha_rect(side, win), (acol * side, 0))
 
     def _blit_action_flash(self) -> None:
         """Flash the selected square white for a moment after a valid action goes through.
@@ -626,7 +660,7 @@ class FirecrackerEnv(gymnasium.Env):
             self._flash_square.fill((255, 255, 255))
         self._flash_square.set_alpha(int(ACTION_FLASH_ALPHA * remaining / ACTION_FLASH_SECONDS))
         arow, acol = self._action_flash_cell
-        self._screen.blit(self._flash_square, (acol * side, arow * side))
+        self._scene.blit(self._flash_square, (acol * side, arow * side))
 
     def _legend_specs(self) -> list[ColorbarSpec]:
         """Colorbar specs for the active view mode, drawn left to right. Returning several renders
@@ -688,7 +722,21 @@ class FirecrackerEnv(gymnasium.Env):
             panel = build_legend_panel(
                 self._legend_specs(), sim_px, self._legend_font, self._legend_title_font
             )
-        self._screen.blit(panel, (sim_px, 0))
+        self._scene.blit(panel, (sim_px, 0))
+
+    def _draw_top_bar(self) -> None:
+        """Draw the status bar across the top of the window, naming the active view mode."""
+        if self._top_bar_font is None:
+            return
+        win_w = self._screen.get_width()
+        pygame.draw.rect(self._screen, TOP_BAR_BG, (0, 0, win_w, TOP_BAR_HEIGHT))
+        pygame.draw.line(
+            self._screen, TOP_BAR_BORDER,
+            (0, TOP_BAR_HEIGHT - 1), (win_w, TOP_BAR_HEIGHT - 1),
+        )
+        label = MODE_LABELS.get(self._current_mode, self._current_mode.name.title())
+        text = self._top_bar_font.render(f"View: {label}", True, TOP_BAR_TEXT)
+        self._screen.blit(text, (TOP_BAR_PAD_LEFT, (TOP_BAR_HEIGHT - text.get_height()) // 2))
 
     def _blit_cursor_wind_vector(self) -> None:
         """In the wind views, draw one wind arrow — styled exactly like the field arrows — at the
@@ -698,6 +746,7 @@ class FirecrackerEnv(gymnasium.Env):
             return
         sim_w = self.grid_size * self._pixel_scale
         px, py = pygame.mouse.get_pos()
+        py -= TOP_BAR_HEIGHT   # window -> scene coordinates (the sim starts below the top bar)
         if not (0 <= px < sim_w and 0 <= py < sim_w):
             return
         col = min(px // self._pixel_scale, self.grid_size - 1)
@@ -708,7 +757,7 @@ class FirecrackerEnv(gymnasium.Env):
         color = wind_arrow_color(float(self._render_air_temp[row, col]), temp_min, temp_max)
         # Base the arrow at the cursor (the measured cell) so it points outward from the pointer tip.
         draw_wind_arrow(
-            self._screen, px, py, vx, vy,
+            self._scene, px, py, vx, vy,
             math.hypot(vx, vy), self._wind_speed_display_max, color, from_base=True,
         )
 
@@ -916,9 +965,10 @@ class FirecrackerEnv(gymnasium.Env):
                 running = False
             elif event.type == pygame.MOUSEMOTION:
                 # Track which coarse action-cell the cursor sits over (for the hover overlay).
-                # Over the legend panel there is no cell to hover, so clear the highlight.
+                # Over the legend panel or the top bar there is no cell to hover, so clear it.
                 px, py = event.pos
-                if px >= sim_w:
+                py -= TOP_BAR_HEIGHT   # window -> scene coordinates
+                if px >= sim_w or py < 0:
                     self._hovered_action_cell = None
                     continue
                 arow = min(py // self._action_cell_px, self.action_grid_size - 1)
@@ -926,8 +976,9 @@ class FirecrackerEnv(gymnasium.Env):
                 self._hovered_action_cell = (arow, acol)
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 px, py = event.pos
-                if px >= sim_w:
-                    continue   # clicks on the legend panel are inert
+                py -= TOP_BAR_HEIGHT   # window -> scene coordinates
+                if px >= sim_w or py < 0:
+                    continue   # clicks on the legend panel or the top bar are inert
                 if event.button == 1:
                     # Left-click drives the action space live: commit this phase's index from the
                     # hovered action-cell (its row in the row phase, its column in the column phase),
