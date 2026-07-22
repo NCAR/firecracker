@@ -144,6 +144,25 @@ TOP_BAR_BORDER:    tuple[int, int, int] = (90, 90, 90)
 TOP_BAR_TEXT:      tuple[int, int, int] = (235, 235, 235)
 TOP_BAR_PAD_LEFT:  int = 12   # left inset of the label text
 
+# The TAB view-mode menu: a centered, translucent overlay panel listing the view modes as a
+# multi-level list, navigated with the arrow keys. Styling only; layout lives with the drawing
+# code in firecracker_env.py (like _draw_top_bar).
+MENU_FONT_SIZE:       int = 24
+MENU_TITLE_FONT_SIZE: int = 20
+MENU_HINT_FONT_SIZE:  int = 16
+MENU_BG:       tuple[int, int, int] = (28, 28, 34)
+MENU_BG_ALPHA: int = 236              # panel opacity (0-255) over the frame beneath it
+MENU_BORDER:   tuple[int, int, int] = (110, 110, 120)
+MENU_TEXT:     tuple[int, int, int] = (225, 225, 228)
+MENU_DIM_TEXT: tuple[int, int, int] = (150, 150, 158)   # keybind hints, footer, submenu arrow
+MENU_SEL_BG:   tuple[int, int, int] = (58, 96, 150)     # highlight bar behind the cursor row
+MENU_SEL_TEXT: tuple[int, int, int] = (255, 255, 255)
+MENU_ACCENT:   tuple[int, int, int] = (120, 180, 255)   # breadcrumb + active-mode dot
+MENU_ROW_H:    int = 34                # per-item row height
+MENU_PAD_X:    int = 18                # panel horizontal inset
+MENU_PAD_Y:    int = 12                # panel vertical inset
+MENU_MIN_WIDTH: int = 300
+
 # Kelvin -> Celsius offset, for temperature tick labels.
 KELVIN_TO_CELSIUS: float = 273.15
 
@@ -451,6 +470,8 @@ def build_fire_surface(
     fuel_type_names: list[str],          # (N,) names, aligned with fuel/ignition axis 0
     show_fire_overlay: bool = True,
     initial_canopy_fuel: np.ndarray | None = None,  # (H, W) each cell's original canopy load (for bole occlusion)
+    show_vegetation: bool = True,        # draw the fuel/vegetation base; False leaves it black (fire-front-only view)
+    visible_fuels: set[int] | None = None,  # if given, only these fuel-type indices contribute to the vegetation blend
 ) -> pygame.Surface:
     rows, cols = fuel_temperatures.shape[1], fuel_temperatures.shape[2]
     rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
@@ -465,37 +486,47 @@ def build_fire_surface(
     )
     any_burning = burning_per_type.any(axis=0)  # (H, W)
 
-    # Each fuel type contributes its base color (trees green, grass yellow-green) weighted by
-    # its mass, so a cell's color is the mass-weighted blend of the fuels present. Mass is
-    # normalised per type by that type's own peak on the map, not by a shared total: grass tops
-    # out at a far lower loading than trees, so a shared scale would render grass near-black.
-    # Per-type normalisation lets each vegetation type use its full brightness range (and keeps
-    # the image scale-invariant: uniformly scaling one type's fuel leaves its colors unchanged).
-    type_colors = np.array(
-        [VEGETATION_COLORS.get(name, DEFAULT_VEGETATION_COLOR) for name in fuel_type_names],
-        dtype=np.float32,
-    )  # (N, 3)
-    type_max = fuel.max(axis=(1, 2), keepdims=True)            # (N, 1, 1) per-type peak
-    normalized = np.divide(fuel, type_max, out=np.zeros_like(fuel), where=type_max > 0.0)
+    if show_vegetation:
+        # Each fuel type contributes its base color (trees green, grass yellow-green) weighted by
+        # its mass, so a cell's color is the mass-weighted blend of the fuels present. Mass is
+        # normalised per type by that type's own peak on the map, not by a shared total: grass tops
+        # out at a far lower loading than trees, so a shared scale would render grass near-black.
+        # Per-type normalisation lets each vegetation type use its full brightness range (and keeps
+        # the image scale-invariant: uniformly scaling one type's fuel leaves its colors unchanged).
+        type_colors = np.array(
+            [VEGETATION_COLORS.get(name, DEFAULT_VEGETATION_COLOR) for name in fuel_type_names],
+            dtype=np.float32,
+        )  # (N, 3)
+        type_max = fuel.max(axis=(1, 2), keepdims=True)            # (N, 1, 1) per-type peak
+        normalized = np.divide(fuel, type_max, out=np.zeros_like(fuel), where=type_max > 0.0)
 
-    # The bole hides behind the canopy: only let its brown contribute once that cell's canopy has
-    # burned down to below TREE_BOLE_CANOPY_FRACTION of the canopy load it *originally* carried
-    # (per-cell, not a map-wide peak). While the canopy is still fuller than that it occludes the
-    # bole, so zero the bole's contribution there. Needs the map's original canopy load; without
-    # it the bole just blends in normally.
-    bole_idx = [i for i, n in enumerate(fuel_type_names) if n.startswith("tree_bole")]
-    canopy_idx = [i for i, n in enumerate(fuel_type_names) if n == "tree_canopy"]
-    if bole_idx and canopy_idx and initial_canopy_fuel is not None:
-        canopy_now = fuel[canopy_idx].sum(axis=0)                    # (H, W) current canopy load
-        # Multiplicative form (vs. dividing) avoids a divide-by-zero where no canopy ever grew;
-        # there initial_canopy_fuel == 0 marks the cell occluded, but the bole load is 0 there
-        # too, so zeroing it changes nothing.
-        occluded = canopy_now >= TREE_BOLE_CANOPY_FRACTION * initial_canopy_fuel
-        for b in bole_idx:
-            normalized[b][occluded] = 0.0   # normalized[b] is a view, so this writes back
+        # The bole hides behind the canopy: only let its brown contribute once that cell's canopy has
+        # burned down to below TREE_BOLE_CANOPY_FRACTION of the canopy load it *originally* carried
+        # (per-cell, not a map-wide peak). While the canopy is still fuller than that it occludes the
+        # bole, so zero the bole's contribution there. Needs the map's original canopy load; without
+        # it the bole just blends in normally. Skip the occlusion when the canopy is toggled off (not
+        # in visible_fuels): with nothing drawn over the bole, the trunk should show through.
+        bole_idx = [i for i, n in enumerate(fuel_type_names) if n.startswith("tree_bole")]
+        canopy_idx = [i for i, n in enumerate(fuel_type_names) if n == "tree_canopy"]
+        canopy_drawn = visible_fuels is None or any(c in visible_fuels for c in canopy_idx)
+        if bole_idx and canopy_idx and initial_canopy_fuel is not None and canopy_drawn:
+            canopy_now = fuel[canopy_idx].sum(axis=0)                    # (H, W) current canopy load
+            # Multiplicative form (vs. dividing) avoids a divide-by-zero where no canopy ever grew;
+            # there initial_canopy_fuel == 0 marks the cell occluded, but the bole load is 0 there
+            # too, so zeroing it changes nothing.
+            occluded = canopy_now >= TREE_BOLE_CANOPY_FRACTION * initial_canopy_fuel
+            for b in bole_idx:
+                normalized[b][occluded] = 0.0   # normalized[b] is a view, so this writes back
 
-    color_accum = np.tensordot(normalized, type_colors, axes=([0], [0]))  # (H, W, 3) in [0, ~]
-    rgb[:] = (np.clip(color_accum, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
+        # Optionally restrict the blend to a subset of fuel types (the FUEL view's per-type toggles):
+        # zero the contribution of any type not in the visible set so only the toggled-on fuels show.
+        if visible_fuels is not None:
+            for i in range(normalized.shape[0]):
+                if i not in visible_fuels:
+                    normalized[i] = 0.0
+
+        color_accum = np.tensordot(normalized, type_colors, axes=([0], [0]))  # (H, W, 3) in [0, ~]
+        rgb[:] = (np.clip(color_accum, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
 
     if show_fire_overlay:
         # Color gradient based on the hottest fuel type; a fixed Kelvin span above the

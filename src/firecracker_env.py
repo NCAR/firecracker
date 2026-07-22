@@ -43,6 +43,21 @@ from rendering import (
     TOP_BAR_BORDER,
     TOP_BAR_TEXT,
     TOP_BAR_PAD_LEFT,
+    MENU_FONT_SIZE,
+    MENU_TITLE_FONT_SIZE,
+    MENU_HINT_FONT_SIZE,
+    MENU_BG,
+    MENU_BG_ALPHA,
+    MENU_BORDER,
+    MENU_TEXT,
+    MENU_DIM_TEXT,
+    MENU_SEL_BG,
+    MENU_SEL_TEXT,
+    MENU_ACCENT,
+    MENU_ROW_H,
+    MENU_PAD_X,
+    MENU_PAD_Y,
+    MENU_MIN_WIDTH,
     DISPLAY_OXYGEN_FLOOR,
     DISPLAY_OXYGEN_CEILING,
     ColorbarSpec,
@@ -56,6 +71,8 @@ from rendering import (
     column_height_colormap,
     wind_temp_colormap,
     fire_overlay_colormap,
+    VEGETATION_COLORS,
+    DEFAULT_VEGETATION_COLOR,
     wind_temp_window,
     wind_arrow_color,
     draw_wind_arrow,
@@ -121,19 +138,29 @@ class ViewMode(Enum):
     RADIANT_HEAT = 7
     TERRAIN = 8
     COLUMN_HEIGHT = 9
-    SUNLIGHT = 10        # off the number row -> bound to a letter key below (the digits are taken)
-    BIOME = 11           # off the number row -> bound to a letter key below (the digits are taken)
+    SUNLIGHT = 10
+    BIOME = 11
+    FUEL = 12            # the vegetation/fuel base (the fire view's counterpart)
 
 
-# Modes 0-9 are picked up automatically from the number row; modes past it (the digits ran out)
-# get an explicit letter binding.
+# Every view mode is bound to a letter key (no number-row keys). W and R are reserved for the
+# wind-overlay toggle and reset, so the two wind views and Radiant Heat take other letters; the TAB
+# menu shows each mode's key, so the bindings need not all be perfectly mnemonic.
 MODE_KEYS: dict[int, ViewMode] = {
-    getattr(pygame, f"K_{mode.value}"): mode
-    for mode in ViewMode
-    if 0 <= mode.value <= 9
+    pygame.K_t: ViewMode.TEMPERATURE,       # air Temperature
+    pygame.K_d: ViewMode.WIND,              # wind Direction (arrows)
+    pygame.K_v: ViewMode.WIND_SPEED,        # wind Velocity/speed
+    pygame.K_f: ViewMode.FIRE,              # Fire front
+    pygame.K_u: ViewMode.FUEL,              # fUel / vegetation
+    pygame.K_o: ViewMode.OXYGEN,            # Oxygen
+    pygame.K_p: ViewMode.PRESSURE,          # mass / Pressure
+    pygame.K_e: ViewMode.FUEL_TEMPERATURE,  # fuel tEmperature
+    pygame.K_h: ViewMode.RADIANT_HEAT,      # radiant Heat
+    pygame.K_g: ViewMode.TERRAIN,           # Ground / terrain
+    pygame.K_c: ViewMode.COLUMN_HEIGHT,     # air Column height
+    pygame.K_s: ViewMode.SUNLIGHT,          # Sunlight
+    pygame.K_b: ViewMode.BIOME,             # Biome
 }
-MODE_KEYS[pygame.K_s] = ViewMode.SUNLIGHT
-MODE_KEYS[pygame.K_b] = ViewMode.BIOME
 
 # Human-readable names for the top status bar, one per view mode.
 MODE_LABELS: dict[ViewMode, str] = {
@@ -149,7 +176,58 @@ MODE_LABELS: dict[ViewMode, str] = {
     ViewMode.COLUMN_HEIGHT:    "Column Height",
     ViewMode.SUNLIGHT:         "Sunlight",
     ViewMode.BIOME:            "Biome",
+    ViewMode.FUEL:             "Fuel",
 }
+
+# Reverse of MODE_KEYS: the view mode -> the key label shown as a hint in the menu ("1", "S", ...).
+MODE_KEY_LABELS: dict[ViewMode, str] = {
+    mode: pygame.key.name(key).upper() for key, mode in MODE_KEYS.items()
+}
+
+def _humanize_fuel(name: str) -> str:
+    """A fuel-type id like 'tree_bole_surface' -> a display string 'Tree Bole Surface'."""
+    return name.replace("_", " ").title()
+
+
+# The TAB view-mode menu, as a tree. Each entry is (label, target); target is a ViewMode (a leaf
+# that selects that view) or a list of further entries (a submenu). Fuel Temperature is a plain
+# leaf: which fuel types it averages is toggled live with the number keys (see _handle_events),
+# not chosen from the menu. Every mode keeps its direct keybind — an arrow-key path to the views.
+VIEW_MENU: list = [
+    ("Atmosphere", [
+        ("Air Temperature", ViewMode.TEMPERATURE),
+        ("Wind",            ViewMode.WIND),
+        ("Wind Speed",      ViewMode.WIND_SPEED),
+        ("Mass / Pressure", ViewMode.PRESSURE),
+        ("Column Height",   ViewMode.COLUMN_HEIGHT),
+        ("Oxygen",          ViewMode.OXYGEN),
+    ]),
+    ("Fire", [
+        ("Fire (front)",     ViewMode.FIRE),
+        ("Fuel",             ViewMode.FUEL),
+        ("Fuel Temperature", ViewMode.FUEL_TEMPERATURE),
+        ("Radiant Heat",     ViewMode.RADIANT_HEAT),
+    ]),
+    ("Terrain", [
+        ("Terrain",  ViewMode.TERRAIN),
+        ("Sunlight", ViewMode.SUNLIGHT),
+        ("Biome",    ViewMode.BIOME),
+    ]),
+]
+
+# Keys the open menu consumes for navigation (Esc closes it rather than quitting the app).
+_MENU_NAV_KEYS: frozenset[int] = frozenset({
+    pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+    pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE,
+})
+
+# The two views with per-fuel-type toggles: the number keys 1..N, the on/off HUD (L to hide) and
+# the top-bar selection label all apply while one of these is on screen.
+_FUEL_VIEWS: frozenset = frozenset({ViewMode.FUEL, ViewMode.FUEL_TEMPERATURE})
+
+# Number keys 1..9 toggle fuel-type membership in the active fuel view (K_1 -> fuel index 0).
+# Fuels past the 9th (rare) are toggle-inert; they still contribute to the all-fuels default.
+_FUEL_TOGGLE_KEYS: dict[int, int] = {getattr(pygame, f"K_{d}"): d - 1 for d in range(1, 10)}
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -318,10 +396,14 @@ class FirecrackerEnv(gymnasium.Env):
         self._legend_font: pygame.font.Font | None = None
         self._legend_title_font: pygame.font.Font | None = None
         self._top_bar_font: pygame.font.Font | None = None
+        self._menu_font: pygame.font.Font | None = None
+        self._menu_title_font: pygame.font.Font | None = None
+        self._menu_hint_font: pygame.font.Font | None = None
         self._color_surface: pygame.Surface | None = None
         self._wind_surface: pygame.Surface | None = None
         self._wind_speed_surface: pygame.Surface | None = None
-        self._fire_surface: pygame.Surface | None = None
+        self._fire_surface: pygame.Surface | None = None   # fire front only, on black
+        self._fuel_surface: pygame.Surface | None = None   # vegetation/fuel base, no fire overlay
         self._oxygen_surface: pygame.Surface | None = None
         self._pressure_surface: pygame.Surface | None = None
         self._fuel_temperature_surface: pygame.Surface | None = None
@@ -339,7 +421,24 @@ class FirecrackerEnv(gymnasium.Env):
         self._flash_square: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
         self._current_mode: ViewMode = ViewMode.TEMPERATURE
+        # The number keys 1..N toggle which fuel types each fuel view shows: FUEL_TEMPERATURE
+        # averages (mass-weighted) over its selected types; FUEL blends the vegetation colors of
+        # its selected types. Each view keeps its own set, both starting with every fuel type on.
+        self._fuel_temp_selected: set[int] = set(range(self._sim.num_fuel_types))
+        self._fuel_selected: set[int] = set(range(self._sim.num_fuel_types))
+        # TAB view-mode menu: the tree, whether it is open, the stack of chosen submenu indices
+        # (the descent path; empty = top level), and the highlighted row within the current level.
+        self._view_menu: list = VIEW_MENU
+        self._menu_open: bool = False
+        self._menu_stack: list[int] = []
+        self._menu_cursor: int = 0
+        # Whether the Fuel Temperature view's fuel on/off HUD is shown (toggled with L); hiding it
+        # uncovers the cells beneath.
+        self._show_fuel_panel: bool = True
         self._show_wind_overlay: bool = False
+        # The main GUI splits fire/fuel into two view modes, so it no longer toggles a fire overlay;
+        # this flag is kept (always on) only for model_viewer, which reads it to overlay the flame on
+        # its shared fire panels.
         self._show_fire_overlay: bool = True
         self._running: bool = True
         self._paused: bool = False
@@ -363,6 +462,9 @@ class FirecrackerEnv(gymnasium.Env):
             self._legend_font = pygame.font.Font(None, LEGEND_FONT_SIZE)
             self._legend_title_font = pygame.font.Font(None, LEGEND_TITLE_FONT_SIZE)
             self._top_bar_font = pygame.font.Font(None, TOP_BAR_FONT_SIZE)
+            self._menu_font = pygame.font.Font(None, MENU_FONT_SIZE)
+            self._menu_title_font = pygame.font.Font(None, MENU_TITLE_FONT_SIZE)
+            self._menu_hint_font = pygame.font.Font(None, MENU_HINT_FONT_SIZE)
 
     def _crop(self, field):
         """The observed inner window of a padded (..., H, W) field: drops the _pad-cell sponge
@@ -569,7 +671,9 @@ class FirecrackerEnv(gymnasium.Env):
             if fire_click is not None:
                 self._spawn_fire_patch(*fire_click)
                 self._surfaces_dirty = True
-                self._rebuild_surfaces_if_dirty()
+            # A fire spawn or a fuel-temp variant switch during event handling dirties the surfaces;
+            # rebuild now so the change shows this frame (matters while paused, when no step will).
+            self._rebuild_surfaces_if_dirty()
             surface = self._surface_for_mode()
             self._screen.fill((0, 0, 0))
             self._draw_top_bar()
@@ -583,6 +687,8 @@ class FirecrackerEnv(gymnasium.Env):
             self._blit_action_highlight()
             self._blit_action_flash()
             self._blit_legend()
+            self._draw_fuel_panel()
+            self._draw_view_menu()
             pygame.display.flip()
             self._clock.tick(TARGET_FPS)
             return None
@@ -707,6 +813,7 @@ class FirecrackerEnv(gymnasium.Env):
         if mode == ViewMode.COLUMN_HEIGHT:
             return [ColorbarSpec("Column", column_height_colormap,
                                  0.0, self._column_height_display_max, meters)]
+        # FUEL is a categorical vegetation blend (no single gradient); its panel stays blank.
         return []
 
     def _blit_legend(self) -> None:
@@ -735,8 +842,218 @@ class FirecrackerEnv(gymnasium.Env):
             (0, TOP_BAR_HEIGHT - 1), (win_w, TOP_BAR_HEIGHT - 1),
         )
         label = MODE_LABELS.get(self._current_mode, self._current_mode.name.title())
+        selected = self._active_fuel_selection()
+        if selected is not None:
+            label = f"{label} - {self._fuel_selection_label(selected)}"
         text = self._top_bar_font.render(f"View: {label}", True, TOP_BAR_TEXT)
         self._screen.blit(text, (TOP_BAR_PAD_LEFT, (TOP_BAR_HEIGHT - text.get_height()) // 2))
+
+    def _active_fuel_selection(self) -> set[int] | None:
+        """The per-fuel-type toggle set the active view uses (FUEL_TEMPERATURE / FUEL), or None for
+        any other view — so the number keys, HUD and top-bar label all target the same set."""
+        if self._current_mode == ViewMode.FUEL_TEMPERATURE:
+            return self._fuel_temp_selected
+        if self._current_mode == ViewMode.FUEL:
+            return self._fuel_selected
+        return None
+
+    def _fuel_selection_label(self, selected: set[int]) -> str:
+        """Describe a fuel-type selection for the top bar: 'All fuels' when every type is on, 'none'
+        when empty, the type names when a short list fits, else a compact count so the label never
+        overruns the window."""
+        names = self._sim.fuel_type_names
+        k = len(selected)
+        if k == 0:
+            return "none selected"
+        if k == len(names):
+            return "All fuels"
+        listed = ", ".join(_humanize_fuel(names[i]) for i in sorted(selected))
+        return listed if len(listed) <= 24 else f"{k} of {len(names)} fuels"
+
+    def _draw_fuel_panel(self) -> None:
+        """In the FUEL and FUEL_TEMPERATURE views, draw a top-left HUD listing every fuel type with
+        its number key and an on/off checkbox (filled with the fuel's map color when on), so it is
+        clear exactly which fuels that view is currently showing/averaging. Toggle it with L."""
+        selected = self._active_fuel_selection()
+        if self._menu_font is None or selected is None or not self._show_fuel_panel:
+            return
+        names = self._sim.fuel_type_names
+        title = self._menu_hint_font.render(f"Fuels  (1-{len(names)} toggle, L hide)", True, MENU_DIM_TEXT)
+        # One row per fuel: "<key>  <name>", bright when on and dimmed when off.
+        rows = []
+        for i, n in enumerate(names):
+            on = i in selected
+            surf = self._menu_font.render(f"{i + 1}  {_humanize_fuel(n)}", True,
+                                          MENU_TEXT if on else MENU_DIM_TEXT)
+            veg = VEGETATION_COLORS.get(n, DEFAULT_VEGETATION_COLOR)
+            rows.append((surf, on, tuple(int(c * 255) for c in veg)))
+
+        box = self._menu_font.get_height() - 6      # checkbox side length
+        row_h = self._menu_font.get_height() + 6
+        pad_x, pad_y, gap = 12, 10, 10
+        header_h = title.get_height() + 8
+        content_w = max([title.get_width()] + [box + gap + s.get_width() for s, _, _ in rows])
+        panel_w = content_w + 2 * pad_x
+        panel_h = pad_y * 2 + header_h + len(rows) * row_h
+
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        pygame.draw.rect(panel, (*MENU_BG, MENU_BG_ALPHA), (0, 0, panel_w, panel_h), border_radius=8)
+        pygame.draw.rect(panel, MENU_BORDER, (0, 0, panel_w, panel_h), width=1, border_radius=8)
+
+        y = pad_y
+        panel.blit(title, (pad_x, y))
+        y += header_h
+        for surf, on, swatch in rows:
+            cy = y + row_h // 2
+            bx, by = pad_x, cy - box // 2
+            if on:
+                pygame.draw.rect(panel, swatch, (bx, by, box, box), border_radius=3)
+                # a dark check mark over the filled swatch
+                pygame.draw.lines(panel, (18, 18, 22), False, [
+                    (bx + int(box * 0.22), by + int(box * 0.52)),
+                    (bx + int(box * 0.42), by + int(box * 0.74)),
+                    (bx + int(box * 0.80), by + int(box * 0.26)),
+                ], 2)
+            else:
+                pygame.draw.rect(panel, MENU_DIM_TEXT, (bx, by, box, box), width=1, border_radius=3)
+            panel.blit(surf, (bx + box + gap, cy - surf.get_height() // 2))
+            y += row_h
+
+        self._scene.blit(panel, (8, 8))
+
+    # ---------------------------------------------------------------------------
+    # TAB view-mode menu
+    # ---------------------------------------------------------------------------
+
+    def _menu_contains_active(self, node) -> bool:
+        """True if the menu subtree `node` (a ViewMode leaf, or a list of entries) holds the view
+        currently on screen."""
+        if isinstance(node, list):
+            return any(self._menu_contains_active(child) for _, child in node)
+        return node == self._current_mode
+
+    def _current_menu_level(self) -> list:
+        """The list of entries at the level the descent path (_menu_stack) currently points to."""
+        node = self._view_menu
+        for idx in self._menu_stack:
+            node = node[idx][1]
+        return node
+
+    def _open_view_menu(self) -> None:
+        """Enter the menu at the top level, homing the cursor on whichever group holds the active
+        view so the currently-shown view is pre-highlighted."""
+        self._menu_stack = []
+        self._menu_cursor = 0
+        for i, (_, target) in enumerate(self._view_menu):
+            if self._menu_contains_active(target):
+                self._menu_cursor = i
+                break
+
+    def _menu_navigate(self, key: int):
+        """Apply one navigation key to the open menu. Returns the selected ViewMode when a leaf is
+        chosen — the caller switches to it and the menu closes; otherwise None."""
+        level = self._current_menu_level()
+        if key == pygame.K_UP:
+            self._menu_cursor = (self._menu_cursor - 1) % len(level)
+        elif key == pygame.K_DOWN:
+            self._menu_cursor = (self._menu_cursor + 1) % len(level)
+        elif key in (pygame.K_RIGHT, pygame.K_RETURN, pygame.K_KP_ENTER):
+            target = level[self._menu_cursor][1]
+            if not isinstance(target, list):
+                self._menu_open = False
+                return target   # a ViewMode leaf
+            # Descend: remember this row (so Left can restore it), then home on the active view.
+            self._menu_stack.append(self._menu_cursor)
+            self._menu_cursor = 0
+            for i, (_, child) in enumerate(self._current_menu_level()):
+                if self._menu_contains_active(child):
+                    self._menu_cursor = i
+                    break
+        elif key == pygame.K_LEFT:
+            if self._menu_stack:
+                self._menu_cursor = self._menu_stack.pop()   # back up, re-select the parent row
+            else:
+                self._menu_open = False
+        elif key == pygame.K_ESCAPE:
+            self._menu_open = False
+        return None
+
+    def _draw_view_menu(self) -> None:
+        """Draw the TAB view-mode menu: a centered, translucent multi-level list navigated with the
+        arrow keys (Enter/Right selects or descends a group, Left goes back, Esc/Tab closes). The
+        active mode is dotted and every mode shows its direct keybind, so the menu doubles as a
+        keybind cheat-sheet."""
+        if not self._menu_open or self._menu_font is None:
+            return
+        level = self._current_menu_level()
+
+        # Breadcrumb built from the labels along the descent path.
+        crumbs = ["View Modes"]
+        node = self._view_menu
+        for idx in self._menu_stack:
+            crumbs.append(node[idx][0])
+            node = node[idx][1]
+        title = "   >   ".join(crumbs)
+
+        # Per-row content: (label, right-aligned hint, is-active). A submenu shows ">"; a leaf shows
+        # its direct keybind. A row is "active" when it is — or contains — the view currently shown.
+        rows = []
+        for lbl, target in level:
+            if isinstance(target, list):
+                rows.append((lbl, ">", self._menu_contains_active(target)))
+            else:
+                rows.append((lbl, MODE_KEY_LABELS.get(target, ""), target == self._current_mode))
+
+        title_surf = self._menu_title_font.render(title, True, MENU_ACCENT)
+        footer_surf = self._menu_hint_font.render(
+            "Up/Down move    Enter/Right select    Left back    Tab close",
+            True, MENU_DIM_TEXT,
+        )
+        label_surfs = [self._menu_font.render(lbl, True, MENU_TEXT) for lbl, _, _ in rows]
+        hint_surfs = [self._menu_hint_font.render(h, True, MENU_DIM_TEXT) for _, h, _ in rows]
+
+        dot_col_w = 18   # left gutter reserved for the active-mode dot
+        gap = 40         # min space between a label and its right-aligned hint
+        content_w = max(
+            [title_surf.get_width(), footer_surf.get_width()]
+            + [dot_col_w + ls.get_width() + gap + hs.get_width()
+               for ls, hs in zip(label_surfs, hint_surfs)]
+        )
+        panel_w = max(MENU_MIN_WIDTH, content_w + 2 * MENU_PAD_X)
+        header_h = title_surf.get_height() + 10
+        footer_h = footer_surf.get_height() + 10
+        body_h = len(rows) * MENU_ROW_H
+        panel_h = MENU_PAD_Y * 2 + header_h + 8 + body_h + 8 + footer_h
+
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        pygame.draw.rect(panel, (*MENU_BG, MENU_BG_ALPHA), (0, 0, panel_w, panel_h), border_radius=10)
+        pygame.draw.rect(panel, MENU_BORDER, (0, 0, panel_w, panel_h), width=1, border_radius=10)
+
+        y = MENU_PAD_Y
+        panel.blit(title_surf, (MENU_PAD_X, y))
+        y += header_h
+        pygame.draw.line(panel, MENU_BORDER, (MENU_PAD_X, y), (panel_w - MENU_PAD_X, y))
+        y += 8
+
+        for i, ((lbl, _, active), ls, hs) in enumerate(zip(rows, label_surfs, hint_surfs)):
+            row_top = y + i * MENU_ROW_H
+            cy = row_top + MENU_ROW_H // 2
+            if i == self._menu_cursor:
+                pygame.draw.rect(panel, MENU_SEL_BG,
+                                 (6, row_top + 2, panel_w - 12, MENU_ROW_H - 4), border_radius=6)
+                ls = self._menu_font.render(lbl, True, MENU_SEL_TEXT)
+            if active:
+                pygame.draw.circle(panel, MENU_ACCENT, (MENU_PAD_X + 3, cy), 3)
+            panel.blit(ls, (MENU_PAD_X + dot_col_w, cy - ls.get_height() // 2))
+            panel.blit(hs, (panel_w - MENU_PAD_X - hs.get_width(), cy - hs.get_height() // 2))
+
+        y += body_h + 8
+        pygame.draw.line(panel, MENU_BORDER, (MENU_PAD_X, y), (panel_w - MENU_PAD_X, y))
+        y += 8
+        panel.blit(footer_surf, (MENU_PAD_X, y))
+
+        sw, sh = self._screen.get_size()
+        self._screen.blit(panel, ((sw - panel_w) // 2, (sh - panel_h) // 2))
 
     def _blit_cursor_wind_vector(self) -> None:
         """In the wind views, draw one wind arrow — styled exactly like the field arrows — at the
@@ -770,6 +1087,8 @@ class FirecrackerEnv(gymnasium.Env):
             return self._wind_surface
         if self._current_mode == ViewMode.FIRE:
             return self._fire_surface
+        if self._current_mode == ViewMode.FUEL:
+            return self._fuel_surface
         if self._current_mode == ViewMode.OXYGEN:
             return self._oxygen_surface
         if self._current_mode == ViewMode.PRESSURE:
@@ -816,7 +1135,21 @@ class FirecrackerEnv(gymnasium.Env):
         # span clamped to a minimum so a near-uniform (no-fire) field isn't over-stretched. The
         # floor sits at ambient and stays there during a fire (combustion only heats), so a flame
         # lifts the ceiling without moving the floor.
-        hottest_fuel = fuel_temps.max(axis=0)                     # per-cell hottest fuel (the fuel view)
+        # The fuel-temperature field to show: the mass-weighted average over just the toggled-on
+        # fuel types (number keys 1..N pick the set). Where the selected types hold ~no mass in a
+        # cell the weighted mean is undefined, so fall back there to their plain mean (near ambient)
+        # to keep the field continuous. With nothing selected, show the display floor (dark).
+        sel = sorted(self._fuel_temp_selected)
+        if sel:
+            sub_temps, sub_mass = fuel_temps[sel], fuel[sel]
+            sel_mass = sub_mass.sum(axis=0)
+            fuel_temp_field = np.where(
+                sel_mass > 1e-9,
+                (sub_temps * sub_mass).sum(axis=0) / np.maximum(sel_mass, 1e-9),
+                sub_temps.mean(axis=0),
+            )
+        else:
+            fuel_temp_field = np.full(fuel_temps.shape[1:], FUEL_TEMP_DISPLAY_MIN_K, dtype=np.float32)
         self._air_temp_display_min = float(temp.min())
         self._air_temp_display_max = max(self._air_temp_display_min + DISPLAY_MIN_TEMP_SPAN_K, float(temp.max()))
         # The fuel-temperature view uses a fixed window (unlike the auto-ranging air-temp view above)
@@ -844,20 +1177,31 @@ class FirecrackerEnv(gymnasium.Env):
             _to_numpy(self._crop(self._initial_canopy_fuel))
             if self._initial_canopy_fuel is not None else None
         )
+        # Split fire/fuel views from the one builder: the FIRE view is the fire front only (burning
+        # cells colored by temperature) on black; the FUEL view is the vegetation/fuel base with no
+        # fire overlay. (Fuel still needs initial_canopy_fuel for the bole-behind-canopy occlusion.)
         self._fire_surface = build_fire_surface(
             fuel_temps, fuel, oxygen, self._pixel_scale,
             ignition_thresholds, self._sim.fuel_burnt_threshold,
             self._sim.fuel_type_names,
-            self._show_fire_overlay and self._sim.fire_enabled,
-            initial_canopy_fuel,
+            show_fire_overlay=self._sim.fire_enabled,
+            show_vegetation=False,
+        )
+        self._fuel_surface = build_fire_surface(
+            fuel_temps, fuel, oxygen, self._pixel_scale,
+            ignition_thresholds, self._sim.fuel_burnt_threshold,
+            self._sim.fuel_type_names,
+            show_fire_overlay=False,
+            initial_canopy_fuel=initial_canopy_fuel,
+            visible_fuels=self._fuel_selected,   # number-key per-type toggles for the FUEL view
         )
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(
             pressure_field, self._pixel_scale, self._pressure_display_max
         )
-        # Fuel-temperature view: the same auto-ranged window over the per-cell hottest fuel.
+        # Fuel-temperature view: the selected variant's field over the fixed fuel-temp window.
         self._fuel_temperature_surface = build_color_surface(
-            hottest_fuel, self._pixel_scale, self._fuel_temp_display_min, self._fuel_temp_display_max,
+            fuel_temp_field, self._pixel_scale, self._fuel_temp_display_min, self._fuel_temp_display_max,
         )
         self._radiant_flux_surface = build_radiant_heat_surface(
             radiant_flux, self._pixel_scale, upper_bound=self._radiant_flux_display_max,
@@ -994,21 +1338,44 @@ class FirecrackerEnv(gymnasium.Env):
                     col = min(px // self._pixel_scale, self.grid_size - 1)
                     fire_click = (row, col)
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+                if event.key == pygame.K_TAB:
+                    # Toggle the view-mode menu; opening it homes the cursor on the active mode.
+                    self._menu_open = not self._menu_open
+                    if self._menu_open:
+                        self._open_view_menu()
+                elif self._menu_open and event.key in _MENU_NAV_KEYS:
+                    selected = self._menu_navigate(event.key)
+                    if selected is not None:
+                        mode = selected
+                        if selected in _FUEL_VIEWS:
+                            self._show_fuel_panel = True   # entering a fuel view reveals its HUD
+                elif (event.key in _FUEL_TOGGLE_KEYS
+                        and _FUEL_TOGGLE_KEYS[event.key] < self._sim.num_fuel_types
+                        and self._active_fuel_selection() is not None):
+                    # Number keys toggle a fuel type in/out of the active fuel view: the FUEL blend
+                    # or the FUEL_TEMPERATURE average updates to just the toggled-on types. They only
+                    # act while a fuel view is on screen (each view keeps its own selection).
+                    self._active_fuel_selection().symmetric_difference_update({_FUEL_TOGGLE_KEYS[event.key]})
+                    self._menu_open = False
+                    self._surfaces_dirty = True   # rebuild the affected fuel surface this frame
+                elif event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_SPACE:
                     self._paused = not self._paused
                 elif event.key == pygame.K_PERIOD:
                     self._step_once = True
-                elif event.key == pygame.K_f:
-                    self._show_fire_overlay = not self._show_fire_overlay
-                    self._surfaces_dirty = True
                 elif event.key == pygame.K_w:
                     self._show_wind_overlay = not self._show_wind_overlay
+                elif event.key == pygame.K_l:
+                    self._show_fuel_panel = not self._show_fuel_panel   # the fuel-view HUD
                 elif event.key == pygame.K_r:
                     self._reset_requested = True
                 elif event.key in MODE_KEYS:
+                    # The direct keybinds still work, open menu or not; a direct pick closes it.
                     mode = MODE_KEYS[event.key]
+                    self._menu_open = False
+                    if mode in _FUEL_VIEWS:
+                        self._show_fuel_panel = True   # pressing U / E reveals the HUD
         return running, mode, fire_click
 
     def _build_info(self) -> dict:
