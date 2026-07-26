@@ -11,9 +11,10 @@ lit on the ground climbs the ladder and involves everything.
 These tests build a uniform five-fuel world (grass, shrub, tree_canopy, tree_bole_surface,
 tree_bole_canopy) -- the full ladder -- ignite a small patch either in the canopy or on the ground,
 run the whole per-tick loop, and pin: a canopy ignition spreads crown-to-crown well beyond the seed
-patch; that same canopy ignition leaves the grass/shrub/surface-trunk essentially unburnt; and the
+patch; that same canopy ignition leaves the grass/shrub/surface-trunk essentially unburnt; the
 ground-ignition control instead consumes every layer (so the world plainly *can* carry fire between
-layers -- the crown fire's restraint is the ladder asymmetry, not an inert map).
+layers -- the crown fire's restraint is the ladder asymmetry, not an inert map); and under an
+ambient wind the crown fire runs as a head fire biased downwind while still sparing the ground.
 """
 
 import numpy as np
@@ -42,10 +43,11 @@ def _sim() -> Simulation:
                                   relaxation=True, air_convection=True))
 
 
-def _state(sim: Simulation, ignite: str) -> SimState:
-    """A flat, wind-free SI world with all five fuels present everywhere, ignited either in the
-    canopy (`ignite="canopy"` -> a hot tree_canopy patch) or on the ground (`ignite="ground"` -> a
-    hot grass+shrub patch). The patch is a one-shot temperature seed, then released to the physics."""
+def _state(sim: Simulation, ignite: str, ambient: tuple[float, float] = (0.0, 0.0)) -> SimState:
+    """A flat SI world with all five fuels present everywhere, ignited either in the canopy
+    (`ignite="canopy"` -> a hot tree_canopy patch) or on the ground (`ignite="ground"` -> a hot
+    grass+shrub patch). The patch is a one-shot temperature seed, then released to the physics.
+    `ambient` is the uniform (x, y) wind [m/s] driving the front (default still air)."""
     gen = MapGenerator(make_config(GRID, FUELS))
     terrain = np.zeros((GRID, GRID), dtype=np.float64)
     air = gen.air_temperature_profile(terrain)
@@ -67,22 +69,24 @@ def _state(sim: Simulation, ignite: str) -> SimState:
         raise ValueError(ignite)
 
     z = torch.zeros_like(mass_t)
-    ax = torch.zeros((1, 1), dtype=sim.dtype, device=sim.device)
+    ax = torch.tensor(float(ambient[0]), dtype=sim.dtype, device=sim.device).view(1, 1)
+    ay = torch.tensor(float(ambient[1]), dtype=sim.dtype, device=sim.device).view(1, 1)
     return SimState(
         mass=mass_t, air_temperatures=lift_air_levels(air_t, sim.num_air_levels),
         ground_temperature=air_t.clone(),
         fuel_temperatures=fuel_t, fuel=fuel, oxygen=oxy_t, terrain=terr_t,
         temp_eq=lift_air_levels(air_t.clone(), sim.num_air_levels),
         oxygen_eq=oxy_t.clone(), mass_eq=mass_t.clone(),
-        x_wind_vel=z.clone(), y_wind_vel=z.clone(), u_amb_x=ax, u_amb_y=ax,
+        x_wind_vel=z + ax, y_wind_vel=z + ay, u_amb_x=ax, u_amb_y=ay,
         radiant_flux=z.clone(),
     )
 
 
-def _run(ignite: str, ticks: int = TICKS) -> tuple[torch.Tensor, SimState, Simulation]:
+def _run(ignite: str, ticks: int = TICKS,
+         ambient: tuple[float, float] = (0.0, 0.0)) -> tuple[torch.Tensor, SimState, Simulation]:
     """Advance a freshly-ignited world; return (initial fuel, final state, sim)."""
     sim = _sim()
-    s = _state(sim, ignite)
+    s = _state(sim, ignite, ambient)
     fuel0 = s.fuel.clone()
     for _ in range(ticks):
         sim.step_fields(s)
@@ -144,3 +148,22 @@ def test_canopy_fire_spares_the_surface_fuels():
     assert burnt_g[I_SHRUB] > 2 * SEED_CELLS
     assert burnt_g[I_CANOPY] > 2 * SEED_CELLS                    # fire reached the crown from below
     assert burnt_g[I_BOLE_SURF] > 2 * SEED_CELLS
+
+
+def test_wind_drives_the_crown_fire_downwind():
+    """Under an ambient wind the crown fire runs as a head fire: it reaches much further downwind
+    than upwind and further along-wind than across it (the same lee bias the surface front shows),
+    while still sparing the surface fuels below."""
+    fuel0, s, _ = _run("canopy", ambient=(8.0, 0.0))    # wind toward +x -> downwind = right
+    left, right, up, down = _canopy_reach(fuel0, s)
+
+    assert right > left + 4                             # clearly further downwind than upwind
+    assert right > down                                 # biased along-wind vs cross-wind
+    # It is still a real, self-sustaining crown fire (a wind-tilted head, not just the seed drifting).
+    assert _burnt(fuel0, s)[I_CANOPY] > 2 * SEED_CELLS
+    # And even wind-driven, the crown fire does not climb down onto the fine surface fuels.
+    burnt = _burnt(fuel0, s)
+    assert burnt[I_GRASS] == 0
+    assert burnt[I_SHRUB] == 0
+    assert burnt[I_BOLE_SURF] == 0
+    assert torch.isfinite(s.fuel_temperatures).all()
