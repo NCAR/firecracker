@@ -100,7 +100,7 @@ RECONSTRUCTABLE: frozenset[ViewMode] = frozenset({
     ViewMode.TEMPERATURE,
     ViewMode.FUEL_TEMPERATURE,
     ViewMode.WIND_SPEED,
-    ViewMode.FIRE,
+    ViewMode.FUEL,
 })
 # Note: TERRAIN and BIOME are no longer reconstructable — the observation carries terrain *slope*
 # (slope_x / slope_y), not height, and no biome channels at all, so the model panel shows the "not in
@@ -330,17 +330,19 @@ class ComparisonViewer:
             return build_wind_speed_surface(
                 phys[self.i_wind_x], phys[self.i_wind_y], scale, env._wind_speed_display_max,
             )
-        # FIRE: the observation carries per-type fuel mass and per-type fuel temperature (but not
-        # oxygen). Vegetation coloring needs only the mass; the burning overlay reads the per-type
-        # temperatures directly with oxygen assumed present, so the reconstructed flame footprint
-        # reads against the physics panel.
+        # FUEL (Fire & Fuel): the observation carries per-type fuel mass and per-type fuel temperature
+        # (but not oxygen). Vegetation coloring needs only the mass; the burning overlay reads the
+        # per-type temperatures directly with oxygen assumed present, so the reconstructed flame
+        # footprint reads against the physics panel. The GUI's per-type toggles and fire-overlay
+        # toggle (env._fuel_selected / env._fuel_fire_overlay) drive both panels identically.
         fuel = phys[self.i_fuel]
         fuel_temps = phys[self.i_fuel_temp]
         oxygen = np.ones(fuel.shape[1:], dtype=np.float32)
         surface = build_fire_surface(
             fuel_temps, fuel, oxygen, scale,
             self.ignition_thresholds, self.fuel_burnt_threshold, self.fuel_type_names,
-            env._show_fire_overlay and env._sim.fire_enabled,
+            show_fire_overlay=env._fuel_fire_overlay and env._sim.fire_enabled,
+            visible_fuels=env._fuel_selected,
         )
         # With M held on, paint red the cells the model's reconstructed ignited channel calls
         # burning with >50% certainty but whose reconstructed fuel temperature stays below the
@@ -372,7 +374,7 @@ class ComparisonViewer:
                             gt[self.i_slope_y] - rc[self.i_slope_y])
         if mode == ViewMode.WIND_SPEED:
             return np.hypot(gt[self.i_wind_x] - rc[self.i_wind_x], gt[self.i_wind_y] - rc[self.i_wind_y])
-        if mode == ViewMode.FIRE:
+        if mode == ViewMode.FUEL:
             return np.abs(gt[self.i_fuel] - rc[self.i_fuel]).mean(axis=0)
         # BIOME (not observed) and any other non-reconstructable mode fall to the mean over channels.
         return np.abs(gt - rc).mean(axis=0)

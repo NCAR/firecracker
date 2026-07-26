@@ -471,7 +471,7 @@ def build_fire_surface(
     show_fire_overlay: bool = True,
     initial_canopy_fuel: np.ndarray | None = None,  # (H, W) each cell's original canopy load (for bole occlusion)
     show_vegetation: bool = True,        # draw the fuel/vegetation base; False leaves it black (fire-front-only view)
-    visible_fuels: set[int] | None = None,  # if given, only these fuel-type indices contribute to the vegetation blend
+    visible_fuels: set[int] | None = None,  # if given, only these fuel-type indices contribute to the vegetation blend AND the fire overlay (a cell burns only where a visible fuel burns)
 ) -> pygame.Surface:
     rows, cols = fuel_temperatures.shape[1], fuel_temperatures.shape[2]
     rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
@@ -529,12 +529,24 @@ def build_fire_surface(
         rgb[:] = (np.clip(color_accum, 0.0, 1.0) * MAX_CHANNEL_VALUE).astype(np.uint8)
 
     if show_fire_overlay:
-        # Color gradient based on the hottest fuel type; a fixed Kelvin span above the
-        # minimum ignition temperature spans the ramp.
-        max_fuel_temp = fuel_temperatures.max(axis=0)
+        # A cell only reads as burning if a *visible* fuel type is burning there, and the flame's
+        # color is driven by the hottest *visible* fuel — hidden (toggled-off) types contribute to
+        # neither. With no restriction (visible_fuels is None) every type counts. A fixed Kelvin span
+        # above the minimum ignition temperature spans the ramp.
+        if visible_fuels is None:
+            overlay_burning = any_burning
+            overlay_temp = fuel_temperatures.max(axis=0)
+        else:
+            vis = sorted(i for i in visible_fuels if 0 <= i < fuel_temperatures.shape[0])
+            if vis:
+                overlay_burning = burning_per_type[vis].any(axis=0)
+                overlay_temp = fuel_temperatures[vis].max(axis=0)
+            else:
+                overlay_burning = np.zeros((rows, cols), dtype=bool)
+                overlay_temp = np.zeros((rows, cols), dtype=fuel_temperatures.dtype)
         min_ign = float(ignition_thresholds.min())
-        t = (max_fuel_temp - min_ign) / FIRE_COLOR_TEMP_SPAN_K
-        rgb[any_burning] = fire_overlay_colormap(t[any_burning])
+        t = (overlay_temp - min_ign) / FIRE_COLOR_TEMP_SPAN_K
+        rgb[overlay_burning] = fire_overlay_colormap(t[overlay_burning])
 
     rgb_scaled = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     surface = pygame.Surface((cols * scale, rows * scale))

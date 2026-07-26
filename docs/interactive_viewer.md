@@ -56,8 +56,7 @@ keybind cheat-sheet.
 | **Air Temperature** | `T` | Surface air temperature. Auto-ranges: the color floor tracks the coldest cell and the ceiling the hottest, so a flame lifts the top of the scale without moving the bottom. |
 | **Wind** | `D` | Wind direction as arrows, tinted by air temperature. This is the *fire wind* (prognostic wind × terrain-channeling gain), so the valley speed-ups are visible. |
 | **Wind Speed** | `V` | Wind magnitude as a color field. |
-| **Fire** | `F` | The fire front only — burning cells colored by temperature — on black. |
-| **Fuel** | `U` | The vegetation/fuel base, colored per fuel type, with no fire overlay. Number keys toggle which types are shown. |
+| **Fire & Fuel** | `F` | The vegetation/fuel base, colored per fuel type, with the fire front as a toggleable overlay (key `0`). Number keys toggle which fuel types are shown; a cell reads as burning only where a *visible* fuel is alight, colored by the hottest visible fuel's temperature. |
 | **Fuel Temperature** | `E` | A mass-weighted average of the selected fuel types' temperatures, over a fixed window so a flame's color reads the same every frame. |
 | **Oxygen** | `O` | Near-surface oxygen density. |
 | **Mass / Pressure** | `P` | Boundary-layer air mass (which doubles as surface pressure). |
@@ -67,10 +66,13 @@ keybind cheat-sheet.
 | **Sunlight** | `S` | The static per-cell solar exposure baked into the map (0–100%). |
 | **Biome** | `B` | The three vegetation biomes (woodland / grassland / shrubland) as flat colors, with a labeled swatch legend. |
 
-The **Fuel** and **Fuel Temperature** views have per-fuel-type toggles: number keys `1`–`N` turn
-individual fuel types on or off, a small panel (top-left, hide with `L`) lists them with checkboxes,
-and the top bar names the current selection. Fuel blends the vegetation colors of the selected
-types; Fuel Temperature averages their temperatures.
+The **Fire & Fuel** and **Fuel Temperature** views have per-fuel-type toggles: number keys `1`–`N`
+turn individual fuel types on or off, a small panel (top-left, hide with `L`) lists them with
+checkboxes, and the top bar names the current selection. Fire & Fuel blends the vegetation colors of
+the selected types; Fuel Temperature averages their temperatures. In Fire & Fuel the `0` key toggles
+the fire overlay on top of the fuel base — only cells where a shown fuel is burning light up, tinted
+by the hottest shown fuel's temperature (hidden fuels are excluded from both the footprint and the
+color).
 
 A **wind-arrow overlay** (toggle with `W`) can be laid on top of any non-wind view. In the two wind
 views, moving the mouse also draws a probe arrow at the hovered cell so you can read a specific
@@ -86,7 +88,8 @@ point.
 | **Left-click** | Drive the two-step action selection (row, then column) |
 | **Tab** | Toggle the view-mode menu |
 | Letter keys | Switch view mode directly |
-| `1`–`9` | Toggle a fuel type in the active Fuel / Fuel Temperature view |
+| `1`–`9` | Toggle a fuel type in the active Fire & Fuel / Fuel Temperature view |
+| `0` | Toggle the fire overlay in the Fire & Fuel view |
 | Arrow keys + Enter | Navigate the menu (Enter/Right selects or descends, Left goes back) |
 | `Space` | Pause / resume |
 | `.` | Step one frame (while paused) |

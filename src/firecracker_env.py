@@ -131,7 +131,6 @@ class ViewMode(Enum):
     WIND_SPEED = 0
     TEMPERATURE = 1
     WIND = 2
-    FIRE = 3
     OXYGEN = 4
     PRESSURE = 5
     FUEL_TEMPERATURE = 6
@@ -140,7 +139,7 @@ class ViewMode(Enum):
     COLUMN_HEIGHT = 9
     SUNLIGHT = 10
     BIOME = 11
-    FUEL = 12            # the vegetation/fuel base (the fire view's counterpart)
+    FUEL = 12            # the vegetation/fuel base, with the fire front as a toggleable overlay (key 0)
 
 
 # Every view mode is bound to a letter key (no number-row keys). W and R are reserved for the
@@ -150,8 +149,7 @@ MODE_KEYS: dict[int, ViewMode] = {
     pygame.K_t: ViewMode.TEMPERATURE,       # air Temperature
     pygame.K_d: ViewMode.WIND,              # wind Direction (arrows)
     pygame.K_v: ViewMode.WIND_SPEED,        # wind Velocity/speed
-    pygame.K_f: ViewMode.FIRE,              # Fire front
-    pygame.K_u: ViewMode.FUEL,              # fUel / vegetation
+    pygame.K_f: ViewMode.FUEL,              # Fire & fuel (fuel base + toggleable fire overlay)
     pygame.K_o: ViewMode.OXYGEN,            # Oxygen
     pygame.K_p: ViewMode.PRESSURE,          # mass / Pressure
     pygame.K_e: ViewMode.FUEL_TEMPERATURE,  # fuel tEmperature
@@ -167,7 +165,6 @@ MODE_LABELS: dict[ViewMode, str] = {
     ViewMode.WIND_SPEED:       "Wind Speed",
     ViewMode.TEMPERATURE:      "Air Temperature",
     ViewMode.WIND:             "Wind",
-    ViewMode.FIRE:             "Fire",
     ViewMode.OXYGEN:           "Oxygen",
     ViewMode.PRESSURE:         "Mass / Pressure",
     ViewMode.FUEL_TEMPERATURE: "Fuel Temperature",
@@ -176,7 +173,7 @@ MODE_LABELS: dict[ViewMode, str] = {
     ViewMode.COLUMN_HEIGHT:    "Column Height",
     ViewMode.SUNLIGHT:         "Sunlight",
     ViewMode.BIOME:            "Biome",
-    ViewMode.FUEL:             "Fuel",
+    ViewMode.FUEL:             "Fire & Fuel",
 }
 
 # Reverse of MODE_KEYS: the view mode -> the key label shown as a hint in the menu ("1", "S", ...).
@@ -203,8 +200,7 @@ VIEW_MENU: list = [
         ("Oxygen",          ViewMode.OXYGEN),
     ]),
     ("Fire", [
-        ("Fire (front)",     ViewMode.FIRE),
-        ("Fuel",             ViewMode.FUEL),
+        ("Fire & Fuel",      ViewMode.FUEL),
         ("Fuel Temperature", ViewMode.FUEL_TEMPERATURE),
         ("Radiant Heat",     ViewMode.RADIANT_HEAT),
     ]),
@@ -402,8 +398,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._color_surface: pygame.Surface | None = None
         self._wind_surface: pygame.Surface | None = None
         self._wind_speed_surface: pygame.Surface | None = None
-        self._fire_surface: pygame.Surface | None = None   # fire front only, on black
-        self._fuel_surface: pygame.Surface | None = None   # vegetation/fuel base, no fire overlay
+        self._fuel_surface: pygame.Surface | None = None   # vegetation/fuel base + optional fire overlay
         self._oxygen_surface: pygame.Surface | None = None
         self._pressure_surface: pygame.Surface | None = None
         self._fuel_temperature_surface: pygame.Surface | None = None
@@ -436,10 +431,11 @@ class FirecrackerEnv(gymnasium.Env):
         # uncovers the cells beneath.
         self._show_fuel_panel: bool = True
         self._show_wind_overlay: bool = False
-        # The main GUI splits fire/fuel into two view modes, so it no longer toggles a fire overlay;
-        # this flag is kept (always on) only for model_viewer, which reads it to overlay the flame on
-        # its shared fire panels.
-        self._show_fire_overlay: bool = True
+        # Whether the Fire & Fuel view (ViewMode.FUEL) draws the fire front as an overlay on top of
+        # the vegetation base. Toggled with the 0 key, like the per-fuel-type number keys. Only cells
+        # where a *visible* fuel burns light up, colored by the hottest visible fuel's temperature.
+        # model_viewer reads this to match its reconstructed fire panel to the physics panel.
+        self._fuel_fire_overlay: bool = True
         self._running: bool = True
         self._paused: bool = False
         self._reset_requested: bool = False
@@ -787,11 +783,6 @@ class FirecrackerEnv(gymnasium.Env):
             # The arrows are tinted by air temperature; the bar shows that same window.
             lo, hi = self._wind_temp_window
             return [ColorbarSpec("Wind temp", wind_temp_colormap, lo, hi, celsius)]
-        if mode == ViewMode.FIRE:
-            # Burning cells are tinted by fuel temperature over a fixed span above ignition.
-            min_ign = float(self._sim.ignition_thresholds.min())
-            return [ColorbarSpec("Fire temp", fire_overlay_colormap,
-                                 min_ign, min_ign + FIRE_COLOR_TEMP_SPAN_K, celsius)]
         if mode == ViewMode.OXYGEN:
             return [ColorbarSpec("Oxygen", oxygen_colormap,
                                  DISPLAY_OXYGEN_FLOOR, DISPLAY_OXYGEN_CEILING, lambda v: f"{v:.2f}")]
@@ -813,7 +804,14 @@ class FirecrackerEnv(gymnasium.Env):
         if mode == ViewMode.COLUMN_HEIGHT:
             return [ColorbarSpec("Column", column_height_colormap,
                                  0.0, self._column_height_display_max, meters)]
-        # FUEL is a categorical vegetation blend (no single gradient); its panel stays blank.
+        if mode == ViewMode.FUEL and self._fuel_fire_overlay:
+            # The vegetation blend is categorical (no single gradient), but when the fire overlay is
+            # on the burning cells are tinted by fuel temperature over a fixed span above ignition —
+            # show that bar so the flame colors are readable.
+            min_ign = float(self._sim.ignition_thresholds.min())
+            return [ColorbarSpec("Fire temp", fire_overlay_colormap,
+                                 min_ign, min_ign + FIRE_COLOR_TEMP_SPAN_K, celsius)]
+        # FUEL with the overlay off is a categorical vegetation blend (no gradient): panel stays blank.
         return []
 
     def _blit_legend(self) -> None:
@@ -871,16 +869,24 @@ class FirecrackerEnv(gymnasium.Env):
         return listed if len(listed) <= 24 else f"{k} of {len(names)} fuels"
 
     def _draw_fuel_panel(self) -> None:
-        """In the FUEL and FUEL_TEMPERATURE views, draw a top-left HUD listing every fuel type with
-        its number key and an on/off checkbox (filled with the fuel's map color when on), so it is
-        clear exactly which fuels that view is currently showing/averaging. Toggle it with L."""
+        """In the Fire & Fuel and Fuel Temperature views, draw a top-left HUD listing every fuel type
+        with its number key and an on/off checkbox (filled with the fuel's map color when on), so it
+        is clear exactly which fuels that view is currently showing/averaging. The Fire & Fuel view
+        also gets a '0  Fire' row for the overlay toggle. Toggle the whole HUD with L."""
         selected = self._active_fuel_selection()
         if self._menu_font is None or selected is None or not self._show_fuel_panel:
             return
         names = self._sim.fuel_type_names
-        title = self._menu_hint_font.render(f"Fuels  (1-{len(names)} toggle, L hide)", True, MENU_DIM_TEXT)
-        # One row per fuel: "<key>  <name>", bright when on and dimmed when off.
+        has_fire = self._current_mode == ViewMode.FUEL
+        hint = f"1-{len(names)} toggle" + (", 0 fire" if has_fire else "") + ", L hide"
+        title = self._menu_hint_font.render(f"Fuels  ({hint})", True, MENU_DIM_TEXT)
+        # One row per fuel: "<key>  <name>", bright when on and dimmed when off. In the Fire & Fuel
+        # view a leading "0  Fire" row toggles the flame overlay (swatch = a flame orange).
         rows = []
+        if has_fire:
+            on = self._fuel_fire_overlay
+            surf = self._menu_font.render("0  Fire", True, MENU_TEXT if on else MENU_DIM_TEXT)
+            rows.append((surf, on, (230, 120, 40)))
         for i, n in enumerate(names):
             on = i in selected
             surf = self._menu_font.render(f"{i + 1}  {_humanize_fuel(n)}", True,
@@ -1085,8 +1091,6 @@ class FirecrackerEnv(gymnasium.Env):
             return self._color_surface
         if self._current_mode == ViewMode.WIND:
             return self._wind_surface
-        if self._current_mode == ViewMode.FIRE:
-            return self._fire_surface
         if self._current_mode == ViewMode.FUEL:
             return self._fuel_surface
         if self._current_mode == ViewMode.OXYGEN:
@@ -1177,23 +1181,18 @@ class FirecrackerEnv(gymnasium.Env):
             _to_numpy(self._crop(self._initial_canopy_fuel))
             if self._initial_canopy_fuel is not None else None
         )
-        # Split fire/fuel views from the one builder: the FIRE view is the fire front only (burning
-        # cells colored by temperature) on black; the FUEL view is the vegetation/fuel base with no
-        # fire overlay. (Fuel still needs initial_canopy_fuel for the bole-behind-canopy occlusion.)
-        self._fire_surface = build_fire_surface(
-            fuel_temps, fuel, oxygen, self._pixel_scale,
-            ignition_thresholds, self._sim.fuel_burnt_threshold,
-            self._sim.fuel_type_names,
-            show_fire_overlay=self._sim.fire_enabled,
-            show_vegetation=False,
-        )
+        # The Fire & Fuel view: the vegetation/fuel base with the fire front as a toggleable overlay
+        # (0 key). visible_fuels drives both — only the number-key-selected types tint the base, and a
+        # cell only reads as burning where one of those visible types is burning (hidden fuels are
+        # ignored, including for the flame's max-temperature color). initial_canopy_fuel gives the
+        # bole-behind-canopy occlusion.
         self._fuel_surface = build_fire_surface(
             fuel_temps, fuel, oxygen, self._pixel_scale,
             ignition_thresholds, self._sim.fuel_burnt_threshold,
             self._sim.fuel_type_names,
-            show_fire_overlay=False,
+            show_fire_overlay=self._fuel_fire_overlay and self._sim.fire_enabled,
             initial_canopy_fuel=initial_canopy_fuel,
-            visible_fuels=self._fuel_selected,   # number-key per-type toggles for the FUEL view
+            visible_fuels=self._fuel_selected,   # number-key per-type toggles for the Fire & Fuel view
         )
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(
@@ -1358,6 +1357,12 @@ class FirecrackerEnv(gymnasium.Env):
                     self._active_fuel_selection().symmetric_difference_update({_FUEL_TOGGLE_KEYS[event.key]})
                     self._menu_open = False
                     self._surfaces_dirty = True   # rebuild the affected fuel surface this frame
+                elif event.key == pygame.K_0 and self._current_mode == ViewMode.FUEL:
+                    # 0 toggles the fire overlay on the Fire & Fuel view, mirroring how 1..N toggle
+                    # the fuel types; only acts while that view is on screen.
+                    self._fuel_fire_overlay = not self._fuel_fire_overlay
+                    self._menu_open = False
+                    self._surfaces_dirty = True
                 elif event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_SPACE:

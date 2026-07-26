@@ -86,7 +86,8 @@ python src/main.py --model models/pooled_huber_deep11222_l256_14ch_best_bf16.pt
 | **Left-click** | Select a coarse action-cell (two clicks: a row, then a column — see below) |
 | **Tab** | Open / close the view-mode menu |
 | **Letter keys** | Jump straight to a view (see the menu for each mode's key) |
-| **Number keys `1`–`9`** | In the Fuel / Fuel Temperature views, toggle individual fuel types on/off |
+| **Number keys `1`–`9`** | In the Fire & Fuel / Fuel Temperature views, toggle individual fuel types on/off |
+| **`0`** | In the Fire & Fuel view, toggle the fire overlay |
 | **`Space`** | Pause / resume |
 | **`.`** (period) | Advance one frame while paused |
 | **`W`** | Toggle the wind-arrow overlay |
@@ -94,7 +95,7 @@ python src/main.py --model models/pooled_huber_deep11222_l256_14ch_best_bf16.pt
 | **`R`** | Reset to a new map |
 | **`Esc`** | Quit |
 
-The **view modes** are: Air Temperature, Wind, Wind Speed, Fire, Fuel, Fuel Temperature, Oxygen,
+The **view modes** are: Air Temperature, Wind, Wind Speed, Fire & Fuel, Fuel Temperature, Oxygen,
 Mass / Pressure, Column Height, Radiant Heat, Terrain, Sunlight, and Biome.
 
 ---
