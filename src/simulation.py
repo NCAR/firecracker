@@ -24,15 +24,15 @@ _MAX_DIFFUSION_COEFF: float = 0.2
 # (H, W) field. The stack is the near-surface air temperature, then one temperature channel per
 # configured fuel type (fuel_temperature_<name>), then one vegetation-mass channel per fuel type
 # (fuel_<name>), then the two signed terrain-slope components (slope_x/slope_y), the two near-surface
-# wind components, the one-hot vegetation biome (one biome_<name> channel per biome), and finally a
-# binary "ignited" mask. It is slope, not terrain height, that skews fire spread (Rothermel slope
-# effect), and a conv stack struggles to synthesize that spatial derivative from a raw height field,
+# wind components, and finally a binary "ignited" mask. It is slope, not terrain height, that skews
+# fire spread (Rothermel slope effect), and a conv stack struggles to synthesize that spatial
+# derivative from a raw height field,
 # so the slope is supplied directly. Because the per-fuel-type channels make the count depend on the
 # configured fuel types, callers derive the ordered names via obs_channel_names(fuel_type_names)
 # rather than reading a fixed tuple. OBS_CHANNELS_PRE/POST are the type-independent channels that
 # bracket the two fuel blocks; every fuel_temperature_<name> channel shares the "fuel_temperature"
-# window and every fuel_<name> channel the "fuel" window in physics_constants.OBS_NORM. The biome and
-# ignited channels are already 0/1, so they share the identity "biome" / "ignited" windows.
+# window and every fuel_<name> channel the "fuel" window in physics_constants.OBS_NORM. The ignited
+# channel is already 0/1, so it shares the identity "ignited" window.
 OBS_CHANNELS_PRE:  tuple[str, ...] = ("air_temperature",)
 OBS_CHANNELS_POST: tuple[str, ...] = ("slope_x", "slope_y", "wind_x", "wind_y")
 # The three non-overlapping vegetation biomes, in the label order gen_maps.classify_biomes returns
