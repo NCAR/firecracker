@@ -181,6 +181,25 @@ MODE_KEY_LABELS: dict[ViewMode, str] = {
     mode: pygame.key.name(key).upper() for key, mode in MODE_KEYS.items()
 }
 
+# Default view assignment for the optional multi-view grid (--views RxC): the panes fill row-major
+# from this list, so a 2x2 opens on the four most useful views and a 3x3 shows nine distinct ones.
+# The active pane can still be retargeted to any view at runtime (letter keys / TAB menu).
+DEFAULT_PANE_VIEWS: list[ViewMode] = [
+    ViewMode.FUEL, ViewMode.TEMPERATURE, ViewMode.WIND, ViewMode.FUEL_TEMPERATURE,
+    ViewMode.OXYGEN, ViewMode.RADIANT_HEAT, ViewMode.TERRAIN, ViewMode.WIND_SPEED, ViewMode.BIOME,
+]
+
+# Target overall pixel width of the multi-view scene; each square pane is this divided by the column
+# count (so a 2-wide grid gets larger panes than a 3-wide one), then capped so a tall (many-row) grid
+# still fits a typical screen (GRID_SCENE_MAX_H bounds the total pane height).
+GRID_PANE_TARGET: int = 780
+GRID_SCENE_MAX_H: int = 900
+
+# Arrow keys used (with SHIFT) to move the active pane around the multi-view grid.
+_ARROW_KEYS: frozenset[int] = frozenset({
+    pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+})
+
 def _humanize_fuel(name: str) -> str:
     """A fuel-type id like 'tree_bole_surface' -> a display string 'Tree Bole Surface'."""
     return name.replace("_", " ").title()
@@ -238,6 +257,8 @@ class FirecrackerEnv(gymnasium.Env):
         render_mode: str | None = None,
         map_name: str | None = None,
         maps_dir: str | None = None,
+        view_grid: tuple[int, int] | None = None,
+        panes: list[ViewMode] | None = None,
     ):
         super().__init__()
         assert render_mode is None or render_mode in self.metadata["render_modes"], (
@@ -415,7 +436,38 @@ class FirecrackerEnv(gymnasium.Env):
         self._action_flash_until: float = 0.0
         self._flash_square: pygame.Surface | None = None
         self._surfaces_dirty: bool = True
-        self._current_mode: ViewMode = ViewMode.TEMPERATURE
+        # Optional fixed ceiling (kelvin) for the air-temperature view's color scale. None = auto-range
+        # to the hottest cell each frame (the default). Pinning it to a constant -- e.g. an episode's
+        # peak air temperature -- keeps the color mapping steady frame to frame instead of flickering
+        # as the fire's peak rises and falls, and makes the scale comparable across frames.
+        self._fixed_air_temp_max: float | None = None
+        # Optional multi-view grid. None = the single-view window (default). When set to (rows, cols)
+        # the window shows rows*cols panes, each an independent view mode; the "active" pane is the one
+        # the letter keys / TAB menu retarget, and SHIFT+arrow keys move which pane is active. In grid
+        # mode the live view (_current_mode, below) is a property backed by panes[_active_pane].
+        self._view_grid: tuple[int, int] | None = view_grid
+        self._active_pane: int = 0
+        self._pane_px: int = 0
+        nfuel = self._sim.num_fuel_types
+        if view_grid is not None:
+            n = view_grid[0] * view_grid[1]
+            if panes is not None:
+                if len(panes) != n:
+                    raise ValueError(f"panes has {len(panes)} entries but the {view_grid} grid needs {n}")
+                self._panes: list[ViewMode] = list(panes)
+            else:
+                self._panes = [DEFAULT_PANE_VIEWS[i % len(DEFAULT_PANE_VIEWS)] for i in range(n)]
+        else:
+            self._panes = []
+        # Each pane keeps its own fuel-type selection, so several Fire & Fuel / Fuel Temperature panes
+        # can show different fuel subsets at once (e.g. one grass-only, one canopy-only). Number keys
+        # toggle the active pane's set. An optional per-pane label overrides the default view name.
+        self._pane_fuel_selected: list[set[int]] = [set(range(nfuel)) for _ in self._panes]
+        self._pane_fuel_temp_selected: list[set[int]] = [set(range(nfuel)) for _ in self._panes]
+        self._pane_labels: list[str | None] = [None for _ in self._panes]
+        self._pane_surfaces: dict[int, pygame.Surface] = {}   # per-pane fuel-view surfaces (rebuilt each step)
+        # Backing store for the single-view current mode (used when _view_grid is None).
+        self._current_mode_single: ViewMode = ViewMode.TEMPERATURE
         # The number keys 1..N toggle which fuel types each fuel view shows: FUEL_TEMPERATURE
         # averages (mass-weighted) over its selected types; FUEL blends the vegetation colors of
         # its selected types. Each view keeps its own set, both starting with every fuel type on.
@@ -445,15 +497,24 @@ class FirecrackerEnv(gymnasium.Env):
             pygame.init()
             pygame.font.init()
             pygame.display.set_caption(WINDOW_TITLE)
-            sim_px = self.grid_size * self._pixel_scale
-            # Reserve a fixed legend panel on the right and a status bar on top, so the window is
-            # permanently wider and taller than the simulation: the colorbar never overlaps the
-            # field, and the view-mode label sits clear above both.
-            win_w = sim_px + LEGEND_PANEL_WIDTH
-            self._screen = pygame.display.set_mode((win_w, sim_px + TOP_BAR_HEIGHT))
+            if self._view_grid is not None:
+                # Multi-view: a rows x cols grid of square panes below the top bar (no side legend --
+                # each pane is labeled instead). The pane size shrinks as the grid widens.
+                rows, cols = self._view_grid
+                self._pane_px = min(GRID_PANE_TARGET // cols, GRID_SCENE_MAX_H // rows)
+                win_w = self._pane_px * cols
+                scene_h = self._pane_px * rows
+            else:
+                sim_px = self.grid_size * self._pixel_scale
+                # Reserve a fixed legend panel on the right and a status bar on top, so the window is
+                # permanently wider and taller than the simulation: the colorbar never overlaps the
+                # field, and the view-mode label sits clear above both.
+                win_w = sim_px + LEGEND_PANEL_WIDTH
+                scene_h = sim_px
+            self._screen = pygame.display.set_mode((win_w, scene_h + TOP_BAR_HEIGHT))
             # Everything below the bar draws into this subsurface, so the sim/legend/overlay code
             # keeps using bar-relative coordinates (y=0 at the top of the sim).
-            self._scene = self._screen.subsurface((0, TOP_BAR_HEIGHT, win_w, sim_px))
+            self._scene = self._screen.subsurface((0, TOP_BAR_HEIGHT, win_w, scene_h))
             self._clock = pygame.time.Clock()
             self._legend_font = pygame.font.Font(None, LEGEND_FONT_SIZE)
             self._legend_title_font = pygame.font.Font(None, LEGEND_TITLE_FONT_SIZE)
@@ -461,6 +522,22 @@ class FirecrackerEnv(gymnasium.Env):
             self._menu_font = pygame.font.Font(None, MENU_FONT_SIZE)
             self._menu_title_font = pygame.font.Font(None, MENU_TITLE_FONT_SIZE)
             self._menu_hint_font = pygame.font.Font(None, MENU_HINT_FONT_SIZE)
+
+    @property
+    def _current_mode(self) -> ViewMode:
+        """The view currently being driven by the keys/menu. In single-view mode this is a plain
+        stored value; in multi-view mode it is the active pane's view, so every existing code path
+        that reads or sets _current_mode transparently targets the active pane."""
+        if self._view_grid is not None:
+            return self._panes[self._active_pane]
+        return self._current_mode_single
+
+    @_current_mode.setter
+    def _current_mode(self, mode: ViewMode) -> None:
+        if self._view_grid is not None:
+            self._panes[self._active_pane] = mode
+        else:
+            self._current_mode_single = mode
 
     def _crop(self, field):
         """The observed inner window of a padded (..., H, W) field: drops the _pad-cell sponge
@@ -670,20 +747,23 @@ class FirecrackerEnv(gymnasium.Env):
             # A fire spawn or a fuel-temp variant switch during event handling dirties the surfaces;
             # rebuild now so the change shows this frame (matters while paused, when no step will).
             self._rebuild_surfaces_if_dirty()
-            surface = self._surface_for_mode()
             self._screen.fill((0, 0, 0))
             self._draw_top_bar()
-            self._scene.blit(surface, (0, 0))
-            # The wind surface is transparent (black colorkey) except for the arrows, so it
-            # overlays any view. Skip WIND, where the arrows are already the primary view.
-            if self._show_wind_overlay and self._current_mode is not ViewMode.WIND:
-                self._scene.blit(self._wind_surface, (0, 0))
-            if self._current_mode in (ViewMode.WIND, ViewMode.WIND_SPEED):
-                self._blit_cursor_wind_vector()
-            self._blit_action_highlight()
-            self._blit_action_flash()
-            self._blit_legend()
-            self._draw_fuel_panel()
+            if self._view_grid is not None:
+                self._render_grid()
+            else:
+                surface = self._surface_for_mode()
+                self._scene.blit(surface, (0, 0))
+                # The wind surface is transparent (black colorkey) except for the arrows, so it
+                # overlays any view. Skip WIND, where the arrows are already the primary view.
+                if self._show_wind_overlay and self._current_mode is not ViewMode.WIND:
+                    self._scene.blit(self._wind_surface, (0, 0))
+                if self._current_mode in (ViewMode.WIND, ViewMode.WIND_SPEED):
+                    self._blit_cursor_wind_vector()
+                self._blit_action_highlight()
+                self._blit_action_flash()
+                self._blit_legend()
+                self._draw_fuel_panel()
             self._draw_view_menu()
             pygame.display.flip()
             self._clock.tick(TARGET_FPS)
@@ -843,15 +923,26 @@ class FirecrackerEnv(gymnasium.Env):
         selected = self._active_fuel_selection()
         if selected is not None:
             label = f"{label} - {self._fuel_selection_label(selected)}"
+        if self._view_grid is not None:
+            label = (f"{label}   ·   pane {self._active_pane + 1}/{len(self._panes)}"
+                     f"   ·   Shift+Arrows move · letter/Tab set view")
         text = self._top_bar_font.render(f"View: {label}", True, TOP_BAR_TEXT)
         self._screen.blit(text, (TOP_BAR_PAD_LEFT, (TOP_BAR_HEIGHT - text.get_height()) // 2))
 
     def _active_fuel_selection(self) -> set[int] | None:
         """The per-fuel-type toggle set the active view uses (FUEL_TEMPERATURE / FUEL), or None for
-        any other view — so the number keys, HUD and top-bar label all target the same set."""
-        if self._current_mode == ViewMode.FUEL_TEMPERATURE:
+        any other view — so the number keys, HUD and top-bar label all target the same set. In grid
+        mode this is the active pane's own set (each pane keeps an independent selection)."""
+        mode = self._current_mode
+        if self._view_grid is not None:
+            if mode == ViewMode.FUEL_TEMPERATURE:
+                return self._pane_fuel_temp_selected[self._active_pane]
+            if mode == ViewMode.FUEL:
+                return self._pane_fuel_selected[self._active_pane]
+            return None
+        if mode == ViewMode.FUEL_TEMPERATURE:
             return self._fuel_temp_selected
-        if self._current_mode == ViewMode.FUEL:
+        if mode == ViewMode.FUEL:
             return self._fuel_selected
         return None
 
@@ -1084,30 +1175,102 @@ class FirecrackerEnv(gymnasium.Env):
             math.hypot(vx, vy), self._wind_speed_display_max, color, from_base=True,
         )
 
-    def _surface_for_mode(self) -> pygame.Surface:
-        if self._current_mode == ViewMode.WIND_SPEED:
+    def _surface_for_mode(self, mode: ViewMode | None = None) -> pygame.Surface:
+        mode = self._current_mode if mode is None else mode
+        if mode == ViewMode.WIND_SPEED:
             return self._wind_speed_surface
-        if self._current_mode == ViewMode.TEMPERATURE:
+        if mode == ViewMode.TEMPERATURE:
             return self._color_surface
-        if self._current_mode == ViewMode.WIND:
+        if mode == ViewMode.WIND:
             return self._wind_surface
-        if self._current_mode == ViewMode.FUEL:
+        if mode == ViewMode.FUEL:
             return self._fuel_surface
-        if self._current_mode == ViewMode.OXYGEN:
+        if mode == ViewMode.OXYGEN:
             return self._oxygen_surface
-        if self._current_mode == ViewMode.PRESSURE:
+        if mode == ViewMode.PRESSURE:
             return self._pressure_surface
-        if self._current_mode == ViewMode.FUEL_TEMPERATURE:
+        if mode == ViewMode.FUEL_TEMPERATURE:
             return self._fuel_temperature_surface
-        if self._current_mode == ViewMode.TERRAIN:
+        if mode == ViewMode.TERRAIN:
             return self._terrain_surface
-        if self._current_mode == ViewMode.SUNLIGHT:
+        if mode == ViewMode.SUNLIGHT:
             return self._sunlight_surface
-        if self._current_mode == ViewMode.BIOME:
+        if mode == ViewMode.BIOME:
             return self._biome_surface
-        if self._current_mode == ViewMode.COLUMN_HEIGHT:
+        if mode == ViewMode.COLUMN_HEIGHT:
             return self._column_height_surface
         return self._radiant_flux_surface
+
+    def _render_grid(self) -> None:
+        """Draw the multi-view grid: each pane shows its assigned view's field scaled to the pane,
+        with a name label and a border (bright accent on the active pane, dim on the rest). The
+        active pane is the one the letter keys / TAB menu retarget; SHIFT+arrows move it."""
+        rows, cols = self._view_grid
+        pane = self._pane_px
+        for i, vm in enumerate(self._panes):
+            r, c = divmod(i, cols)
+            x, y = c * pane, r * pane
+            # Fuel-view panes have their own per-selection surface; other views share the prebuilt one.
+            # The mode surfaces are built at grid_size*_pixel_scale; nearest-scale to the pane keeps
+            # the cells crisp (no blur) and is cheap.
+            surf = self._pane_surfaces.get(i) or self._surface_for_mode(vm)
+            self._scene.blit(pygame.transform.scale(surf, (pane, pane)), (x, y))
+            active = i == self._active_pane
+            label = self._pane_label(i, vm)
+            text = self._menu_font.render(label, True, MENU_TEXT if active else MENU_DIM_TEXT)
+            strip = pygame.Surface((pane, text.get_height() + 6), pygame.SRCALPHA)
+            strip.fill((*MENU_BG, 205))
+            self._scene.blit(strip, (x, y))
+            self._scene.blit(text, (x + 6, y + 3))
+            pygame.draw.rect(
+                self._scene, MENU_ACCENT if active else MENU_BORDER,
+                (x, y, pane, pane), width=3 if active else 1,
+            )
+
+    def _pane_label(self, i: int, vm: ViewMode) -> str:
+        """The label drawn on pane i: its custom label if set, else the view name, with the fuel-type
+        selection appended for fuel views (so several fuel panes read as e.g. 'Grass, Shrub')."""
+        if self._pane_labels[i] is not None:
+            return self._pane_labels[i]
+        label = MODE_LABELS.get(vm, vm.name.title())
+        if vm == ViewMode.FUEL:
+            return f"{label} - {self._fuel_selection_label(self._pane_fuel_selected[i])}"
+        if vm == ViewMode.FUEL_TEMPERATURE:
+            return f"{label} - {self._fuel_selection_label(self._pane_fuel_temp_selected[i])}"
+        return label
+
+    def _move_active_pane(self, key: int) -> None:
+        """Move the active pane one step in the arrow direction, clamped at the grid edges."""
+        rows, cols = self._view_grid
+        r, c = divmod(self._active_pane, cols)
+        if key == pygame.K_LEFT:
+            c -= 1
+        elif key == pygame.K_RIGHT:
+            c += 1
+        elif key == pygame.K_UP:
+            r -= 1
+        elif key == pygame.K_DOWN:
+            r += 1
+        r = max(0, min(rows - 1, r))
+        c = max(0, min(cols - 1, c))
+        self._active_pane = r * cols + c
+
+    def _grid_cell_from_pixel(self, px: int, py: int) -> tuple[int, int] | None:
+        """Map a window pixel to a sim (row, col) in multi-view mode: find the pane under the cursor
+        and convert the pane-local position to a cell. None if the cursor is on the top bar or off the
+        panes. Any pane works -- they all show the same underlying world."""
+        py -= TOP_BAR_HEIGHT
+        if py < 0:
+            return None
+        rows, cols = self._view_grid
+        pane = self._pane_px
+        pc, pr = px // pane, py // pane
+        if pr >= rows or pc >= cols:
+            return None
+        scale = pane / self.grid_size
+        col = min(int((px - pc * pane) / scale), self.grid_size - 1)
+        row = min(int((py - pr * pane) / scale), self.grid_size - 1)
+        return row, col
 
     def _rebuild_surfaces_if_dirty(self) -> None:
         if not self._surfaces_dirty:
@@ -1139,23 +1302,12 @@ class FirecrackerEnv(gymnasium.Env):
         # span clamped to a minimum so a near-uniform (no-fire) field isn't over-stretched. The
         # floor sits at ambient and stays there during a fire (combustion only heats), so a flame
         # lifts the ceiling without moving the floor.
-        # The fuel-temperature field to show: the mass-weighted average over just the toggled-on
-        # fuel types (number keys 1..N pick the set). Where the selected types hold ~no mass in a
-        # cell the weighted mean is undefined, so fall back there to their plain mean (near ambient)
-        # to keep the field continuous. With nothing selected, show the display floor (dark).
-        sel = sorted(self._fuel_temp_selected)
-        if sel:
-            sub_temps, sub_mass = fuel_temps[sel], fuel[sel]
-            sel_mass = sub_mass.sum(axis=0)
-            fuel_temp_field = np.where(
-                sel_mass > 1e-9,
-                (sub_temps * sub_mass).sum(axis=0) / np.maximum(sel_mass, 1e-9),
-                sub_temps.mean(axis=0),
-            )
-        else:
-            fuel_temp_field = np.full(fuel_temps.shape[1:], FUEL_TEMP_DISPLAY_MIN_K, dtype=np.float32)
         self._air_temp_display_min = float(temp.min())
-        self._air_temp_display_max = max(self._air_temp_display_min + DISPLAY_MIN_TEMP_SPAN_K, float(temp.max()))
+        # Ceiling: the hottest cell this frame (auto-range), unless a fixed ceiling is pinned (then the
+        # scale stays put frame to frame). Either way, keep a minimum span so a near-uniform field isn't
+        # over-stretched.
+        air_temp_ceiling = float(temp.max()) if self._fixed_air_temp_max is None else self._fixed_air_temp_max
+        self._air_temp_display_max = max(self._air_temp_display_min + DISPLAY_MIN_TEMP_SPAN_K, air_temp_ceiling)
         # The fuel-temperature view uses a fixed window (unlike the auto-ranging air-temp view above)
         # so a flame's color reads the same temperature every frame and across models in the viewer.
         self._fuel_temp_display_min = FUEL_TEMP_DISPLAY_MIN_K
@@ -1181,27 +1333,20 @@ class FirecrackerEnv(gymnasium.Env):
             _to_numpy(self._crop(self._initial_canopy_fuel))
             if self._initial_canopy_fuel is not None else None
         )
-        # The Fire & Fuel view: the vegetation/fuel base with the fire front as a toggleable overlay
-        # (0 key). visible_fuels drives both — only the number-key-selected types tint the base, and a
-        # cell only reads as burning where one of those visible types is burning (hidden fuels are
-        # ignored, including for the flame's max-temperature color). initial_canopy_fuel gives the
-        # bole-behind-canopy occlusion.
-        self._fuel_surface = build_fire_surface(
-            fuel_temps, fuel, oxygen, self._pixel_scale,
-            ignition_thresholds, self._sim.fuel_burnt_threshold,
-            self._sim.fuel_type_names,
-            show_fire_overlay=self._fuel_fire_overlay and self._sim.fire_enabled,
-            initial_canopy_fuel=initial_canopy_fuel,
-            visible_fuels=self._fuel_selected,   # number-key per-type toggles for the Fire & Fuel view
-        )
+        # Stash the raw fuel-view inputs so the per-selection builders (_fire_surface_for /
+        # _fuel_temp_surface_for) can render any fuel subset -- one for the single view, and a
+        # different one per pane in multi-view mode.
+        self._fire_inputs = {
+            "fuel_temps": fuel_temps, "fuel": fuel, "oxygen": oxygen,
+            "ignition_thresholds": ignition_thresholds, "initial_canopy_fuel": initial_canopy_fuel,
+        }
+        self._fuel_surface = self._fire_surface_for(self._fuel_selected)
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
         self._pressure_surface = build_pressure_surface(
             pressure_field, self._pixel_scale, self._pressure_display_max
         )
         # Fuel-temperature view: the selected variant's field over the fixed fuel-temp window.
-        self._fuel_temperature_surface = build_color_surface(
-            fuel_temp_field, self._pixel_scale, self._fuel_temp_display_min, self._fuel_temp_display_max,
-        )
+        self._fuel_temperature_surface = self._fuel_temp_surface_for(self._fuel_temp_selected)
         self._radiant_flux_surface = build_radiant_heat_surface(
             radiant_flux, self._pixel_scale, upper_bound=self._radiant_flux_display_max,
         )
@@ -1219,7 +1364,47 @@ class FirecrackerEnv(gymnasium.Env):
         self._column_height_surface = build_column_height_surface(
             column_height, self._pixel_scale, self._column_height_display_max
         )
+        # Multi-view: each fuel-view pane may show a different fuel subset, so give it its own surface
+        # (the shared _fuel_surface / _fuel_temperature_surface only cover the single active selection).
+        self._pane_surfaces = {}
+        for i, vm in enumerate(self._panes):
+            if vm == ViewMode.FUEL:
+                self._pane_surfaces[i] = self._fire_surface_for(self._pane_fuel_selected[i])
+            elif vm == ViewMode.FUEL_TEMPERATURE:
+                self._pane_surfaces[i] = self._fuel_temp_surface_for(self._pane_fuel_temp_selected[i])
         self._surfaces_dirty = False
+
+    def _fire_surface_for(self, selection: set[int]) -> pygame.Surface:
+        """Build a Fire & Fuel surface showing only the given fuel-type indices (base tint + flame
+        overlay), from the raw fields cached this frame in _fire_inputs."""
+        fi = self._fire_inputs
+        return build_fire_surface(
+            fi["fuel_temps"], fi["fuel"], fi["oxygen"], self._pixel_scale,
+            fi["ignition_thresholds"], self._sim.fuel_burnt_threshold, self._sim.fuel_type_names,
+            show_fire_overlay=self._fuel_fire_overlay and self._sim.fire_enabled,
+            initial_canopy_fuel=fi["initial_canopy_fuel"], visible_fuels=selection,
+        )
+
+    def _fuel_temp_surface_for(self, selection: set[int]) -> pygame.Surface:
+        """Build a Fuel Temperature surface for the given fuel-type indices: the mass-weighted mean
+        temperature over the selected types (plain mean where they hold ~no mass, so the field stays
+        continuous; the display floor when nothing is selected), over the fixed fuel-temp window."""
+        fi = self._fire_inputs
+        fuel_temps, fuel = fi["fuel_temps"], fi["fuel"]
+        sel = sorted(selection)
+        if sel:
+            sub_temps, sub_mass = fuel_temps[sel], fuel[sel]
+            sel_mass = sub_mass.sum(axis=0)
+            field = np.where(
+                sel_mass > 1e-9,
+                (sub_temps * sub_mass).sum(axis=0) / np.maximum(sel_mass, 1e-9),
+                sub_temps.mean(axis=0),
+            )
+        else:
+            field = np.full(fuel_temps.shape[1:], FUEL_TEMP_DISPLAY_MIN_K, dtype=np.float32)
+        return build_color_surface(
+            field, self._pixel_scale, self._fuel_temp_display_min, self._fuel_temp_display_max,
+        )
 
     def _to_tensor(self, arr: np.ndarray) -> torch.Tensor:
         """Move a host numpy field onto the simulation device as a float32 tensor."""
@@ -1307,6 +1492,11 @@ class FirecrackerEnv(gymnasium.Env):
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.MOUSEMOTION:
+                # The coarse action grid is a single-view concept; in multi-view mode there is no
+                # action-cell hover to track.
+                if self._view_grid is not None:
+                    self._hovered_action_cell = None
+                    continue
                 # Track which coarse action-cell the cursor sits over (for the hover overlay).
                 # Over the legend panel or the top bar there is no cell to hover, so clear it.
                 px, py = event.pos
@@ -1318,6 +1508,14 @@ class FirecrackerEnv(gymnasium.Env):
                 acol = min(px // self._action_cell_px, self.action_grid_size - 1)
                 self._hovered_action_cell = (arow, acol)
             elif event.type == pygame.MOUSEBUTTONDOWN:
+                if self._view_grid is not None:
+                    # Multi-view: only right-click-to-ignite is supported (the two-step action
+                    # selection is a single-view training aid). Any pane maps to the same world.
+                    if event.button == 3:
+                        cell = self._grid_cell_from_pixel(*event.pos)
+                        if cell is not None:
+                            fire_click = cell
+                    continue
                 px, py = event.pos
                 py -= TOP_BAR_HEIGHT   # window -> scene coordinates
                 if px >= sim_w or py < 0:
@@ -1342,6 +1540,13 @@ class FirecrackerEnv(gymnasium.Env):
                     self._menu_open = not self._menu_open
                     if self._menu_open:
                         self._open_view_menu()
+                elif (self._view_grid is not None and (event.mod & pygame.KMOD_SHIFT)
+                        and event.key in _ARROW_KEYS):
+                    # Multi-view: SHIFT+arrows move which pane is active. Re-read the mode afterwards
+                    # so the render() write-back (self._current_mode = mode) is a no-op on the newly
+                    # active pane rather than overwriting it with the old pane's mode.
+                    self._move_active_pane(event.key)
+                    mode = self._current_mode
                 elif self._menu_open and event.key in _MENU_NAV_KEYS:
                     selected = self._menu_navigate(event.key)
                     if selected is not None:

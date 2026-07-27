@@ -241,9 +241,27 @@ def run_comparison(
     env.close()
 
 
-def run(config: dict, map_name: str | None = None, maps_dir: str | None = None) -> None:
+def parse_views(spec: str) -> tuple[int, int]:
+    """Parse a --views 'RxC' argument (e.g. '2x2', '3x3') into a (rows, cols) grid, 1..3 each."""
+    try:
+        rows_s, cols_s = spec.lower().split("x")
+        rows, cols = int(rows_s), int(cols_s)
+    except ValueError:
+        raise SystemExit(f"--views must look like RxC, e.g. 2x2 or 3x3; got {spec!r}")
+    if not (1 <= rows <= 3 and 1 <= cols <= 3):
+        raise SystemExit(f"--views rows and cols must each be between 1 and 3; got {spec!r}")
+    return rows, cols
+
+
+def run(
+    config: dict,
+    map_name: str | None = None,
+    maps_dir: str | None = None,
+    view_grid: tuple[int, int] | None = None,
+) -> None:
     env = FirecrackerEnv(
-        config=config, render_mode="human", map_name=map_name, maps_dir=maps_dir
+        config=config, render_mode="human", map_name=map_name, maps_dir=maps_dir,
+        view_grid=view_grid,
     )
 
     step_interval = 1.0 / env._sim.simulation_steps_per_second
@@ -325,6 +343,12 @@ if __name__ == "__main__":
         help="run with no window and no real-time throttle (fastest; runs to max_steps)",
     )
     parser.add_argument(
+        "--views", metavar="RxC",
+        help="show a grid of independent view panes instead of one view, e.g. 2x2 or 3x3. "
+             "SHIFT+arrow keys move the active pane; the letter keys / TAB menu set the active "
+             "pane's view. (window mode only)",
+    )
+    parser.add_argument(
         "--steps", type=int, metavar="N",
         help="run for N steps then truncate (overrides [environment].max_steps)",
     )
@@ -339,6 +363,11 @@ if __name__ == "__main__":
 
     if args.model and args.headless:
         parser.error("--model needs a window to draw into; it can't be combined with --headless.")
+    if args.views and (args.headless or args.model):
+        parser.error("--views is a windowed single-world layout; it can't be combined with "
+                     "--headless or --model.")
+
+    view_grid = parse_views(args.views) if args.views else None
 
     config = load_config(args.config)
     if args.steps is not None:
@@ -350,4 +379,4 @@ if __name__ == "__main__":
     elif args.headless:
         run_headless(config, map_name=args.map, maps_dir=args.maps_dir)
     else:
-        run(config, map_name=args.map, maps_dir=args.maps_dir)
+        run(config, map_name=args.map, maps_dir=args.maps_dir, view_grid=view_grid)
