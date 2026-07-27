@@ -4,3 +4,4 @@ pygame
 gymnasium
 pytest
 wandb
+pillow  # tools/record_views.py: GIF encoding
