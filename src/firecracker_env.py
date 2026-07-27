@@ -324,7 +324,7 @@ class FirecrackerEnv(gymnasium.Env):
         # Water an action drops on its action-cell block [kg/m^2 of liquid water], added to the
         # cells' moisture. A wet cell (moisture > 0) cannot ignite until the water boils off; the
         # evaporation/gate physics lives in Simulation.apply_moisture.
-        self._water_drop_amount = float(action_cfg.get("water_drop_amount", 10.0))
+        self._water_drop_amount = float(action_cfg.get("water_drop_amount", 20.0))
         # Action-cell (arow, acol) currently under the mouse, or None when the cursor is
         # outside the window. Drawn as a brightening overlay each frame (render).
         self._hovered_action_cell: tuple[int, int] | None = None
@@ -700,14 +700,22 @@ class FirecrackerEnv(gymnasium.Env):
 
     def _apply_water_drop(self, arow: int, acol: int) -> None:
         """Drop water on the action-cell (arow, acol): add water_drop_amount [kg/m^2] to the moisture
-        of every sim cell in its block. The wet cells then can't ignite until Simulation.apply_moisture
+        of every sim cell inside the CIRCLE that circumscribes the action-cell's square block (radius
+        = half the square's diagonal), so the whole square is wetted plus a little beyond -- a round
+        splash rather than a hard square. The wet cells can't ignite until Simulation.apply_moisture
         boils the water off. Action-cell indices are on the observed grid, so offset by _pad."""
         if self._moisture is None or self._water_drop_amount <= 0.0:
             return
         c = self._action_cell_cells
-        r0 = self._pad + arow * c
+        r0 = self._pad + arow * c                       # block's top-left in padded-grid indices
         c0 = self._pad + acol * c
-        self._moisture[r0:r0 + c, c0:c0 + c] += self._water_drop_amount
+        center_r = r0 + (c - 1) / 2.0                   # geometric centre of the c x c block
+        center_c = c0 + (c - 1) / 2.0
+        radius = c * (2.0 ** 0.5) / 2.0                 # half-diagonal: the square sits inside the disk
+        rows = torch.arange(self._sim_size, device=self._sim.device).view(-1, 1)
+        cols = torch.arange(self._sim_size, device=self._sim.device).view(1, -1)
+        disk = (rows - center_r) ** 2 + (cols - center_c) ** 2 <= radius ** 2
+        self._moisture[disk] += self._water_drop_amount
 
     def _burning_per_type(self) -> torch.Tensor:
         """(N, H, W) boolean mask of cells currently burning: hot enough to pyrolyse, with fuel and

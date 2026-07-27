@@ -230,3 +230,26 @@ def test_completed_action_near_fire_drops_water(make_env):
     env.step(fr)
     env.step(fc)
     assert env._selected_action_cell is None
+
+
+def test_water_drop_footprint_is_a_circle_around_the_square(make_env):
+    """With a coarse action grid (c > 1 sim cells per action-cell), a drop wets a disk that
+    circumscribes the action-cell's square: every square cell is wet, the disk bulges a little beyond
+    the square edges, and cells outside the circumscribing circle stay dry."""
+    G = 32
+    config = make_config(G)
+    config["action"] = {"grid_size": 4}                # 8x8 sim cells per action-cell
+    env = make_env(config, build_map(G))
+    env.reset(seed=0)
+    c = env._action_cell_cells
+    assert c == 8
+    p = env._pad
+    arow = acol = 1                                    # a middle action-cell, room to bulge each way
+    r0, c0 = p + arow * c, p + acol * c
+    env._apply_water_drop(arow, acol)
+    m = env._moisture
+
+    assert (m[r0:r0 + c, c0:c0 + c] > 0).all()          # the whole square block is wet
+    assert float(m[r0 - 1, c0 + 3]) > 0                 # one row above the square (near centre) -> inside disk
+    assert float(m[r0 - 4, c0 + 3]) == 0               # farther out, beyond the circle -> dry
+    assert float(m[r0 - 3, c0 - 3]) == 0               # a diagonal corner well outside the circle -> dry

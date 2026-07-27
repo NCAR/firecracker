@@ -468,7 +468,7 @@ grid_size = 32   # action-grid cells per side (256 sim cells / 32 -> 8x8 cells e
 # A completed action drops water on its action-cell block: water_drop_amount kg/m^2 of liquid
 # water is added to those cells' moisture. A wet cell (moisture > 0) cannot ignite -- the water
 # first absorbs heat from the surrounding fuel/air and boils off (see [moisture]).
-water_drop_amount = 10.0  # liquid water per drop [kg/m^2]
+water_drop_amount = 20.0  # liquid water per drop [kg/m^2]
 
 [moisture]
 # Fire-suppression water dropped by the action. Standing water [kg/m^2] on a cell is a heat sink:
