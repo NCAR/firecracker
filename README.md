@@ -92,6 +92,7 @@ python src/main.py --model models/pooled_huber_deep11222_l256_14ch_best_bf16.pt
 | **`.`** (period) | Advance one frame while paused |
 | **`W`** | Toggle the wind-arrow overlay |
 | **`L`** | Show / hide the fuel-type panel |
+| **`N`** | Toggle light / dark chrome for the legend and menus (dark by default) |
 | **`R`** | Reset to a new map |
 | **`Esc`** | Quit |
 

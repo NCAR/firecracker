@@ -163,6 +163,68 @@ MENU_PAD_X:    int = 18                # panel horizontal inset
 MENU_PAD_Y:    int = 12                # panel vertical inset
 MENU_MIN_WIDTH: int = 300
 
+# ---------------------------------------------------------------------------
+# Light / dark theme
+#
+# The legend panel and the TAB view-mode menu ("dropdown") can be flipped between the default dark
+# palette and a light one at runtime. Only that chrome changes — the field colormaps and the top
+# status bar are untouched. Drawing code reads the *active* theme through `theme()` rather than the
+# module constants directly, so a toggle takes effect on the next frame. The constants above remain
+# the dark values (and the dark theme's source), so importers that read them keep the old look.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Theme:
+    legend_bg:      tuple[int, int, int]
+    legend_border:  tuple[int, int, int]
+    legend_text:    tuple[int, int, int]
+    top_bar_bg:     tuple[int, int, int]
+    top_bar_border: tuple[int, int, int]
+    top_bar_text:   tuple[int, int, int]
+    menu_bg:       tuple[int, int, int]
+    menu_border:   tuple[int, int, int]
+    menu_text:     tuple[int, int, int]
+    menu_dim_text: tuple[int, int, int]
+    menu_sel_bg:   tuple[int, int, int]
+    menu_sel_text: tuple[int, int, int]
+    menu_accent:   tuple[int, int, int]
+
+
+DARK_THEME = Theme(
+    legend_bg=LEGEND_BG, legend_border=LEGEND_BORDER, legend_text=LEGEND_TEXT,
+    top_bar_bg=TOP_BAR_BG, top_bar_border=TOP_BAR_BORDER, top_bar_text=TOP_BAR_TEXT,
+    menu_bg=MENU_BG, menu_border=MENU_BORDER, menu_text=MENU_TEXT,
+    menu_dim_text=MENU_DIM_TEXT, menu_sel_bg=MENU_SEL_BG, menu_sel_text=MENU_SEL_TEXT,
+    menu_accent=MENU_ACCENT,
+)
+
+LIGHT_THEME = Theme(
+    legend_bg=(255, 255, 255), legend_border=(120, 120, 120), legend_text=(0, 0, 0),
+    top_bar_bg=(240, 240, 242), top_bar_border=(120, 120, 120), top_bar_text=(0, 0, 0),
+    menu_bg=(255, 255, 255), menu_border=(150, 150, 160), menu_text=(0, 0, 0),
+    menu_dim_text=(90, 90, 100), menu_sel_bg=(70, 120, 190), menu_sel_text=(255, 255, 255),
+    menu_accent=(30, 90, 170),
+)
+
+_active_theme: Theme = DARK_THEME
+
+
+def theme() -> Theme:
+    """The palette the chrome (legend panel + TAB view menu) currently draws with."""
+    return _active_theme
+
+
+def set_light_mode(on: bool) -> None:
+    """Switch the legend/menu chrome between the light and dark palettes (dark is the default)."""
+    global _active_theme
+    _active_theme = LIGHT_THEME if on else DARK_THEME
+
+
+def is_light_mode() -> bool:
+    return _active_theme is LIGHT_THEME
+
+
 # Kelvin -> Celsius offset, for temperature tick labels.
 KELVIN_TO_CELSIUS: float = 273.15
 
@@ -589,8 +651,9 @@ def build_colorbar_column(
 ) -> pygame.Surface:
     """Render one legend column: a title, a vertical gradient bar (lo at the bottom, hi at the
     top) and LEGEND_TICKS numeric labels along its right edge."""
+    th = theme()
     col = pygame.Surface((LEGEND_COLUMN_WIDTH, height))
-    col.fill(LEGEND_BG)
+    col.fill(th.legend_bg)
 
     bar_x, bar_w = LEGEND_BAR_X, LEGEND_BAR_WIDTH
     bar_top = LEGEND_BAR_PAD_TOP
@@ -603,16 +666,16 @@ def build_colorbar_column(
     bar_surf = pygame.Surface((bar_w, bar_h))
     pygame.surfarray.blit_array(bar_surf, grad.transpose(1, 0, 2))
     col.blit(bar_surf, (bar_x, bar_top))
-    pygame.draw.rect(col, LEGEND_BORDER, (bar_x, bar_top, bar_w, bar_h), 1)
+    pygame.draw.rect(col, th.legend_border, (bar_x, bar_top, bar_w, bar_h), 1)
 
-    col.blit(title_font.render(spec.title, True, LEGEND_TEXT), (bar_x, LEGEND_TITLE_Y))
+    col.blit(title_font.render(spec.title, True, th.legend_text), (bar_x, LEGEND_TITLE_Y))
 
     for i in range(LEGEND_TICKS):
         frac = i / (LEGEND_TICKS - 1)                  # 0 at the bottom, 1 at the top
         y = int(bar_top + (1.0 - frac) * (bar_h - 1))
         value = spec.lo + frac * (spec.hi - spec.lo)
-        pygame.draw.line(col, LEGEND_TEXT, (bar_x + bar_w, y), (bar_x + bar_w + LEGEND_TICK_LEN, y))
-        label = bar_font.render(spec.tick_label(value), True, LEGEND_TEXT)
+        pygame.draw.line(col, th.legend_text, (bar_x + bar_w, y), (bar_x + bar_w + LEGEND_TICK_LEN, y))
+        label = bar_font.render(spec.tick_label(value), True, th.legend_text)
         col.blit(label, (bar_x + bar_w + LEGEND_TICK_LEN + LEGEND_LABEL_GAP, y - label.get_height() // 2))
 
     return col
@@ -624,7 +687,7 @@ def build_legend_panel(
 ) -> pygame.Surface:
     """The full right-side legend panel: each spec drawn as an adjacent column, left to right."""
     panel = pygame.Surface((LEGEND_PANEL_WIDTH, height))
-    panel.fill(LEGEND_BG)
+    panel.fill(theme().legend_bg)
     x = LEGEND_GUTTER
     for spec in specs:
         panel.blit(build_colorbar_column(spec, height, bar_font, title_font), (x, 0))
@@ -638,16 +701,17 @@ def build_biome_legend_panel(
     """The right-side legend for the categorical biome view: a title over a color swatch and its
     name for each biome (a gradient bar makes no sense for discrete classes, so this replaces it).
     The name sits under its swatch, not beside it, so the long biome names clear the panel width."""
+    th = theme()
     panel = pygame.Surface((LEGEND_PANEL_WIDTH, height))
-    panel.fill(LEGEND_BG)
+    panel.fill(th.legend_bg)
     x = LEGEND_BAR_X + LEGEND_GUTTER
-    panel.blit(title_font.render("Biome", True, LEGEND_TEXT), (x, LEGEND_TITLE_Y))
+    panel.blit(title_font.render("Biome", True, th.legend_text), (x, LEGEND_TITLE_Y))
     sw_w, sw_h = 2 * LEGEND_BAR_WIDTH, LEGEND_BAR_WIDTH   # a short, wide swatch key
     y = LEGEND_BAR_PAD_TOP
     for name, color in zip(BIOME_NAMES, BIOME_COLORS):
         pygame.draw.rect(panel, tuple(int(c) for c in color), (x, y, sw_w, sw_h))
-        pygame.draw.rect(panel, LEGEND_BORDER, (x, y, sw_w, sw_h), 1)
-        label = bar_font.render(name, True, LEGEND_TEXT)
+        pygame.draw.rect(panel, th.legend_border, (x, y, sw_w, sw_h), 1)
+        label = bar_font.render(name, True, th.legend_text)
         panel.blit(label, (x, y + sw_h + LEGEND_LABEL_GAP))
         y += sw_h + label.get_height() + LEGEND_TICK_LEN * 2
     return panel

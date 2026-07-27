@@ -39,21 +39,11 @@ from rendering import (
     LEGEND_TITLE_FONT_SIZE,
     TOP_BAR_HEIGHT,
     TOP_BAR_FONT_SIZE,
-    TOP_BAR_BG,
-    TOP_BAR_BORDER,
-    TOP_BAR_TEXT,
     TOP_BAR_PAD_LEFT,
     MENU_FONT_SIZE,
     MENU_TITLE_FONT_SIZE,
     MENU_HINT_FONT_SIZE,
-    MENU_BG,
     MENU_BG_ALPHA,
-    MENU_BORDER,
-    MENU_TEXT,
-    MENU_DIM_TEXT,
-    MENU_SEL_BG,
-    MENU_SEL_TEXT,
-    MENU_ACCENT,
     MENU_ROW_H,
     MENU_PAD_X,
     MENU_PAD_Y,
@@ -89,6 +79,9 @@ from rendering import (
     build_biome_surface,
     build_legend_panel,
     build_biome_legend_panel,
+    theme,
+    set_light_mode,
+    is_light_mode,
 )
 
 
@@ -142,9 +135,10 @@ class ViewMode(Enum):
     FUEL = 12            # the vegetation/fuel base, with the fire front as a toggleable overlay (key 0)
 
 
-# Every view mode is bound to a letter key (no number-row keys). W and R are reserved for the
-# wind-overlay toggle and reset, so the two wind views and Radiant Heat take other letters; the TAB
-# menu shows each mode's key, so the bindings need not all be perfectly mnemonic.
+# Every view mode is bound to a letter key (no number-row keys). W, R, L and N are reserved for the
+# wind-overlay toggle, reset, fuel HUD toggle and the light/dark chrome toggle, so the two wind views
+# and Radiant Heat take other letters; the TAB menu shows each mode's key, so the bindings need not
+# all be perfectly mnemonic.
 MODE_KEYS: dict[int, ViewMode] = {
     pygame.K_t: ViewMode.TEMPERATURE,       # air Temperature
     pygame.K_d: ViewMode.WIND,              # wind Direction (arrows)
@@ -942,10 +936,11 @@ class FirecrackerEnv(gymnasium.Env):
         """Draw the status bar across the top of the window, naming the active view mode."""
         if self._top_bar_font is None:
             return
+        th = theme()
         win_w = self._screen.get_width()
-        pygame.draw.rect(self._screen, TOP_BAR_BG, (0, 0, win_w, TOP_BAR_HEIGHT))
+        pygame.draw.rect(self._screen, th.top_bar_bg, (0, 0, win_w, TOP_BAR_HEIGHT))
         pygame.draw.line(
-            self._screen, TOP_BAR_BORDER,
+            self._screen, th.top_bar_border,
             (0, TOP_BAR_HEIGHT - 1), (win_w, TOP_BAR_HEIGHT - 1),
         )
         label = MODE_LABELS.get(self._current_mode, self._current_mode.name.title())
@@ -955,7 +950,7 @@ class FirecrackerEnv(gymnasium.Env):
         if self._view_grid is not None:
             label = (f"{label}   ·   pane {self._active_pane + 1}/{len(self._panes)}"
                      f"   ·   Shift+Arrows move · letter/Tab set view")
-        text = self._top_bar_font.render(f"View: {label}", True, TOP_BAR_TEXT)
+        text = self._top_bar_font.render(f"View: {label}", True, th.top_bar_text)
         self._screen.blit(text, (TOP_BAR_PAD_LEFT, (TOP_BAR_HEIGHT - text.get_height()) // 2))
 
     def _active_fuel_selection(self) -> set[int] | None:
@@ -996,21 +991,22 @@ class FirecrackerEnv(gymnasium.Env):
         selected = self._active_fuel_selection()
         if self._menu_font is None or selected is None or not self._show_fuel_panel:
             return
+        th = theme()
         names = self._sim.fuel_type_names
         has_fire = self._current_mode == ViewMode.FUEL
         hint = f"1-{len(names)} toggle" + (", 0 fire" if has_fire else "") + ", L hide"
-        title = self._menu_hint_font.render(f"Fuels  ({hint})", True, MENU_DIM_TEXT)
+        title = self._menu_hint_font.render(f"Fuels  ({hint})", True, th.menu_dim_text)
         # One row per fuel: "<key>  <name>", bright when on and dimmed when off. In the Fire & Fuel
         # view a leading "0  Fire" row toggles the flame overlay (swatch = a flame orange).
         rows = []
         if has_fire:
             on = self._fuel_fire_overlay
-            surf = self._menu_font.render("0  Fire", True, MENU_TEXT if on else MENU_DIM_TEXT)
+            surf = self._menu_font.render("0  Fire", True, th.menu_text if on else th.menu_dim_text)
             rows.append((surf, on, (230, 120, 40)))
         for i, n in enumerate(names):
             on = i in selected
             surf = self._menu_font.render(f"{i + 1}  {_humanize_fuel(n)}", True,
-                                          MENU_TEXT if on else MENU_DIM_TEXT)
+                                          th.menu_text if on else th.menu_dim_text)
             veg = VEGETATION_COLORS.get(n, DEFAULT_VEGETATION_COLOR)
             rows.append((surf, on, tuple(int(c * 255) for c in veg)))
 
@@ -1023,8 +1019,8 @@ class FirecrackerEnv(gymnasium.Env):
         panel_h = pad_y * 2 + header_h + len(rows) * row_h
 
         panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-        pygame.draw.rect(panel, (*MENU_BG, MENU_BG_ALPHA), (0, 0, panel_w, panel_h), border_radius=8)
-        pygame.draw.rect(panel, MENU_BORDER, (0, 0, panel_w, panel_h), width=1, border_radius=8)
+        pygame.draw.rect(panel, (*th.menu_bg, MENU_BG_ALPHA), (0, 0, panel_w, panel_h), border_radius=8)
+        pygame.draw.rect(panel, th.menu_border, (0, 0, panel_w, panel_h), width=1, border_radius=8)
 
         y = pad_y
         panel.blit(title, (pad_x, y))
@@ -1041,7 +1037,7 @@ class FirecrackerEnv(gymnasium.Env):
                     (bx + int(box * 0.80), by + int(box * 0.26)),
                 ], 2)
             else:
-                pygame.draw.rect(panel, MENU_DIM_TEXT, (bx, by, box, box), width=1, border_radius=3)
+                pygame.draw.rect(panel, th.menu_dim_text, (bx, by, box, box), width=1, border_radius=3)
             panel.blit(surf, (bx + box + gap, cy - surf.get_height() // 2))
             y += row_h
 
@@ -1130,13 +1126,14 @@ class FirecrackerEnv(gymnasium.Env):
             else:
                 rows.append((lbl, MODE_KEY_LABELS.get(target, ""), target == self._current_mode))
 
-        title_surf = self._menu_title_font.render(title, True, MENU_ACCENT)
+        th = theme()
+        title_surf = self._menu_title_font.render(title, True, th.menu_accent)
         footer_surf = self._menu_hint_font.render(
             "Up/Down move    Enter/Right select    Left back    Tab close",
-            True, MENU_DIM_TEXT,
+            True, th.menu_dim_text,
         )
-        label_surfs = [self._menu_font.render(lbl, True, MENU_TEXT) for lbl, _, _ in rows]
-        hint_surfs = [self._menu_hint_font.render(h, True, MENU_DIM_TEXT) for _, h, _ in rows]
+        label_surfs = [self._menu_font.render(lbl, True, th.menu_text) for lbl, _, _ in rows]
+        hint_surfs = [self._menu_hint_font.render(h, True, th.menu_dim_text) for _, h, _ in rows]
 
         dot_col_w = 18   # left gutter reserved for the active-mode dot
         gap = 40         # min space between a label and its right-aligned hint
@@ -1152,29 +1149,29 @@ class FirecrackerEnv(gymnasium.Env):
         panel_h = MENU_PAD_Y * 2 + header_h + 8 + body_h + 8 + footer_h
 
         panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-        pygame.draw.rect(panel, (*MENU_BG, MENU_BG_ALPHA), (0, 0, panel_w, panel_h), border_radius=10)
-        pygame.draw.rect(panel, MENU_BORDER, (0, 0, panel_w, panel_h), width=1, border_radius=10)
+        pygame.draw.rect(panel, (*th.menu_bg, MENU_BG_ALPHA), (0, 0, panel_w, panel_h), border_radius=10)
+        pygame.draw.rect(panel, th.menu_border, (0, 0, panel_w, panel_h), width=1, border_radius=10)
 
         y = MENU_PAD_Y
         panel.blit(title_surf, (MENU_PAD_X, y))
         y += header_h
-        pygame.draw.line(panel, MENU_BORDER, (MENU_PAD_X, y), (panel_w - MENU_PAD_X, y))
+        pygame.draw.line(panel, th.menu_border, (MENU_PAD_X, y), (panel_w - MENU_PAD_X, y))
         y += 8
 
         for i, ((lbl, _, active), ls, hs) in enumerate(zip(rows, label_surfs, hint_surfs)):
             row_top = y + i * MENU_ROW_H
             cy = row_top + MENU_ROW_H // 2
             if i == self._menu_cursor:
-                pygame.draw.rect(panel, MENU_SEL_BG,
+                pygame.draw.rect(panel, th.menu_sel_bg,
                                  (6, row_top + 2, panel_w - 12, MENU_ROW_H - 4), border_radius=6)
-                ls = self._menu_font.render(lbl, True, MENU_SEL_TEXT)
+                ls = self._menu_font.render(lbl, True, th.menu_sel_text)
             if active:
-                pygame.draw.circle(panel, MENU_ACCENT, (MENU_PAD_X + 3, cy), 3)
+                pygame.draw.circle(panel, th.menu_accent, (MENU_PAD_X + 3, cy), 3)
             panel.blit(ls, (MENU_PAD_X + dot_col_w, cy - ls.get_height() // 2))
             panel.blit(hs, (panel_w - MENU_PAD_X - hs.get_width(), cy - hs.get_height() // 2))
 
         y += body_h + 8
-        pygame.draw.line(panel, MENU_BORDER, (MENU_PAD_X, y), (panel_w - MENU_PAD_X, y))
+        pygame.draw.line(panel, th.menu_border, (MENU_PAD_X, y), (panel_w - MENU_PAD_X, y))
         y += 8
         panel.blit(footer_surf, (MENU_PAD_X, y))
 
@@ -1245,14 +1242,15 @@ class FirecrackerEnv(gymnasium.Env):
             surf = self._pane_surfaces.get(i) or self._surface_for_mode(vm)
             self._scene.blit(pygame.transform.scale(surf, (pane, pane)), (x, y))
             active = i == self._active_pane
+            th = theme()
             label = self._pane_label(i, vm)
-            text = self._menu_font.render(label, True, MENU_TEXT if active else MENU_DIM_TEXT)
+            text = self._menu_font.render(label, True, th.menu_text if active else th.menu_dim_text)
             strip = pygame.Surface((pane, text.get_height() + 6), pygame.SRCALPHA)
-            strip.fill((*MENU_BG, 205))
+            strip.fill((*th.menu_bg, 205))
             self._scene.blit(strip, (x, y))
             self._scene.blit(text, (x + 6, y + 3))
             pygame.draw.rect(
-                self._scene, MENU_ACCENT if active else MENU_BORDER,
+                self._scene, th.menu_accent if active else th.menu_border,
                 (x, y, pane, pane), width=3 if active else 1,
             )
 
@@ -1614,6 +1612,8 @@ class FirecrackerEnv(gymnasium.Env):
                     self._show_wind_overlay = not self._show_wind_overlay
                 elif event.key == pygame.K_l:
                     self._show_fuel_panel = not self._show_fuel_panel   # the fuel-view HUD
+                elif event.key == pygame.K_n:
+                    set_light_mode(not is_light_mode())   # flip legend/menu light vs. dark chrome
                 elif event.key == pygame.K_r:
                     self._reset_requested = True
                 elif event.key in MODE_KEYS:
