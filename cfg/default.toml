@@ -245,6 +245,18 @@ convective_radius_m      = 10.0   # reach [m] of the convective ignition onto ne
 convective_wind_bias     = 1.0    # downwind skew of the convective ignition (concentration on wind/u_ref)
 convective_wind_ref      = 10.0   # u_ref [m/s]: wind speed at which the wind bias matches the old unit form
 convective_slope_bias    = 2.5    # upslope skew of the convective ignition (concentration on tan^2(slope))
+canopy_wind_factor       = 1.4    # crown-fire wind sensitivity: the canopy air levels scale their convective
+                                  # fraction up with the SQUARE of the wind speed by (this - 1)*(wind/u_ref)^2
+                                  # (the crowns sit in the faster free-stream wind above the surface). ROS
+                                  # saturates in that fraction, so the crown's net rate of spread still rises
+                                  # only ~near-linearly with wind (as in operational models, e.g. Cruz et al.
+                                  # 2005 ~U^0.9) but far more steeply than the surface front: it creeps like a
+                                  # shrub fire in light wind, nears a grass fire's rate in strong wind, and
+                                  # overtakes it over a dense canopy. 1.0 = off (same fraction as the surface).
+canopy_density_ref       = 2.8    # crown foliage load [kg/m^2] at which the crown-fire boost above is at
+                                  # full strength; the boost scales with the local crown load / this, so a
+                                  # denser stand spreads faster and a thin canopy barely crowns (2.8 = a
+                                  # fully-stocked cell: fuel_per_tree 0.7 x the 4-tree cap).
 spawn_fire               = false  # if true, a random fire spawns at reset; if false, left-click to ignite
 spawn_radius             = 0      # radius (grid cells) of the ignition patch; 0 = a single cell (an ember /
                                   # dropped cigarette). A healthy model spreads one hot grass cell downwind.

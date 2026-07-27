@@ -288,6 +288,17 @@ class Simulation:
         # stronger. Set near a light prevailing wind so 5 m/s already bites and 10-15 m/s is strong.
         self.convective_wind_ref:         float = float(fire.get("convective_wind_ref",       10.0))
         self.convective_slope_bias:       float = float(fire.get("convective_slope_bias",     2.5))
+        # Crown-fire wind sensitivity (see update_fire): the crowns sit up in the faster free-stream
+        # flow (sub-canopy wind is strongly reduced) and a wind-driven crown fire tilts its plume into
+        # the unburned canopy, so its convective fraction (the share of combustion heat thrown forward
+        # to ignite neighbours -- the head-ROS driver) is scaled up on the canopy air levels with the
+        # SQUARE of the wind speed by (this - 1)*(wind/u_ref)^2, and by the local crown-foliage density.
+        # Because ROS saturates in cf, the net crown ROS still rises only ~near-linearly with wind (in
+        # line with operational models, e.g. Cruz et al. 2005 ~U^0.9), but far more steeply than the
+        # surface front: the crown creeps like a shrub fire in calm air, approaches a grass fire's rate
+        # in a strong wind, and over a dense, well-connected canopy exceeds it. 1.0 disables it (canopy
+        # spreads at the same convective fraction as the surface).
+        self.canopy_wind_factor:          float = float(fire.get("canopy_wind_factor",         1.4))
         conv_radius_m                           = float(fire.get("convective_radius_m",       10.0))
         self.convective_radius:           int   = max(1, round(conv_radius_m / self.cell_size_m))
         # The convective deposit uses a von Mises angular kernel exp(b.offset_hat) (see
@@ -349,6 +360,10 @@ class Simulation:
         # convective-ignition deposit runs once per such level so a burning cell's level-L plume ignites
         # only neighbours' level-L fuels (the ladder during spread). Above-canopy (fuel-free) is skipped.
         self._levels_with_fuel: list[int] = sorted(set(self.fuel_levels))
+        # Ceiling on the wind-scaled canopy convective fraction (update_fire): cf_level is capped at
+        # _cf_max - nf so the retained air share (1 - cf_level - nf) stays positive and energy is
+        # conserved. Leaves plenty of headroom for the crown fire to reach and overtake a grass fire.
+        self._cf_max: float = 0.6
         # Bole-segment indices for conduct_bole_segments (None when a config has no split trunk, e.g.
         # the single-fuel test worlds -> the stage is then a no-op).
         self._bole_surface_idx: int | None = (
@@ -368,6 +383,19 @@ class Simulation:
             i for i, lvl in enumerate(self.fuel_levels)
             if lvl == 0 and i not in (self._bole_surface_idx,)
         ]
+        # Fine crown foliage: the elevated (canopy-level) fuels that are not the coarse canopy bole --
+        # the leaf/twig fuel that actually carries a crown fire. Its per-cell load is the "tree density"
+        # the crown-fire wind boost scales with (update_fire): a denser, better-stocked canopy drives a
+        # larger fraction of its heat forward, so it spreads faster (and can overtake a grass fire),
+        # while a thin canopy barely crowns. Empty in a single-fuel test world -> the boost sees a
+        # neutral density of 1 (no scaling). canopy_density_ref is the load at which the boost matches
+        # its nominal (canopy_wind_factor) strength -- the default ~2.8 kg/m^2 is a fully-stocked cell
+        # (fuel_per_tree 0.7 x the 4-tree cap).
+        self._canopy_fine_idx: list[int] = [
+            i for i, lvl in enumerate(self.fuel_levels)
+            if lvl != 0 and i != self._bole_canopy_idx
+        ]
+        self.canopy_density_ref: float = float(fire.get("canopy_density_ref", 2.8))
 
         def _ft(name: str, key: str, default: float) -> float:
             return float(fuel_types_cfg.get(name, {}).get(key, default))
@@ -1148,6 +1176,13 @@ class Simulation:
         hhv, s = self.heat_of_combustion, self.stoich_oxygen
         present = fuel > self.fuel_burnt_threshold
         air0 = air_temperatures.select(-3, 0)   # surface-level (..., H, W) view, for (H, W) shape refs
+        # Crown-foliage load [kg/m^2] as a fraction of a fully-stocked stand, read BEFORE this tick's
+        # consumption so it tracks the *stand density* (a fixed property of the trees), not the burning
+        # cell's momentarily-depleted fuel. Drives the crown-fire density boost below.
+        canopy_stand = (
+            fuel[self._canopy_fine_idx].sum(dim=-3) / self.canopy_density_ref
+            if self._canopy_fine_idx else None
+        )
 
         # Surface mass flux psi [kg/(m^2_surface*s)]: kinetic chemistry in series with O2 film
         # diffusion. The kinetic flux underflows to ~0 at ambient T (cold fuel inert); the diffusive
@@ -1260,17 +1295,42 @@ class Simulation:
         smag = torch.sqrt(sgx ** 2 + sgy ** 2)                      # tan(slope)
         bx = self.convective_wind_bias * (x_wind_vel / u_ref) + self.convective_slope_bias * sgx * smag
         by = self.convective_wind_bias * (y_wind_vel / u_ref) + self.convective_slope_bias * sgy * smag
+
+        # Per-level convective FRACTION (crown-fire wind + density sensitivity): cf is the share of a
+        # burning cell's air heat thrown forward as ignition, which sets the head ROS. The surface fire
+        # keeps the calibrated cf; a crown fire in a strong wind tilts its plume into the unburned canopy
+        # and sits in the faster free-stream flow, so it drives a *larger* fraction forward -- the canopy
+        # levels scale cf up with the SQUARE of the wind speed by (canopy_wind_factor - 1), and by the
+        # local crown-foliage load relative to a fully-stocked stand (canopy_density_ref). Squaring the
+        # cf knob keeps the boost negligible in light wind (the crown creeps like a shrub fire); because
+        # ROS saturates in cf, the resulting head RATE OF SPREAD still climbs only ~near-linearly and
+        # mildly accelerating with wind -- in line with operational crown-fire models, whose ROS is
+        # roughly linear in the 10-m wind (Cruz et al. 2005 use ~U^0.9; wind exponents near/above 2 are
+        # flagged as unrealistic at high wind) -- and the cf cap below prevents runaway. The density
+        # factor makes a dense, well-stocked canopy spread faster than a thin one (as canopy bulk density
+        # does in those models, here a bit more strongly). So the crown head grows far more wind- and
+        # density-sensitively than the surface front: it approaches a grass fire's rate in a strong wind
+        # and, over dense trees, overtakes it, while a sparse canopy barely crowns. Capped so the
+        # retained air share (1 - cf - nf) stays positive.
+        speed = torch.sqrt(x_wind_vel ** 2 + y_wind_vel ** 2)        # (H, W) wind speed
+        nf = self.near_field_fraction
+        cf_level = torch.full_like(air_temperatures, cf)             # (L, H, W), surface stays at cf
+        density = canopy_stand if canopy_stand is not None else torch.ones_like(speed)  # 1 = stocked stand
+        wind_gain = 1.0 + (self.canopy_wind_factor - 1.0) * (speed / u_ref) ** 2 * density  # (H, W) >= 1
+        for lvl in self._levels_with_fuel:
+            if lvl != 0:                                             # elevated (canopy) levels
+                cf_level[lvl] = (cf * wind_gain).clamp(max=self._cf_max - nf)
         # Per-level ignition deposit: spread each level's plume heat by the kernel (a spatial
         # convolution, so run once per fuel-bearing level), then let each fuel receive only from ITS
         # level. This is the ladder DURING spread -- a grass front's surface-level plume ignites
         # neighbours' surface fuels but deposits nothing into their canopy level. Two components sum
-        # into `delivered`: the wind-biased convective share (cf, sets the head ROS) and the isotropic
-        # near-field share (nf, Rothermel's no-wind baseline that lets a point ignition establish).
-        nf = self.near_field_fraction
+        # into `delivered`: the wind-biased convective share (cf_level, sets the head ROS) and the
+        # isotropic near-field share (nf, Rothermel's no-wind baseline that lets a point ignition
+        # establish).
         delivered = torch.zeros_like(air_temperatures)       # (L, H, W) [J/m^2]
         for lvl in self._levels_with_fuel:
             share = air_share.select(-3, lvl)
-            biased = self._convective_deposit(cf * share, bx, by)
+            biased = self._convective_deposit(cf_level.select(-3, lvl) * share, bx, by)
             near   = self._isotropic_deposit(nf * share) if nf > 0.0 else 0.0
             delivered.select(-3, lvl).copy_((biased + near).clamp(min=0.0))
         delivered_f = delivered.index_select(-3, self._fuel_level_index)  # (N,H,W) each fuel's level deposit
@@ -1299,10 +1359,11 @@ class Simulation:
         fuel_temperatures = (fuel_temperatures + dT_conv).clamp(min=0.0)
 
         # Per-level air bookkeeping (conserved, off-grid edge loss aside): each level keeps the share
-        # that was not convected out, (1-cf-nf)*air_share; each receiver's leftover ignition heat its
-        # fuel did not take up (delivered - absorbed) warms that level's plume air.
+        # that was not convected out, (1-cf_level-nf)*air_share (cf_level is wind-scaled on the canopy
+        # levels); each receiver's leftover ignition heat its fuel did not take up (delivered -
+        # absorbed) warms that level's plume air.
         air_temperatures = (
-            air_temperatures + ((1.0 - cf - nf) * air_share + (delivered - absorbed)) / C_plume
+            air_temperatures + ((1.0 - cf_level - nf) * air_share + (delivered - absorbed)) / C_plume
         ).clamp(min=0.0)
 
         return air_temperatures, fuel_temperatures, fuel, oxygen.clamp(min=0.0)

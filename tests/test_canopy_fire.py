@@ -15,6 +15,12 @@ patch; that same canopy ignition leaves the grass/shrub/surface-trunk essentiall
 ground-ignition control instead consumes every layer (so the world plainly *can* carry fire between
 layers -- the crown fire's restraint is the ladder asymmetry, not an inert map); and under an
 ambient wind the crown fire runs as a head fire biased downwind while still sparing the ground.
+
+Two more pin the crown fire's *rate*: it is strongly wind-sensitive -- a stiff wind carries the head
+far further than a light one -- and it scales with tree density, a heavy canopy spreading faster than
+a thin one (the canopy convective fraction is boosted by wind^2 and crown load in update_fire, so the
+crown creeps in calm air but its head rate of spread climbs steeply -- far more than the surface
+front -- and can overtake a grass fire in a strong wind over dense trees).
 """
 
 import numpy as np
@@ -43,11 +49,13 @@ def _sim() -> Simulation:
                                   relaxation=True, air_convection=True))
 
 
-def _state(sim: Simulation, ignite: str, ambient: tuple[float, float] = (0.0, 0.0)) -> SimState:
+def _state(sim: Simulation, ignite: str, ambient: tuple[float, float] = (0.0, 0.0),
+           canopy_load: float = 1.0) -> SimState:
     """A flat SI world with all five fuels present everywhere, ignited either in the canopy
     (`ignite="canopy"` -> a hot tree_canopy patch) or on the ground (`ignite="ground"` -> a hot
     grass+shrub patch). The patch is a one-shot temperature seed, then released to the physics.
-    `ambient` is the uniform (x, y) wind [m/s] driving the front (default still air)."""
+    `ambient` is the uniform (x, y) wind [m/s] driving the front (default still air); `canopy_load`
+    scales the crown foliage and canopy trunk (the tree density) for the density-sensitivity test."""
     gen = MapGenerator(make_config(GRID, FUELS))
     terrain = np.zeros((GRID, GRID), dtype=np.float64)
     air = gen.air_temperature_profile(terrain)
@@ -57,6 +65,8 @@ def _state(sim: Simulation, ignite: str, ambient: tuple[float, float] = (0.0, 0.
     air_t, mass_t, oxy_t, terr_t = t(air), t(mass), t(oxygen), t(terrain)
 
     fuel = torch.ones((5, GRID, GRID), dtype=sim.dtype, device=sim.device)               # every layer present
+    fuel[I_CANOPY] = canopy_load                                                          # crown foliage density
+    fuel[I_BOLE_CANOPY] = canopy_load                                                     # its trunk scales with it
     fuel_t = torch.full((5, GRID, GRID), pc.T_REF, dtype=sim.dtype, device=sim.device)   # all at ambient
     c = GRID // 2
     patch = (slice(c - SEED, c + SEED + 1), slice(c - SEED, c + SEED + 1))
@@ -82,15 +92,25 @@ def _state(sim: Simulation, ignite: str, ambient: tuple[float, float] = (0.0, 0.
     )
 
 
-def _run(ignite: str, ticks: int = TICKS,
-         ambient: tuple[float, float] = (0.0, 0.0)) -> tuple[torch.Tensor, SimState, Simulation]:
+def _run(ignite: str, ticks: int = TICKS, ambient: tuple[float, float] = (0.0, 0.0),
+         canopy_load: float = 1.0) -> tuple[torch.Tensor, SimState, Simulation]:
     """Advance a freshly-ignited world; return (initial fuel, final state, sim)."""
     sim = _sim()
-    s = _state(sim, ignite, ambient)
+    s = _state(sim, ignite, ambient, canopy_load)
     fuel0 = s.fuel.clone()
     for _ in range(ticks):
         sim.step_fields(s)
     return fuel0, s, sim
+
+
+def _downwind_reach(fuel0: torch.Tensor, s: SimState) -> int:
+    """How many cells the burnt crown reaches downwind (+x) of centre along the centre row. Uses a
+    consumed-fraction test so it reads the same at any canopy_load."""
+    load0 = fuel0[I_CANOPY]
+    burnt = ((fuel0 - s.fuel)[I_CANOPY] > 0.5 * load0).cpu().numpy()
+    c = GRID // 2
+    cols = np.where(burnt[c])[0]
+    return int(cols.max() - c) if len(cols) else 0
 
 
 def _burnt(fuel0: torch.Tensor, s: SimState) -> np.ndarray:
@@ -167,3 +187,20 @@ def test_wind_drives_the_crown_fire_downwind():
     assert burnt[I_SHRUB] == 0
     assert burnt[I_BOLE_SURF] == 0
     assert torch.isfinite(s.fuel_temperatures).all()
+
+
+def test_crown_fire_rate_is_strongly_wind_sensitive():
+    """Crown-fire spread is strongly wind-sensitive: a strong wind carries the head much further
+    downwind than a light wind does over the same time (the canopy convective fraction scales with
+    wind speed, so the crown creeps in calm air but races once the wind gets up)."""
+    fuel0_l, s_l, _ = _run("canopy", ambient=(3.0, 0.0))
+    fuel0_h, s_h, _ = _run("canopy", ambient=(14.0, 0.0))
+    assert _downwind_reach(fuel0_h, s_h) > _downwind_reach(fuel0_l, s_l) + 3
+
+
+def test_crown_fire_rate_scales_with_tree_density():
+    """A denser, better-stocked canopy spreads the crown fire faster: at the same wind the head runs
+    further downwind over a heavy canopy than a light one (the boost scales with the crown load)."""
+    fuel0_sparse, s_sparse, _ = _run("canopy", ambient=(12.0, 0.0), canopy_load=1.0)
+    fuel0_dense, s_dense, _ = _run("canopy", ambient=(12.0, 0.0), canopy_load=3.0)
+    assert _downwind_reach(fuel0_dense, s_dense) > _downwind_reach(fuel0_sparse, s_sparse) + 2
