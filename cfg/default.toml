@@ -193,7 +193,7 @@ cfl_target      = 0.5     # max Courant number per substep (advective + gravity-
 enabled        = true    # apply the channeling gain to the wind the fire/oxygen read (false = prognostic wind)
 radius_m       = 300.0   # cross-stream scan reach [m] each way (sets the gap scale the gain responds to)
 height_scale_m = 100.0   # terrain rise [m] that fully closes the channel (a smaller rise closes it partly)
-gain_max       = 2.0     # cap on the channeling speedup (a tight gap saturates here); stacks on the prognostic lee/foehn overshoot (~1.3x), so 3.0 drove ~45 m/s fire winds from a 15 m/s synoptic
+gain_max       = 1.19    # cap on the channeling speedup (a tight gap saturates here); stacks on the prognostic lee/foehn overshoot (~1.4x). Held low so that with the 10-15 m/s ambient band the fully-developed gained surface wind stays <=25 m/s in the tightest gaps (worst map's steady prognostic max ~21 m/s * 1.19 ~= 25)
 smooth_sigma   = 1.0     # Gaussian smoothing [cells] of the gain field (removes per-cell speckle)
 
 [fire]
