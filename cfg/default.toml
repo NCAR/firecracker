@@ -465,6 +465,22 @@ bottleneck_channels = 256                      # 1x1-conv compress 512->256 ch b
 # brightens it in the display so the current selection is visible. grid_size must
 # divide [environment].grid_size evenly.
 grid_size = 32   # action-grid cells per side (256 sim cells / 32 -> 8x8 cells each)
+# A completed action drops water on its action-cell block: water_drop_amount kg/m^2 of liquid
+# water is added to those cells' moisture. A wet cell (moisture > 0) cannot ignite -- the water
+# first absorbs heat from the surrounding fuel/air and boils off (see [moisture]).
+water_drop_amount = 10.0  # liquid water per drop [kg/m^2]
+
+[moisture]
+# Fire-suppression water dropped by the action. Standing water [kg/m^2] on a cell is a heat sink:
+# it absorbs the super-ambient heat of the co-located fuel and surface air to boil off at the
+# latent heat of vaporization, pinning the fuel near boiling so the cell cannot ignite until the
+# water is gone. base_dry_rate + wind_dry_coeff * wind_speed is the ambient (sun + wind) mass loss
+# per second with no fire, so a drop also dries out on its own -- faster in wind. See
+# Simulation.apply_moisture.
+enabled        = true
+base_dry_rate  = 0.001    # fraction/s of standing water lost to sun with no wind
+wind_dry_coeff = 0.002    # extra fraction/s per (m/s) of near-surface wind (water carried away)
+# dry_reference  = 373.15  # temperature water is held at before boiling [K]; defaults to water's boiling point
 
 [environment]
 # device selects where the simulation tensors live: "cuda" for an NVIDIA GPU,

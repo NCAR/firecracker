@@ -30,6 +30,16 @@ O2_DENSITY_REF:   float = 0.2315 * 1.165    # ambient sea-level O2 partial densi
 # --- Radiation -------------------------------------------------------------
 EMISSIVITY: float = 0.95                    # grey-body emissivity of the surface
 
+# --- Water (fire-suppression moisture) -------------------------------------
+# Liquid water dropped on a cell (a fire-suppression action) sits as fuel/surface moisture.
+# It cannot get hotter than its boiling point: heat from the surrounding fuel and air first
+# drives it to WATER_BOILING_POINT and then boils it off at WATER_LATENT_HEAT per kg -- a large
+# energy sink (~5x a fuel's heat of combustion released per kg burned is offset by ~0.14 kg of
+# water), which is why a wet cell stays near the boiling point and cannot reach ignition until
+# the water has evaporated. See Simulation.apply_moisture.
+WATER_LATENT_HEAT:   float = 2.26e6         # latent heat of vaporization of water [J/kg]
+WATER_BOILING_POINT: float = 373.15         # boiling point of water at sea level [K] (100 C)
+
 # --- Domain reference scales -----------------------------------------------
 ELEV_MAX_M:     float = 500.0               # documented terrain elevation ceiling over the domain [m]
 FUEL_REF_KG_M2: float = 20.0                # representative dense-forest areal biomass [kg/m^2]

@@ -91,6 +91,11 @@ class SimState:
     channel_gain:      torch.Tensor | None = None
     x_wind_fire:       torch.Tensor | None = None
     y_wind_fire:       torch.Tensor | None = None
+    # Fire-suppression moisture: liquid water [kg/m^2] dropped on cells (the env's action). A cell
+    # with moisture > 0 cannot ignite -- the water first absorbs heat from the surrounding fuel and
+    # air and boils off (Simulation.apply_moisture). Optional so hand-built and legacy states (no
+    # suppression) keep working: a None field skips the moisture stage entirely.
+    moisture:          torch.Tensor | None = None
 
 
 # --- Vertical air levels (Phase 1) -------------------------------------------------------------
@@ -187,6 +192,22 @@ class Simulation:
         venting = (cfg or {}).get("venting", {})
         self.venting_enabled: bool  = bool(venting.get("enabled", True))
         self.plume_vent_rate: float = float(venting.get("rate",    0.05))
+
+        # Fire-suppression moisture (the env's water-drop action). Liquid water [kg/m^2] sits on a
+        # cell as a heat sink: each tick it absorbs the super-ambient sensible heat of the co-located
+        # fuel and surface air to boil off at WATER_LATENT_HEAT, pinning the fuel near the boiling
+        # point so a wet cell cannot ignite until the water is gone. A baseline drying rate (sun) plus
+        # a wind-carried term also removes water with no fire present, so a drop eventually clears. See
+        # apply_moisture. The action deposit itself (amount, footprint) lives in the env.
+        moisture = (cfg or {}).get("moisture", {})
+        self.moisture_enabled:        bool  = bool(moisture.get("enabled", True))
+        # Ambient drying: fraction/s of standing water lost to sun + wind even with no fire. The wind
+        # term scales the rate with the near-surface wind speed (water carried away as spray/vapour).
+        self.moisture_base_dry_rate:  float = float(moisture.get("base_dry_rate",  1.0e-3))
+        self.moisture_wind_dry_coeff: float = float(moisture.get("wind_dry_coeff", 2.0e-3))
+        # Drying reference: the temperature water is driven to before it boils (its boiling point).
+        # Only fuel/air hotter than this gives up heat to the latent (thermal) evaporation term.
+        self.moisture_dry_reference:  float = float(moisture.get("dry_reference", pc.WATER_BOILING_POINT))
 
         # Phase 2 shallow-water momentum core. Wind is prognostic [m/s]; drag relaxes it
         # toward the per-map synoptic ambient wind, the column-top height gradient
@@ -1422,6 +1443,94 @@ class Simulation:
 
         return fuel_temperatures + dT_fuel, radiant_flux
 
+    def apply_moisture(
+        self,
+        moisture: torch.Tensor,           # (..., H, W)     liquid water on the cell [kg/m^2]
+        fuel_temperatures: torch.Tensor,  # (..., N, H, W)  per-type fuel temperature T_f [K]
+        air_temperatures: torch.Tensor,   # (..., L, H, W)  per-level air temperature T_a [K]
+        fuel: torch.Tensor,               # (..., N, H, W)  per-type biomass [kg/m^2]
+        speed: torch.Tensor,              # (..., H, W)     near-surface wind speed [m/s]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Standing water as a heat sink and hard ignition gate (the water-drop action's effect).
+
+        Water dropped on a cell (SimState.moisture) can never get hotter than its boiling point:
+        each tick it draws the *super-ambient* sensible heat of the co-located fuel and the surface
+        air -- the heat those hold above WATER_BOILING_POINT -- and spends it boiling itself off at
+        WATER_LATENT_HEAT [J/kg]. That heat is removed from the fuel and air (they cool back toward
+        the boiling point), so a wet cell sitting in a flame front soaks up the incoming radiant and
+        convective heat instead of igniting -- the water is a genuine retardant, not a flag. A
+        baseline drying term (sun) plus a wind-carried term also remove water with no fire present,
+        so a drop clears on its own over time and faster in wind.
+
+        Finally, while any water remains the cell is gated: every fuel type there is held at/below the
+        boiling point, so `moisture > 0` strictly forbids ignition (the heat sink already pins wet
+        fuel there; this clamp is the exact guarantee, and at the boiling point the Arrhenius burn
+        flux is ~14 orders below a flame's). Once the last water boils off the gate lifts and the
+        (now dry) fuel is free to heat to ignition. Rank-agnostic. Returns the updated (moisture,
+        fuel_temperatures, air_temperatures).
+        """
+        L, dt = pc.WATER_LATENT_HEAT, self.dt
+        T_dry = self.moisture_dry_reference
+        cp_fuel, cp_air = self.fuel_specific_heat, pc.CP_AIR
+        wet = moisture > 0.0                                      # (..., H, W)
+
+        # Super-ambient heat each fuel type / the surface air holds above the boiling point [J/m^2].
+        present   = fuel > self.fuel_burnt_threshold
+        C_fuel    = cp_fuel * fuel                                # (..., N, H, W) thermal mass
+        f_excess  = (fuel_temperatures - T_dry).clamp(min=0.0)    # (..., N, H, W) K above boiling
+        f_heat_n  = torch.where(present, C_fuel * f_excess, torch.zeros_like(C_fuel))  # per type
+        fuel_heat = f_heat_n.sum(dim=-3)                          # (..., H, W)
+
+        air0     = air_temperatures.select(-3, 0)                 # surface-level air (..., H, W)
+        rho      = pc.P_REF / (pc.GAS_CONSTANT_DRY_AIR * air0.clamp(min=1.0))
+        C_air    = rho * self.plume_mixing_depth * cp_air         # surface plume-slab capacity
+        a_excess = (air0 - T_dry).clamp(min=0.0)
+        air_heat = C_air * a_excess                               # (..., H, W)
+
+        total_heat = fuel_heat + air_heat                         # (..., H, W) available to boil
+        # Heat spent this tick = min(what's available, what it takes to boil all the water present).
+        need = moisture * L
+        Q    = torch.where(wet, torch.minimum(total_heat, need), torch.zeros_like(moisture))
+        evap_thermal = Q / L                                      # kg/m^2 boiled off by absorbed heat
+
+        # Cool the sources by the heat they gave up: each type / the air sheds its share of Q in
+        # proportion to its own super-ambient heat, which for a lumped capacity is exactly a uniform
+        # temperature drop of Q/total_heat * (T - T_dry) -- so nothing is cooled below the boiling
+        # point and energy balances the latent heat removed. No-op where there is no water or no
+        # super-ambient heat to give.
+        denom  = total_heat.clamp(min=1e-30)
+        frac   = (Q / denom).unsqueeze(-3)                        # (..., 1, H, W) share of excess shed
+        # Only present fuel gave up heat (f_heat_n was masked), so only present fuel cools -- this
+        # keeps the temperature drops summing exactly to Q (with the air term) and leaves a burnt
+        # cell's vestigial temperature untouched.
+        fuel_temperatures = fuel_temperatures - torch.where(
+            present, frac * f_excess, torch.zeros_like(f_excess)
+        )
+        air0  = air0 - (Q / denom) * a_excess
+        air_temperatures = _with_surface(air_temperatures, air0)
+
+        # Ambient drying (sun + wind carrying water away): an exact-exponential mass loss on whatever
+        # water survived the thermal boil-off, at base_dry_rate + wind_dry_coeff * wind speed.
+        moisture = (moisture - evap_thermal).clamp(min=0.0)
+        dry_rate = self.moisture_base_dry_rate + self.moisture_wind_dry_coeff * speed
+        moisture = moisture * torch.exp(-dry_rate * dt)
+
+        # Hard ignition gate: hold every fuel type at a still-wet cell at/below the boiling point.
+        # Wet fuel physically cannot get hotter than its water (it stays at ~100 C until the water is
+        # gone), and this model's combustion is Arrhenius with no hard threshold -- at the boiling
+        # point the kinetic flux is ~14 orders below a flame's, so pinning wet fuel there makes any
+        # burn utterly negligible. The thermal boil-off above already drives fuel toward T_dry; this
+        # clamp is the exact guarantee (and also caps radiant/convective preheat of a wet cell). Once
+        # the last water evaporates the gate lifts and the dry fuel is free to heat to ignition.
+        wet = (moisture > 0.0).unsqueeze(-3)                      # (..., 1, H, W)
+        fuel_temperatures = torch.where(
+            wet & (fuel_temperatures > T_dry),
+            torch.full_like(fuel_temperatures, T_dry),
+            fuel_temperatures,
+        )
+
+        return moisture, fuel_temperatures.clamp(min=0.0), air_temperatures
+
     # ---------------------------------------------------------------------------
     # Full per-tick step + observation
     # ---------------------------------------------------------------------------
@@ -1505,6 +1614,16 @@ class Simulation:
             # Bole-segment conduction: the trunk climbs fire from the surface bole up to the canopy
             # bole (fast up, slow down) -- the ladder's dedicated conduit. No-op without a split bole.
             s.fuel_temperatures = self.conduct_bole_segments(s.fuel_temperatures, s.fuel)
+
+        # Fire-suppression moisture (the water-drop action): standing water on a cell absorbs the
+        # surrounding fuel/air heat to boil off and, while present, forbids that cell from igniting.
+        # Runs after combustion/radiant so it soaks up the heat those just delivered to a wet cell,
+        # and independently of the fire toggle so a drop also dries out (sun + wind) on a cold world.
+        if self.moisture_enabled and s.moisture is not None:
+            speed = torch.sqrt(u_fire ** 2 + v_fire ** 2)
+            s.moisture, s.fuel_temperatures, s.air_temperatures = self.apply_moisture(
+                s.moisture, s.fuel_temperatures, s.air_temperatures, s.fuel, speed,
+            )
 
         # Inter-level convection: carry heat *upward* through the air stack (surface -> canopy ->
         # above), gated on instability. This is what gives the surface/canopy slabs a sink -- the heat

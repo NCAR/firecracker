@@ -472,6 +472,8 @@ def build_fire_surface(
     initial_canopy_fuel: np.ndarray | None = None,  # (H, W) each cell's original canopy load (for bole occlusion)
     show_vegetation: bool = True,        # draw the fuel/vegetation base; False leaves it black (fire-front-only view)
     visible_fuels: set[int] | None = None,  # if given, only these fuel-type indices contribute to the vegetation blend AND the fire overlay (a cell burns only where a visible fuel burns)
+    moisture: np.ndarray | None = None,  # (H, W) suppression water [kg/m^2]; wet cells are desaturated toward grey
+    moisture_ref: float = 1.0,           # water load [kg/m^2] at which a cell is fully grey (>= is clamped)
 ) -> pygame.Surface:
     rows, cols = fuel_temperatures.shape[1], fuel_temperatures.shape[2]
     rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
@@ -547,6 +549,17 @@ def build_fire_surface(
         min_ign = float(ignition_thresholds.min())
         t = (overlay_temp - min_ign) / FIRE_COLOR_TEMP_SPAN_K
         rgb[overlay_burning] = fire_overlay_colormap(t[overlay_burning])
+
+    # Suppression water desaturates a cell: dropped water bleaches the vegetation toward grey, and as
+    # it evaporates / is carried off (Simulation.apply_moisture) the moisture falls and the color
+    # saturates back. s = min(moisture / moisture_ref, 1) is the greyness; each cell is blended toward
+    # its own luminance so hue is lost but brightness is preserved. Wet cells can't burn, so this sits
+    # under the (absent-there) fire overlay and never greys a flame.
+    if moisture is not None:
+        s = np.clip(moisture / max(moisture_ref, 1e-9), 0.0, 1.0)[:, :, np.newaxis]  # (H, W, 1)
+        lum = rgb.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)  # (H, W)
+        grey = lum[:, :, np.newaxis]
+        rgb = (rgb * (1.0 - s) + grey * s).clip(0, MAX_CHANNEL_VALUE).astype(np.uint8)
 
     rgb_scaled = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     surface = pygame.Surface((cols * scale, rows * scale))

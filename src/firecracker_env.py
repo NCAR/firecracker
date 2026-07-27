@@ -321,6 +321,10 @@ class FirecrackerEnv(gymnasium.Env):
             self.action_grid_size = default if self.grid_size % default == 0 else self.grid_size
         self._action_cell_cells = self.grid_size // self.action_grid_size
         self._action_cell_px = self._action_cell_cells * self._pixel_scale
+        # Water an action drops on its action-cell block [kg/m^2 of liquid water], added to the
+        # cells' moisture. A wet cell (moisture > 0) cannot ignite until the water boils off; the
+        # evaporation/gate physics lives in Simulation.apply_moisture.
+        self._water_drop_amount = float(action_cfg.get("water_drop_amount", 10.0))
         # Action-cell (arow, acol) currently under the mouse, or None when the cursor is
         # outside the window. Drawn as a brightening overlay each frame (render).
         self._hovered_action_cell: tuple[int, int] | None = None
@@ -360,6 +364,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._initial_canopy_fuel: torch.Tensor | None = None  # per-cell original canopy load (for bole occlusion)
         self._oxygen: np.ndarray | None = None
         self._mass: np.ndarray | None = None   # boundary-layer areal mass [kg/m^2]
+        self._moisture: torch.Tensor | None = None   # per-cell suppression water [kg/m^2] (water-drop action)
         self._mass_eq: torch.Tensor | None = None   # rest-state mass (open-boundary sponge target)
         self._terrain: np.ndarray | None = None
         self._sunlight: np.ndarray | None = None   # static average solar exposure [0,1] (SUNLIGHT view)
@@ -646,6 +651,10 @@ class FirecrackerEnv(gymnasium.Env):
         self._last_radiant_flux = torch.zeros(
             (self._sim_size, self._sim_size), dtype=self._sim.dtype, device=self._sim.device
         )
+        # Suppression water starts dry everywhere; the water-drop action adds to it (_apply_water_drop).
+        self._moisture = torch.zeros(
+            (self._sim_size, self._sim_size), dtype=self._sim.dtype, device=self._sim.device
+        )
         self._step_count = 0
         self._pending_action_row = None
         self._selected_action_cell = None
@@ -681,12 +690,24 @@ class FirecrackerEnv(gymnasium.Env):
             arow, acol = self._pending_action_row, action
             self._pending_action_row = None             # column step completes the cell
             if self._action_cell_near_fire(arow, acol):
-                # Fire in the cell or a neighbour -> the action goes through.
+                # Fire in the cell or a neighbour -> the action goes through: drop water on the cell.
                 self._selected_action_cell = (arow, acol)
+                self._apply_water_drop(arow, acol)
                 if self.render_mode is not None:
                     self._action_flash_cell = (arow, acol)
                     self._action_flash_until = time.monotonic() + ACTION_FLASH_SECONDS
             # else: fire-free neighbourhood -> implicit no-op (nothing selected, no flash).
+
+    def _apply_water_drop(self, arow: int, acol: int) -> None:
+        """Drop water on the action-cell (arow, acol): add water_drop_amount [kg/m^2] to the moisture
+        of every sim cell in its block. The wet cells then can't ignite until Simulation.apply_moisture
+        boils the water off. Action-cell indices are on the observed grid, so offset by _pad."""
+        if self._moisture is None or self._water_drop_amount <= 0.0:
+            return
+        c = self._action_cell_cells
+        r0 = self._pad + arow * c
+        c0 = self._pad + acol * c
+        self._moisture[r0:r0 + c, c0:c0 + c] += self._water_drop_amount
 
     def _burning_per_type(self) -> torch.Tensor:
         """(N, H, W) boolean mask of cells currently burning: hot enough to pyrolyse, with fuel and
@@ -1336,9 +1357,13 @@ class FirecrackerEnv(gymnasium.Env):
         # Stash the raw fuel-view inputs so the per-selection builders (_fire_surface_for /
         # _fuel_temp_surface_for) can render any fuel subset -- one for the single view, and a
         # different one per pane in multi-view mode.
+        moisture = (
+            _to_numpy(self._crop(self._moisture)) if self._moisture is not None else None
+        )
         self._fire_inputs = {
             "fuel_temps": fuel_temps, "fuel": fuel, "oxygen": oxygen,
             "ignition_thresholds": ignition_thresholds, "initial_canopy_fuel": initial_canopy_fuel,
+            "moisture": moisture,
         }
         self._fuel_surface = self._fire_surface_for(self._fuel_selected)
         self._oxygen_surface = build_oxygen_surface(oxygen, self._pixel_scale)
@@ -1383,6 +1408,7 @@ class FirecrackerEnv(gymnasium.Env):
             fi["ignition_thresholds"], self._sim.fuel_burnt_threshold, self._sim.fuel_type_names,
             show_fire_overlay=self._fuel_fire_overlay and self._sim.fire_enabled,
             initial_canopy_fuel=fi["initial_canopy_fuel"], visible_fuels=selection,
+            moisture=fi["moisture"], moisture_ref=self._water_drop_amount,
         )
 
     def _fuel_temp_surface_for(self, selection: set[int]) -> pygame.Surface:
@@ -1433,6 +1459,7 @@ class FirecrackerEnv(gymnasium.Env):
             channel_gain=self._channel_gain,
             x_wind_fire=self._x_wind_fire,
             y_wind_fire=self._y_wind_fire,
+            moisture=self._moisture,
         )
 
     def _store_field_state(self, s: SimState) -> None:
@@ -1448,6 +1475,7 @@ class FirecrackerEnv(gymnasium.Env):
         self._x_wind_fire       = s.x_wind_fire
         self._y_wind_fire       = s.y_wind_fire
         self._last_radiant_flux = s.radiant_flux
+        self._moisture          = s.moisture
 
     def _pick_receptive_cell(self) -> tuple[int, int]:
         """Random observed-interior cell that carries fine surface fuel (grass/shrub) an ember can
